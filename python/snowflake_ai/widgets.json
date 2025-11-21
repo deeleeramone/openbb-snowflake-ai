@@ -1,0 +1,34 @@
+{
+    "snowflake_execute_query": {
+        "name": "Snowflake Execute",
+        "description": "Execute a Snowflake SQL query.",
+        "category": "Snowflake",
+        "type": "omni",
+        "searchCategory": "Snowflake",
+        "widgetId": "snowlake_execute_querty",
+        "params": [
+            {
+                "paramName": "prompt",
+                "type": "text",
+                "description": "SQL query to compile and execute.",
+                "label": "SQL",
+                "show": false,
+                "placeholder": "",
+                "inputType": "sql"
+            }
+        ],
+        "endpoint": "widgets/execute",
+        "runButton": false,
+        "gridData": {
+            "w": 40,
+            "h": 20
+        },
+        "data": {
+            "dataKey": "",
+            "table": {
+                "showAll": true
+            }
+        },
+        "source": ["Snowflake"]
+    }
+}
