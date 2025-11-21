@@ -469,8 +469,8 @@ async def handle_slash_command(
             messages = await run_in_thread(client.get_messages, conv_id)
 
             # Summarize the conversation
-            output = f"### Conversation History Summary\n\n"
-            output += f"**Total Messages:** {len(messages)}\n\n"
+            output = "### Conversation History Summary\n\n"
+            output += f"**Total Messages:** {len(messages)}\n"
 
             # Count message types
             human_msgs = 0
@@ -528,46 +528,22 @@ async def handle_slash_command(
                     output += f"- `{tool}`: {count} time(s)\n"
                 output += "\n"
 
-            if tables_accessed:
-                output += f"**Tables Accessed:**\n"
-                for table in sorted(tables_accessed):
-                    output += f"- `{table}`\n"
-                output += "\n"
-
-            if queries_executed:
-                output += f"**Recent Queries Executed:**\n"
-                for i, query in enumerate(queries_executed[-5:], 1):
-                    output += f"{i}. `{query}`\n"
-                output += "\n"
-
-            # Show recent conversation snippets with better formatting
+            # Show recent conversation snippets
             output += "**Recent Conversation (last 10 exchanges):**\n"
             recent_messages = messages[-20:]  # Get last 20 to show exchanges
 
-            last_role = None
             for i, (msg_id, role, content) in enumerate(recent_messages):
                 if role in ["human", "user"] and "[Tool Result" not in content:
-                    # Add line break between exchanges
-                    if last_role in ["assistant", "ai"]:
-                        output += "\n"
-
                     snippet = content[:150].replace("\n", " ")
                     if len(content) > 150:
                         snippet += "..."
-                    output += f"👤 **User:** {snippet}\n"
-                    last_role = role
+                    output += f"\n👤 **User:** {snippet}  \n"
 
                 elif role in ["assistant", "ai"]:
                     snippet = content[:150].replace("\n", " ")
                     if len(content) > 150:
                         snippet += "..."
-                    output += f"🤖 **Assistant:** {snippet}\n"
-                    last_role = role
-
-            output += "\n💡 **Tips:**\n"
-            output += "- The AI maintains context of recent messages and tool results\n"
-            output += "- When asking about previous data, be specific about what you're referring to\n"
-            output += "- All data from executed queries and accessed tables remains available in the conversation history"
+                    output += f"🤖 **Assistant:** {snippet}  \n"
 
             yield to_sse(message_chunk(output))
         except Exception as e:
@@ -622,7 +598,7 @@ async def handle_slash_command(
                 )
                 output += f"- 🤖 Assistant: {snippet}\n"
 
-        output += f"""
+        output += """
 
 **💡 Context Management:**
 - Recent messages and tool results are automatically included

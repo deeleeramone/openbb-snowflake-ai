@@ -1,5 +1,6 @@
 """Conversation history and context management for Snowflake AI."""
 
+import asyncio
 import os
 import uuid
 from typing import Any
@@ -10,8 +11,6 @@ from .helpers import parse_widget_data
 
 async def run_in_thread(func, *args, **kwargs):
     """Run a function in a background thread."""
-    import asyncio
-
     return await asyncio.to_thread(func, *args, **kwargs)
 
 
@@ -34,7 +33,6 @@ async def load_conversation_history(
         List of conversation messages with role, content, and details
     """
     final_conversation_history = []
-    widget_data_context = []  # Collect widget data for non-tool models
 
     # Load existing messages from cache
     cached_messages = await run_in_thread(client.get_messages, conv_id)
@@ -50,12 +48,8 @@ async def load_conversation_history(
         if os.environ.get("SNOWFLAKE_DEBUG"):
             print(f"[DEBUG] Truncated cached messages to last {max_cached_messages}")
 
-    # Build history from cached messages, filtering out tool messages
+    # Build history from cached messages
     for message_id, role, content in cached_messages:
-        # Skip tool messages from cache - they shouldn't be in conversation history
-        if role == "tool":
-            continue
-
         final_conversation_history.append(
             {
                 "role": role,
@@ -64,53 +58,42 @@ async def load_conversation_history(
             }
         )
 
-    if os.environ.get("SNOWFLAKE_DEBUG"):
-        print(
-            f"[DEBUG] final_conversation_history now has {len(final_conversation_history)} messages"
-        )
-
-    # Add new messages from the current request
+    # Process new messages from the current request
     for message in request_messages:
-        msg_id = str(uuid.uuid4())
-
-        msg_dict = {
-            "role": message.role,
-            "content": message.content,
-            "details": None,
-        }
-
-        if message.role == "tool" and hasattr(message, "data"):
-            context_str = parse_widget_data(message.data, conv_id)
-            msg_dict["content"] = f"Tool output:\n{context_str}"
-            msg_dict["details"] = message.data
-
-            # Store widget data for potential injection
-            widget_data_context.append({"data": message.data, "parsed": context_str})
-
-        final_conversation_history.append(msg_dict)
-
-        # Store message immediately
-        await run_in_thread(
-            client.add_message,
-            conv_id,
-            msg_id,
-            message.role,
-            msg_dict["content"],
+        # Check if message already exists
+        msg_content = message.content if hasattr(message, "content") else str(message)
+        is_duplicate = any(
+            msg["role"] == message.role and msg["content"] == msg_content
+            for msg in final_conversation_history
         )
 
-    if os.environ.get("SNOWFLAKE_DEBUG"):
-        print(
-            f"[DEBUG] After adding new messages: {len(final_conversation_history)} total messages"
-        )
-
-    # Store widget data context for later use
-    if widget_data_context:
-        final_conversation_history.append(
-            {
-                "role": "widget_context",
-                "content": widget_data_context,
+        if not is_duplicate:
+            msg_id = str(uuid.uuid4())
+            msg_dict = {
+                "role": message.role,
+                "content": msg_content,
                 "details": None,
             }
+
+            if message.role == "tool" and hasattr(message, "data"):
+                context_str = parse_widget_data(message.data, conv_id)
+                msg_dict["content"] = f"Tool output:\n{context_str}"
+                msg_dict["details"] = message.data
+
+            final_conversation_history.append(msg_dict)
+
+            # Store message immediately
+            await run_in_thread(
+                client.add_message,
+                conv_id,
+                msg_id,
+                message.role,
+                msg_dict["content"],
+            )
+
+    if os.environ.get("SNOWFLAKE_DEBUG"):
+        print(
+            f"[DEBUG] After processing: {len(final_conversation_history)} total messages"
         )
 
     return final_conversation_history

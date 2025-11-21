@@ -215,12 +215,14 @@ impl SnowflakeEngine {
 
 
     pub fn generate_jwt(&mut self) -> Result<(), String> {
-        // SNOWFLAKE_PASSWORD contains a Personal Access Token (PAT) for Cortex Analyst API
-        let pat = self.password.as_ref()
-            .ok_or("SNOWFLAKE_PASSWORD not set. It should contain a Personal Access Token (PAT).")?;
-
-        // PAT is used directly as the bearer token
-        self.jwt_token = Some(pat.clone());
+        // For Cortex API, we need to use Snowflake session token, not the password
+        // The password is used for initial authentication, but Cortex needs the session token
+        
+        // Get the session token from the active session
+        let token = self.session.token()
+            .ok_or("Failed to get session token. Session may not be authenticated.")?;
+        
+        self.jwt_token = Some(token.to_string());
         Ok(())
     }
 
@@ -806,9 +808,7 @@ impl SnowflakeEngine {
             })
             .collect();
 
-        Ok(json!({
-            "columns": columns_json
-        }))
+        Ok(serde_json::Value::Array(columns_json))
     }
 
     /// Get list of tables in current schema

@@ -72,7 +72,6 @@ def execute_widget_query(
     client: Annotated[SnowflakeAI, Depends(snowflake_client)],
 ):
     """Execute a Snowflake SQL query."""
-    print(payload)
     try:
         raw_result = client.execute_query(payload.get("prompt", ""))
     except Exception as exc:  # pragma: no cover - surfaced via HTTPException
@@ -83,4 +82,11 @@ def execute_widget_query(
     except json.JSONDecodeError:
         parsed_result = raw_result
 
-    return {"content": parsed_result.get("rowData", [])}
+    row_data = parsed_result.get("rowData", [])
+
+    if not row_data:
+        raise HTTPException(
+            status_code=500, detail="No row data returned from Snowflake query."
+        )
+
+    return {"content": row_data}

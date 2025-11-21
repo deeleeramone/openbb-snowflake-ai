@@ -9,8 +9,10 @@ import os
 import re
 import uuid
 import threading
+import traceback
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any, Optional, Iterator as TypingIterator
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,6 +28,8 @@ from sse_starlette import EventSourceResponse
 from ._snowflake_ai import (
     SnowflakeAgent,
     SnowflakeAI,
+    ToolCall,
+    FunctionCall,
 )
 from .helpers import to_sse
 from .models import SchemaItem
@@ -65,7 +69,7 @@ max_tokens_preferences: dict[str, int] = {}
 client_pool: dict[str, SnowflakeAI] = {}
 # Track token usage per conversation
 token_usage: dict[str, dict[str, int]] = {}
-MAX_TOOL_ITERATIONS = 3
+MAX_TOOL_ITERATIONS = 10
 
 NON_TOOL_CALLING_MODELS = {
     "llama4-maverick",
@@ -172,6 +176,28 @@ async def run_in_thread(func, *args, **kwargs):
 def is_iterator(value: object) -> bool:
     """Check if a value is an iterator."""
     return isinstance(value, Iterator)
+
+
+def is_reasoning_event(event: object) -> bool:
+    """Check if an event is a reasoning event."""
+    if not isinstance(event, dict):
+        return False
+
+    if event.get("event") in {"reasoning", "reasoning_step"}:
+        return True
+
+    payload = event.get("data")
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except json.JSONDecodeError:
+            return False
+
+    if isinstance(payload, dict):
+        payload_type = payload.get("type") or payload.get("event")
+        return payload_type in {"reasoning", "reasoning_step"}
+
+    return False
 
 
 async def iterate_sync_generator(generator: Iterator):
@@ -396,16 +422,23 @@ async def stream(request_obj: Request, request: QueryRequest):
                 # Build complete conversation history INCLUDING tool results
                 all_messages = []
                 for msg_id, role, content in cached_messages:
+                    # Check if this is a tool result message
+                    is_tool_result = "[Tool Result" in content
                     all_messages.append(
                         {
                             "role": role,
                             "content": content,
-                            "details": None,
+                            "details": (
+                                {"is_tool_result": is_tool_result}
+                                if is_tool_result
+                                else None
+                            ),
                         }
                     )
 
-                # Process NEW messages from request
                 request_messages_to_add = []
+                has_new_user_message = False
+                needs_response = False
 
                 for idx, message in enumerate(request.messages):
                     # Handle tool messages (widget data comes back as tool messages)
@@ -415,7 +448,7 @@ async def stream(request_obj: Request, request: QueryRequest):
                             # Always parse to ensure pdf_text_blocks is populated
                             parsed_data = parse_widget_data(message.data, conv_id)
 
-                            # Only add context if it's the LAST message (to avoid context bloat)
+                            # Only add context if it's the last message
                             if idx == len(request.messages) - 1:
                                 widget_context_str = f"Use the following data to answer the question:\n\n--- Data ---\n{parsed_data}\n------\n"
 
@@ -459,14 +492,13 @@ async def stream(request_obj: Request, request: QueryRequest):
                         # Check if this is a new message not in cache
                         is_new = True
                         if all_messages:
-                            # More thorough duplicate check - check entire content
                             message_content = (
                                 message.content
                                 if isinstance(message.content, str)
                                 else str(message.content)
                             )
 
-                            # Check against ALL cached messages to prevent any duplicates
+                            # Prevent duplicates by checking entire content
                             for cached_msg in all_messages:
                                 if (
                                     cached_msg["role"] == message.role
@@ -481,6 +513,92 @@ async def stream(request_obj: Request, request: QueryRequest):
 
                         if is_new:
                             request_messages_to_add.append(message)
+                            # Track if we have a new user message
+                            if message.role in ["human", "user"]:
+                                has_new_user_message = True
+                                needs_response = True
+                        else:
+                            # Even if message is cached, check if it's the last user message
+                            # and whether it has been responded to
+                            if (
+                                message.role in ["human", "user"]
+                                and idx == len(request.messages) - 1
+                            ):
+                                # Treat a last human message as an intentional send/resend.
+                                # Always require a fresh response when the user explicitly sent (or resent) the message.
+                                has_new_user_message = True
+                                needs_response = True
+                                if os.environ.get("SNOWFLAKE_DEBUG"):
+                                    print(
+                                        "[DEBUG] Last user message is a resend/explicit send - forcing a fresh response"
+                                    )
+
+                                # Note: we intentionally do NOT append the duplicate to request_messages_to_add
+                                # to avoid duplicating stored messages in the cache.
+                            else:
+                                has_response = False
+                                found_this_msg = False
+
+                                for i, cached_msg in enumerate(all_messages):
+                                    if not found_this_msg:
+                                        # Find this specific user message in cache
+                                        if cached_msg["role"] in [
+                                            "human",
+                                            "user",
+                                        ] and cached_msg["content"] == (
+                                            message.content
+                                            if isinstance(message.content, str)
+                                            else str(message.content)
+                                        ):
+                                            found_this_msg = True
+                                    elif found_this_msg:
+                                        # After finding the user message, check if there's an assistant response
+                                        if cached_msg["role"] == "assistant":
+                                            has_response = True
+                                            break
+                                        elif (
+                                            cached_msg["role"] in ["human", "user"]
+                                            and "[Tool Result"
+                                            not in cached_msg["content"]
+                                        ):
+                                            # Another user message without tool result means no response to previous
+                                            break
+
+                                if not has_response:
+                                    needs_response = True
+                                    if os.environ.get("SNOWFLAKE_DEBUG"):
+                                        print(
+                                            f"[DEBUG] Last user message needs a response"
+                                        )
+
+                # Only process if we have a new user message OR need to respond to existing one
+                if (
+                    not has_new_user_message
+                    and not widget_context_str
+                    and not needs_response
+                ):
+                    if os.environ.get("SNOWFLAKE_DEBUG"):
+                        print(
+                            "[DEBUG] No new user message to process and last message already has response"
+                        )
+
+                    # Return the last assistant message if it exists
+                    for msg in reversed(all_messages):
+                        if msg["role"] == "assistant":
+                            yield to_sse(message_chunk(msg["content"]))
+                            if os.environ.get("SNOWFLAKE_DEBUG"):
+                                print(
+                                    f"[DEBUG] Returning cached assistant response: {msg['content'][:100]}..."
+                                )
+                            return
+
+                    # If no assistant message found, acknowledge the situation
+                    yield to_sse(
+                        message_chunk(
+                            "I'm ready to help. Please ask me a question or use /help to see available commands."
+                        )
+                    )
+                    return
 
                 # Only add truly new unique messages from request and store them
                 if request_messages_to_add:
@@ -624,10 +742,13 @@ async def stream(request_obj: Request, request: QueryRequest):
 
                 # Append widget data to last human message (like the example)
                 if widget_context_str:
+                    # Find the last NEW human message, not a historical one
                     for msg in reversed(current_messages):
                         if msg["role"] in ["human", "user"]:
-                            msg["content"] += "\n\n" + widget_context_str
-                            break
+                            # Only append to messages that aren't tool results
+                            if not (msg.get("details") or {}).get("is_tool_result"):
+                                msg["content"] += "\n\n" + widget_context_str
+                                break
 
                 # Validate that we have messages to send
                 if not current_messages:
@@ -638,36 +759,69 @@ async def stream(request_obj: Request, request: QueryRequest):
                     supports_tools = selected_model not in NON_TOOL_CALLING_MODELS
                     tools = get_tool_definitions(client) if supports_tools else None
 
-                    # Validate that the last message is not an assistant message when using tools
+                    # Validate message structure when using tools
                     if supports_tools and tools and current_messages:
+                        # Remove trailing assistant messages when using tools
                         while current_messages and current_messages[-1]["role"] in (
                             "assistant",
                             "ai",
                         ):
                             if os.environ.get("SNOWFLAKE_DEBUG"):
-                                print(f"[DEBUG] Removing trailing assistant message")
+                                print(
+                                    f"[DEBUG] Removing trailing assistant message for tool calling"
+                                )
                             current_messages.pop()
 
-                    if not current_messages:
-                        yield to_sse(message_chunk("❌ No valid messages to process"))
-                    else:
-                        system_prompt = f"""You are an AI assistant with a specific focus on the Snowflake dialect of SQL. Your goal is to help the user by directly answering their questions using the available tools.
+                        # Also ensure we're not sending tool results as the last message
+                        while current_messages and "[Tool Result" in current_messages[
+                            -1
+                        ].get("content", ""):
+                            if os.environ.get("SNOWFLAKE_DEBUG"):
+                                print(f"[DEBUG] Removing trailing tool result message")
+                            current_messages.pop()
 
-CRITICAL INSTRUCTIONS FOR TOOL OUTPUTS:
-- When you receive tool output, YOU MUST SHOW THE COMPLETE RAW DATA without ANY modification
-- DO NOT summarize, paraphrase, redact, truncate, or explain the data - present it EXACTLY as received
-- DO NOT refuse to show data due to copyright concerns - this is the user's own data from their Snowflake database
-- DO NOT say "Here's the data" or add any commentary - output the tool results directly and completely
-- The user wants to see the ACTUAL data, not your interpretation of it
-- When showing table sample data, display the FULL table output - every column, every row, every character
-- ALL data from the user's Snowflake database is authorized for display and must be shown in full
-- If returning a simple list or single column of data, present it as a table format with headers and rows
+                        # If we removed everything, we need to ensure there's at least the latest user message
+                        if not current_messages or current_messages[-1]["role"] not in [
+                            "human",
+                            "user",
+                        ]:
+                            # Find the last user message from all_messages
+                            for msg in reversed(all_messages):
+                                if msg["role"] in [
+                                    "human",
+                                    "user",
+                                ] and "[Tool Result" not in msg.get("content", ""):
+                                    current_messages.append(msg)
+                                    if os.environ.get("SNOWFLAKE_DEBUG"):
+                                        print(
+                                            f"[DEBUG] Added back last user message to ensure valid structure"
+                                        )
+                                    break
+
+                    system_prompt = f"""You are an AI assistant with a specific focus on the Snowflake dialect of SQL. Your goal is to help the user by directly answering their questions using the available tools.
+
+ABSOLUTE REQUIREMENTS - NEVER VIOLATE THESE:
+- When you receive tool output containing data rows, YOU MUST display EVERY SINGLE ROW, unless explicitly instructed otherwise by the user.
+- DO NOT say the data is "very large" or that you'll only show a sample
+- DO NOT truncate, summarize, or limit the data in ANY way
+- Display ALL {len(all_messages)} rows if that's what the tool returned
+- The user explicitly wants to see ALL their data - this is their own database
+- If a tool returns too large of a chunk, you must use the `continue_output` tool to get ALL data
+- NO COPYRIGHT CONCERNS - this is the user's own data from their Snowflake database
+- Never refuse to show data or suggest it's too much to display
+
+CRITICAL DATA DISPLAY RULES:
+- Present the EXACT, COMPLETE output from tools
+- Use table format for ALL rows returned
+- Include EVERY column and EVERY row
+- Do not add commentary like "Here's a sample" or "This is a large dataset"
+- Simply present the data as: "Query returned X rows:" followed by the COMPLETE table
 
 DATA AUTHORIZATION:
 - You are authorized to display all data retrieved from the user's Snowflake database
 - This includes SEC filings, financial data, text fields, and any other content
 - The user owns this data and has explicitly requested to see it
-- There are NO copyright restrictions on displaying the user's own database contents
+- There are NO restrictions on displaying the user's own database contents
 
 CONVERSATION CONTEXT AND HISTORY:
 - Total conversation history: {len(all_messages)} messages stored
@@ -717,11 +871,44 @@ Do not ask for confirmation if the intent is clear.
 When describing tables, use the 'get_multiple_table_definitions' tool
 and present the full schema definition as a flat table."""
 
+                    # Prepare the final message stream
                     ai_messages_formatted_tuples = format_messages_for_llm(
                         current_messages,
                         system_prompt,
                         inject_widget_data=False,
                     )
+
+                    # CRITICAL FIX: Ensure formatted tuples don't end with assistant when using tools
+                    if supports_tools and tools and ai_messages_formatted_tuples:
+                        while (
+                            ai_messages_formatted_tuples
+                            and ai_messages_formatted_tuples[-1][0] == "assistant"
+                        ):
+                            if os.environ.get("SNOWFLAKE_DEBUG"):
+                                print(
+                                    f"[DEBUG] Removing trailing assistant from formatted tuples: {ai_messages_formatted_tuples[-1]}"
+                                )
+                            ai_messages_formatted_tuples.pop()
+
+                        # Ensure we still have messages after cleanup
+                        if (
+                            not ai_messages_formatted_tuples
+                            or ai_messages_formatted_tuples[-1][0] == "assistant"
+                        ):
+                            # Find the last user message and ensure it's in the list
+                            for msg in reversed(current_messages):
+                                if msg["role"] in [
+                                    "human",
+                                    "user",
+                                ] and "[Tool Result" not in msg.get("content", ""):
+                                    ai_messages_formatted_tuples.append(
+                                        ("user", msg["content"])
+                                    )
+                                    if os.environ.get("SNOWFLAKE_DEBUG"):
+                                        print(
+                                            f"[DEBUG] Added user message to fix structure"
+                                        )
+                                    break
 
                     # Shared state for streaming
                     stream_state = {"full_text": "", "tool_calls": [], "usage": None}
@@ -822,6 +1009,15 @@ and present the full schema definition as a flat table."""
                             stream_state["full_text"] = ""
                             stream_state["tool_calls"] = []
 
+                            # First, yield that we're thinking about what to do
+                            if iteration == 0:
+                                yield to_sse(
+                                    reasoning_step(
+                                        "Analyzing request and determining required tools...",
+                                        event_type="INFO",
+                                    )
+                                )
+
                             generator = stream_llm_with_tools(
                                 client,
                                 ai_messages_formatted_tuples,
@@ -840,10 +1036,42 @@ and present the full schema definition as a flat table."""
                                 ),
                             )
 
-                            async for event in generate_sse_events(
-                                generator, stream_state
-                            ):
-                                yield event
+                            # Consume the generator and handle events immediately
+                            async for event in generator:
+                                if not event:
+                                    continue
+
+                                event_type, event_data = event
+
+                                if event_type == "text":
+                                    stream_state["full_text"] += event_data
+                                    yield to_sse(message_chunk(event_data))
+                                elif event_type == "citation":
+                                    yield event_data.model_dump()
+                                elif event_type == "tool_call":
+                                    stream_state["tool_calls"].append(event_data)
+                                elif event_type == "complete":
+                                    # CRITICAL: Extract tool_calls from the complete event
+                                    if isinstance(event_data, dict):
+                                        stream_state["tool_calls"] = event_data.get(
+                                            "tool_calls", []
+                                        )
+                                        stream_state["usage"] = event_data.get(
+                                            "usage", None
+                                        )
+                                        stream_state["full_text"] = event_data.get(
+                                            "text", stream_state["full_text"]
+                                        )
+                                    if os.environ.get("SNOWFLAKE_DEBUG"):
+                                        print(
+                                            f"[DEBUG] Complete event received with {len(stream_state.get('tool_calls', []))} tool calls"
+                                        )
+                                    break
+                                else:
+                                    # Yield any other events (like reasoning steps from handler)
+                                    yield to_sse(
+                                        reasoning_step(event_data, event_type="INFO")
+                                    )
 
                             # Update token usage after completion
                             if stream_state.get("usage"):
@@ -878,39 +1106,44 @@ and present the full schema definition as a flat table."""
                                 except Exception:
                                     pass
 
-                            if stream_state["full_text"].strip():
-                                # Check if this assistant response is already in cache
-                                response_already_cached = False
-                                for cached_msg in all_messages[
-                                    -5:
-                                ]:  # Check last few messages
-                                    if (
-                                        cached_msg["role"] == "assistant"
-                                        and cached_msg["content"]
-                                        == stream_state["full_text"]
-                                    ):
-                                        response_already_cached = True
-                                        if os.environ.get("SNOWFLAKE_DEBUG"):
-                                            print(
-                                                "[DEBUG] Assistant response already in cache, skipping"
-                                            )
-                                        break
-
-                                if not response_already_cached:
-                                    ai_msg_id = str(uuid.uuid4())
-                                    ai_messages_formatted_tuples.append(
-                                        ("assistant", stream_state["full_text"])
-                                    )
-                                    await run_in_thread(
-                                        client.add_message,
-                                        conv_id,
-                                        ai_msg_id,
-                                        "assistant",
-                                        stream_state["full_text"],
-                                    )
+                            # Check if there are tool calls to process
+                            if os.environ.get("SNOWFLAKE_DEBUG"):
+                                print(
+                                    f"[DEBUG] Checking for tool calls. Found: {len(stream_state['tool_calls'])}"
+                                )
+                                print(
+                                    f"[DEBUG] Tool calls: {[tc.function.name for tc in stream_state['tool_calls']]}"
+                                )
 
                             if not stream_state["tool_calls"]:
-                                break
+                                # Try to recover if the streaming API didn't emit structured tool calls
+                                synthetic_call = parse_synthetic_tool_call(
+                                    stream_state["full_text"]
+                                )
+
+                                if synthetic_call:
+                                    if os.environ.get("SNOWFLAKE_DEBUG"):
+                                        print(
+                                            "[DEBUG] Synthesizing tool call from raw assistant text"
+                                        )
+                                    stream_state["tool_calls"] = [synthetic_call]
+                                else:
+                                    # No tool calls - this is a final response
+                                    # Don't yield the full text again - it was already streamed chunk by chunk
+                                    if stream_state["full_text"].strip():
+                                        # Just store it in cache, don't send it again
+                                        ai_msg_id = str(uuid.uuid4())
+                                        await run_in_thread(
+                                            client.add_message,
+                                            conv_id,
+                                            ai_msg_id,
+                                            "assistant",
+                                            stream_state["full_text"],
+                                        )
+                                    break
+
+                            # WE HAVE TOOL CALLS - Process them NOW with reasoning steps
+                            has_tool_calls = len(stream_state["tool_calls"]) > 0
 
                             for tool_call in stream_state["tool_calls"]:
                                 tool_name = tool_call.function.name
@@ -925,17 +1158,53 @@ and present the full schema definition as a flat table."""
                                 except json.JSONDecodeError:
                                     tool_args_parsed = {"raw": tool_args_str}
 
+                                # Yield reasoning step with arguments
                                 yield to_sse(
                                     reasoning_step(
-                                        f"Calling {tool_name} -> {tool_args_parsed}",
+                                        f"Calling tool {tool_name} with arguments: {tool_args_str}",
                                         event_type="INFO",
                                     )
                                 )
 
-                                # Store tool results for context - ALWAYS keep full results
-                                current_tool_output_for_llm, _ = await execute_tool(
-                                    tool_call, client
+                                # Execute the tool
+                                if os.environ.get("SNOWFLAKE_DEBUG"):
+                                    print(f"[DEBUG] Executing tool: {tool_name}")
+
+                                current_tool_output_for_llm, raw_tool_data = (
+                                    await execute_tool(tool_call, client)
                                 )
+
+                                # Yield completion reasoning step
+                                if "Error getting" in str(
+                                    current_tool_output_for_llm
+                                ) or "Error:" in str(current_tool_output_for_llm):
+                                    yield to_sse(
+                                        reasoning_step(
+                                            f"Tool {tool_name} encountered an error.",
+                                            event_type="ERROR",
+                                        )
+                                    )
+                                else:
+                                    if (
+                                        tool_name
+                                        in ["execute_query", "get_table_sample_data"]
+                                        and isinstance(raw_tool_data, dict)
+                                        and "rowData" in raw_tool_data
+                                    ):
+                                        row_count = len(raw_tool_data["rowData"])
+                                        yield to_sse(
+                                            reasoning_step(
+                                                f"Retrieved {row_count} rows.",
+                                                event_type="INFO",
+                                            )
+                                        )
+                                    else:
+                                        yield to_sse(
+                                            reasoning_step(
+                                                f"Tool {tool_name} completed successfully.",
+                                                event_type="INFO",
+                                            )
+                                        )
 
                                 # Format tool result for the LLM
                                 tool_result_formatted = f"The result from {tool_name} is:\n{current_tool_output_for_llm}"
@@ -945,36 +1214,55 @@ and present the full schema definition as a flat table."""
                                     ("user", f"[Tool Result]\n{tool_result_formatted}")
                                 )
 
-                                # Check if tool result is already in cache before storing
+                                # Store COMPLETE tool result in cache
                                 tool_result_text = f"[Tool Result from {tool_name}]\n{current_tool_output_for_llm}"
-                                result_already_cached = False
 
-                                for cached_msg in all_messages[
-                                    -10:
-                                ]:  # Check recent messages
-                                    if (
-                                        cached_msg["role"] == "user"
-                                        and cached_msg["content"] == tool_result_text
-                                    ):
-                                        result_already_cached = True
-                                        if os.environ.get("SNOWFLAKE_DEBUG"):
-                                            print(
-                                                "[DEBUG] Tool result already in cache, skipping"
-                                            )
-                                        break
+                                tool_msg_id = str(uuid.uuid4())
+                                await run_in_thread(
+                                    client.add_message,
+                                    conv_id,
+                                    tool_msg_id,
+                                    "user",
+                                    tool_result_text,
+                                )
 
-                                if not result_already_cached:
-                                    # Store COMPLETE tool result in cache for permanent history
-                                    tool_msg_id = str(uuid.uuid4())
+                                # Store raw data for direct access
+                                if isinstance(raw_tool_data, dict):
+                                    data_key = f"tool_result_{tool_name}_{tool_msg_id}"
                                     await run_in_thread(
-                                        client.add_message,
+                                        client.set_conversation_data,
                                         conv_id,
-                                        tool_msg_id,
-                                        "user",
-                                        tool_result_text,
+                                        data_key,
+                                        json.dumps(raw_tool_data),
                                     )
-                                    if os.environ.get("SNOWFLAKE_DEBUG"):
-                                        print("[DEBUG] Stored new tool result in cache")
+
+                            # If we processed tool calls, we need to continue to get the final response
+                            if has_tool_calls:
+                                # Yield reasoning step that we're generating the final response
+                                yield to_sse(
+                                    reasoning_step(
+                                        "Processing results and generating response...",
+                                        event_type="INFO",
+                                    )
+                                )
+
+                                if os.environ.get("SNOWFLAKE_DEBUG"):
+                                    print(
+                                        f"[DEBUG] Continuing to iteration {iteration + 2} with {len(ai_messages_formatted_tuples)} messages"
+                                    )
+                                    print(f"[DEBUG] Last 3 messages:")
+                                    for i, msg in enumerate(
+                                        ai_messages_formatted_tuples[-3:]
+                                    ):
+                                        print(
+                                            f"[DEBUG]   {i}: {msg[0]}: {msg[1][:200]}..."
+                                        )
+
+                                # Continue to next iteration - the LLM will now interpret the tool results.
+                                continue
+                            else:
+                                # No more tool calls - we're done
+                                break
 
             except Exception as e:
                 import traceback
@@ -985,13 +1273,49 @@ and present the full schema definition as a flat table."""
                 )
                 yield to_sse(message_chunk(f"❌ An error occurred: {str(e)}"))
 
-    # Return EventSourceResponse with proper generator that yields model_dump()
     async def sse_generator():
         async for event in execution_loop():
-            # event is already a dict from model_dump() calls or to_sse() calls
             yield event
 
     return EventSourceResponse(
         content=sse_generator(),
         media_type="text/event-stream",
     )
+
+
+def parse_synthetic_tool_call(raw_text: str) -> Optional[ToolCall]:
+    """Detect JSON-style tool calls emitted as plain text and convert to ToolCall."""
+    try:
+        parsed = json.loads(raw_text.strip())
+    except json.JSONDecodeError:
+        return None
+
+    if not isinstance(parsed, dict):
+        return None
+
+    # Default to execute_query when we only see a query payload
+    if "query" in parsed:
+        arguments = json.dumps({"query": parsed["query"]})
+        return ToolCall(
+            id=str(uuid.uuid4()),
+            tool_type="function",
+            function=FunctionCall(
+                name=parsed.get("tool", "execute_query"),
+                arguments=arguments,
+            ),
+        )
+
+    # Generic format: {"tool": "name", "arguments": {...}}
+    tool_name = parsed.get("tool") or parsed.get("name")
+    args = parsed.get("arguments")
+    if tool_name and isinstance(args, (dict, list)):
+        return ToolCall(
+            id=str(uuid.uuid4()),
+            tool_type="function",
+            function=FunctionCall(
+                name=tool_name,
+                arguments=json.dumps(args),
+            ),
+        )
+
+    return None

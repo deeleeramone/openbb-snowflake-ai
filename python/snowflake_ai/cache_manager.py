@@ -1,15 +1,10 @@
 """Cache management utilities for conversation history optimization."""
 
-import asyncio
 import os
 from typing import Optional
 
 from ._snowflake_ai import SnowflakeAI
-
-
-async def run_in_thread(func, *args, **kwargs):
-    """Run a function in a background thread."""
-    return await asyncio.to_thread(func, *args, **kwargs)
+from .conversation_manager import run_in_thread
 
 
 async def get_conversation_summary(

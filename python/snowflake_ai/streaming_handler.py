@@ -108,16 +108,25 @@ async def stream_llm_with_tools(
     try:
         async for chunk in iterate_sync_generator(response_stream):
             if os.environ.get("SNOWFLAKE_DEBUG"):
-                print(f"[RAW SSE DATA]: {chunk}")
+                # Try different ways to extract data from the chunk
+                if hasattr(chunk, "__dict__"):
+                    print(f"[RAW SSE DATA]: {chunk.__dict__}")
+                elif hasattr(chunk, "to_dict"):
+                    print(f"[RAW SSE DATA]: {chunk.to_dict()}")
+                else:
+                    # Try to serialize it as JSON if possible
+                    dumped = (
+                        chunk.to_json_string()
+                        if hasattr(chunk, "to_json_string")
+                        else str(chunk.dict())
+                    )
+                    print(f"[RAW SSE DATA]: {dumped}")
 
-            # Check for usage data in chunk
             if hasattr(chunk, "usage") and chunk.usage:
                 usage_data = chunk.usage
-                if os.environ.get("SNOWFLAKE_DEBUG"):
-                    print(f"[DEBUG] Found usage in chunk: {usage_data}")
 
                 # Extract usage fields - handle both dict and object formats
-                if isinstance(usage_data, dict):
+                if isinstance(usage_data, dict) and usage_data.get("total_tokens"):
                     final_usage = {
                         "prompt_tokens": usage_data.get("prompt_tokens", 0),
                         "completion_tokens": usage_data.get("completion_tokens", 0),
@@ -137,9 +146,6 @@ async def stream_llm_with_tools(
                             usage_data, "cache_read_input_tokens", 0
                         ),
                     }
-
-                if os.environ.get("SNOWFLAKE_DEBUG"):
-                    print(f"[DEBUG] Extracted usage: {final_usage}")
 
             if not (hasattr(chunk, "choices") and chunk.choices):
                 continue
@@ -331,19 +337,23 @@ async def stream_llm_with_tools(
     tool_calls = []
     if tool_calls_in_progress:
         for _, info in tool_calls_in_progress.items():
-            tool_calls.append(
-                ToolCall(
-                    id=info["id"],
-                    tool_type="function",
-                    function=FunctionCall(
-                        name=info["name"],
-                        arguments=info["arguments"],
-                    ),
+            if (
+                info["name"] and info["arguments"]
+            ):  # Only add if we have both name and args
+                tool_calls.append(
+                    ToolCall(
+                        id=info["id"],
+                        tool_type="function",
+                        function=FunctionCall(
+                            name=info["name"],
+                            arguments=info["arguments"],
+                        ),
+                    )
                 )
-            )
 
     if os.environ.get("SNOWFLAKE_DEBUG"):
         print(f"[DEBUG] Final usage stats: {final_usage}")
+        print(f"[DEBUG] Tool calls collected: {len(tool_calls)}")
 
     yield (
         "complete",
