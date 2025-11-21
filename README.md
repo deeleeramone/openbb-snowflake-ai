@@ -70,6 +70,8 @@ the browser window.
   - If None, an in-memory cache is used.
 - SNOWFLAKE_CACHE_KEY (Must be supplied for file-based caches.)
 
+Generate a secure, random key using: `openssl rand -base64 32`
+
 ### Debug
 
 - SNOWFLAKE_DEBUG
