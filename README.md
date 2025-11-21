@@ -17,7 +17,7 @@ There are no pre-built wheels, so it is currently installable from the source co
 
 ### Steps
 
-With the environment active, and requirements satisied,
+With the environment active, and requirements satisfied,
 navigate into the root of the project and enter:
 
 ```sh
