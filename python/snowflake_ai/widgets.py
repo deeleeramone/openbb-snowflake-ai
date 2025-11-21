@@ -74,7 +74,7 @@ def execute_widget_query(
     """Execute a Snowflake SQL query."""
     print(payload)
     try:
-        raw_result = client.execute_query(payload.model_dump().get("prompt", ""))
+        raw_result = client.execute_query(payload.get("prompt", ""))
     except Exception as exc:  # pragma: no cover - surfaced via HTTPException
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
