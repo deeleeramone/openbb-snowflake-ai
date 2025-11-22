@@ -113,17 +113,16 @@ jobs:
           rust-toolchain: stable
           docker-options: -e CI -e PKG_CONFIG_PATH=/usr/local/lib/pkgconfig -e TARGET=${{ matrix.target }}
           before-script-linux: |
-            # Install build tools
+            # Install build tools and dependencies
             if command -v apk > /dev/null; then
-              apk add pkgconfig perl make gcc musl-dev git
+              apk add pkgconfig perl make gcc musl-dev git openssl-dev
             elif command -v yum > /dev/null; then
-              yum install -y pkgconfig perl-core make gcc git
+              yum install -y pkgconfig perl-core make gcc git openssl-devel
             elif command -v apt-get > /dev/null; then
-              apt-get update && apt-get install -y pkg-config build-essential git
+              apt-get update && apt-get install -y pkg-config build-essential git libssl-dev
             fi
 
-            # Force OpenSSL to be vendored (built from source) to avoid cross-compilation linking issues
-            # This modifies Cargo.toml temporarily for the build
+            # Force OpenSSL to be vendored (built from source) for the Rust crate
             if command -v cargo > /dev/null; then
               cargo add openssl --features vendored
             fi
@@ -147,7 +146,12 @@ jobs:
             tar xzf sqlcipher.tar.gz
             (
               cd sqlcipher-4.6.0
-              ./configure --enable-tempstore=yes --disable-tcl CFLAGS="-DSQLITE_HAS_CODEC" $HOST_ARG
+              # Explicitly set flags to help configure find OpenSSL if pkg-config fails or isn't used by default
+              # In manylinux (CentOS), openssl is in /usr/include and /usr/lib64
+              export LDFLAGS="-L/usr/lib64 -L/usr/lib"
+              export CFLAGS="-I/usr/include -DSQLITE_HAS_CODEC"
+              
+              ./configure --enable-tempstore=yes --disable-tcl $HOST_ARG
               make
               make install
             )
