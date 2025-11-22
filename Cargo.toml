@@ -19,7 +19,7 @@ tower-lsp = "0.20"
 dashmap = "6"
 regex = "1"
 reqwest = { version = "0.11", features = ["json", "stream"] }
-pyo3 = { version = "0.27.1", features = ["extension-module", "experimental-async", "serde"] }
+pyo3 = { version = "0.27.1", features = ["extension-module", "experimental-async", "serde", "generate-import-lib"] }
 futures = "0.3"
 eventsource-stream = "0.2"
 chrono = "0.4"
