@@ -116,15 +116,18 @@ jobs:
             if command -v apk > /dev/null; then
               apk add pkgconfig openssl-dev sqlcipher-dev
             elif command -v yum > /dev/null; then
-              yum install -y openssl-devel
+              yum install -y pkgconfig openssl-devel
               # Build SQLCipher from source as it is not available in manylinux repos
               # Using Homebrew on Linux inside Docker is not recommended/standard for manylinux builds
               curl -L https://github.com/sqlcipher/sqlcipher/archive/v4.6.0.tar.gz -o sqlcipher.tar.gz
               tar xzf sqlcipher.tar.gz
-              cd sqlcipher-4.6.0
-              ./configure --enable-tempstore=yes --disable-tcl CFLAGS="-DSQLITE_HAS_CODEC"
-              make
-              make install
+              # Use a subshell to avoid changing the working directory for subsequent steps
+              (
+                cd sqlcipher-4.6.0
+                ./configure --enable-tempstore=yes --disable-tcl CFLAGS="-DSQLITE_HAS_CODEC"
+                make
+                make install
+              )
             elif command -v apt-get > /dev/null; then
               apt-get update && apt-get install -y pkg-config libssl-dev libsqlcipher-dev
             fi
