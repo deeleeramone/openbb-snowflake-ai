@@ -111,26 +111,46 @@ jobs:
           manylinux: ${{ matrix.manylinux }}
           args: --release --out dist --interpreter ${{ matrix.interpreter || '3.10 3.11 3.12 3.13' }}
           rust-toolchain: stable
-          docker-options: -e CI -e PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
+          docker-options: -e CI -e PKG_CONFIG_PATH=/usr/local/lib/pkgconfig -e TARGET=${{ matrix.target }}
           before-script-linux: |
+            # Install build tools
             if command -v apk > /dev/null; then
-              apk add pkgconfig openssl-dev sqlcipher-dev
+              apk add pkgconfig perl make gcc musl-dev git
             elif command -v yum > /dev/null; then
-              yum install -y pkgconfig openssl-devel
-              # Build SQLCipher from source as it is not available in manylinux repos
-              # Using Homebrew on Linux inside Docker is not recommended/standard for manylinux builds
-              curl -L https://github.com/sqlcipher/sqlcipher/archive/v4.6.0.tar.gz -o sqlcipher.tar.gz
-              tar xzf sqlcipher.tar.gz
-              # Use a subshell to avoid changing the working directory for subsequent steps
-              (
-                cd sqlcipher-4.6.0
-                ./configure --enable-tempstore=yes --disable-tcl CFLAGS="-DSQLITE_HAS_CODEC"
-                make
-                make install
-              )
+              yum install -y pkgconfig perl-core make gcc git
             elif command -v apt-get > /dev/null; then
-              apt-get update && apt-get install -y pkg-config libssl-dev libsqlcipher-dev
+              apt-get update && apt-get install -y pkg-config build-essential git
             fi
+
+            # Force OpenSSL to be vendored (built from source) to avoid cross-compilation linking issues
+            # This modifies Cargo.toml temporarily for the build
+            if command -v cargo > /dev/null; then
+              cargo add openssl --features vendored
+            fi
+
+            # Build SQLCipher from source
+            # Detect cross-compiler based on TARGET env var
+            HOST_ARG=""
+            if [[ "$TARGET" == "aarch64-unknown-linux-musl" ]]; then
+               if command -v aarch64-unknown-linux-musl-gcc > /dev/null; then
+                 export CC=aarch64-unknown-linux-musl-gcc
+                 HOST_ARG="--host=aarch64-unknown-linux-musl"
+               fi
+            elif [[ "$TARGET" == "armv7-unknown-linux-musleabihf" ]]; then
+               if command -v armv7-unknown-linux-musleabihf-gcc > /dev/null; then
+                 export CC=armv7-unknown-linux-musleabihf-gcc
+                 HOST_ARG="--host=arm-unknown-linux-musleabihf"
+               fi
+            fi
+            
+            curl -L https://github.com/sqlcipher/sqlcipher/archive/v4.6.0.tar.gz -o sqlcipher.tar.gz
+            tar xzf sqlcipher.tar.gz
+            (
+              cd sqlcipher-4.6.0
+              ./configure --enable-tempstore=yes --disable-tcl CFLAGS="-DSQLITE_HAS_CODEC" $HOST_ARG
+              make
+              make install
+            )
 
       - run: ${{ (matrix.os == 'windows' && 'dir') || 'ls -lh' }} dist/
 
