@@ -27,7 +27,7 @@ jobs:
           CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-*"
           CIBW_PROJECT_REQUIRES_PYTHON: ">=3.10"
           CIBW_BUILD_FRONTEND: "build"
-          CIBW_ENVIRONMENT: "MATURIN_MANIFEST_PATH=Cargo.toml MATURIN_FEATURES=python"
+          CIBW_ENVIRONMENT: "MATURIN_MANIFEST_PATH=../cargo.toml MATURIN_FEATURES=python"
           CIBW_SKIP: "pp* *musllinux*"
           CIBW_ARCHS_MACOS: "x86_64 arm64 universal2"
           CIBW_ARCHS_LINUX: "x86_64 aarch64"
