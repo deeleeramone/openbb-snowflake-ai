@@ -89,7 +89,10 @@ impl Backend {
         // SubQuery context - inside parentheses after SELECT/IN/EXISTS
         if let Some(open_paren_pos) = text_before_cursor.rfind('(') {
             let text_after_paren = &text_before_cursor[open_paren_pos..];
-            if Regex::new(r"(?i)^\(\s*(SELECT|WITH)").unwrap().is_match(text_after_paren) {
+            if Regex::new(r"(?i)^\(\s*(SELECT|WITH)")
+                .unwrap()
+                .is_match(text_after_paren)
+            {
                 return QueryPosition {
                     context: CompletionContext::SubQuery,
                     partial_word,
@@ -99,7 +102,10 @@ impl Backend {
         }
 
         // Qualified column (table.column or alias.column)
-        if let Some(caps) = Regex::new(r"(\w+)\.\s*(\w*)$").unwrap().captures(&text_before_cursor) {
+        if let Some(caps) = Regex::new(r"(\w+)\.\s*(\w*)$")
+            .unwrap()
+            .captures(&text_before_cursor)
+        {
             return QueryPosition {
                 context: CompletionContext::ColumnName,
                 partial_word: caps.get(2).map_or("", |m| m.as_str()).to_string(),
@@ -108,14 +114,20 @@ impl Backend {
         }
 
         // CaseExpression context
-        if Regex::new(r"(?i)\bCASE\s+(\w+\s+)?WHEN\s+\w*$").unwrap().is_match(&text_before_cursor) {
+        if Regex::new(r"(?i)\bCASE\s+(\w+\s+)?WHEN\s+\w*$")
+            .unwrap()
+            .is_match(&text_before_cursor)
+        {
             return QueryPosition {
                 context: CompletionContext::CaseExpression,
                 partial_word,
                 table_qualifier: None,
             };
         }
-        if Regex::new(r"(?i)\bCASE\b[^;]*\bTHEN\s+\w*$").unwrap().is_match(&text_before_cursor) {
+        if Regex::new(r"(?i)\bCASE\b[^;]*\bTHEN\s+\w*$")
+            .unwrap()
+            .is_match(&text_before_cursor)
+        {
             return QueryPosition {
                 context: CompletionContext::CaseExpression,
                 partial_word,
@@ -124,21 +136,30 @@ impl Backend {
         }
 
         // WindowFunction context - after OVER keyword
-        if Regex::new(r"(?i)\bOVER\s*\(\s*$").unwrap().is_match(&text_before_cursor) {
+        if Regex::new(r"(?i)\bOVER\s*\(\s*$")
+            .unwrap()
+            .is_match(&text_before_cursor)
+        {
             return QueryPosition {
                 context: CompletionContext::WindowFunction,
                 partial_word: String::new(),
                 table_qualifier: None,
             };
         }
-        if Regex::new(r"(?i)\bOVER\s*\(\s*PARTITION\s+BY\s+\w*$").unwrap().is_match(&text_before_cursor) {
+        if Regex::new(r"(?i)\bOVER\s*\(\s*PARTITION\s+BY\s+\w*$")
+            .unwrap()
+            .is_match(&text_before_cursor)
+        {
             return QueryPosition {
                 context: CompletionContext::ColumnName,
                 partial_word,
                 table_qualifier: None,
             };
         }
-        if Regex::new(r"(?i)\bOVER\s*\(\s*ORDER\s+BY\s+\w*$").unwrap().is_match(&text_before_cursor) {
+        if Regex::new(r"(?i)\bOVER\s*\(\s*ORDER\s+BY\s+\w*$")
+            .unwrap()
+            .is_match(&text_before_cursor)
+        {
             return QueryPosition {
                 context: CompletionContext::ColumnName,
                 partial_word,
@@ -147,7 +168,10 @@ impl Backend {
         }
 
         // DataType context - after AS in CAST/CONVERT
-        if Regex::new(r"(?i)\b(CAST|CONVERT|TRY_CAST)\s*\([^)]*\s+AS\s+(\w*)$").unwrap().is_match(&text_before_cursor) {
+        if Regex::new(r"(?i)\b(CAST|CONVERT|TRY_CAST)\s*\([^)]*\s+AS\s+(\w*)$")
+            .unwrap()
+            .is_match(&text_before_cursor)
+        {
             return QueryPosition {
                 context: CompletionContext::DataType,
                 partial_word,
@@ -156,14 +180,20 @@ impl Backend {
         }
 
         // JoinCondition context - after JOIN...ON
-        if Regex::new(r"(?i)\bJOIN\s+\w+\s+(AS\s+\w+\s+)?ON\s+\w*$").unwrap().is_match(&text_before_cursor) {
+        if Regex::new(r"(?i)\bJOIN\s+\w+\s+(AS\s+\w+\s+)?ON\s+\w*$")
+            .unwrap()
+            .is_match(&text_before_cursor)
+        {
             return QueryPosition {
                 context: CompletionContext::JoinCondition,
                 partial_word,
                 table_qualifier: None,
             };
         }
-        if Regex::new(r"(?i)\bJOIN\s+\w+\s+(AS\s+\w+\s+)?ON\s+[^=]+=\s*\w*$").unwrap().is_match(&text_before_cursor) {
+        if Regex::new(r"(?i)\bJOIN\s+\w+\s+(AS\s+\w+\s+)?ON\s+[^=]+=\s*\w*$")
+            .unwrap()
+            .is_match(&text_before_cursor)
+        {
             return QueryPosition {
                 context: CompletionContext::JoinCondition,
                 partial_word,
@@ -172,7 +202,10 @@ impl Backend {
         }
 
         // FunctionName context - after opening parenthesis with function-like pattern
-        if Regex::new(r"(?i)\b(\w+)\s*\($").unwrap().is_match(&text_before_cursor) {
+        if Regex::new(r"(?i)\b(\w+)\s*\($")
+            .unwrap()
+            .is_match(&text_before_cursor)
+        {
             return QueryPosition {
                 context: CompletionContext::FunctionName,
                 partial_word: String::new(),
@@ -190,7 +223,10 @@ impl Backend {
         }
 
         // ColumnName context - after SELECT
-        if Regex::new(r"(?i)\bSELECT\s+(DISTINCT\s+)?(\w*)$").unwrap().is_match(&text_before_cursor) {
+        if Regex::new(r"(?i)\bSELECT\s+(DISTINCT\s+)?(\w*)$")
+            .unwrap()
+            .is_match(&text_before_cursor)
+        {
             return QueryPosition {
                 context: CompletionContext::ColumnName,
                 partial_word,
@@ -199,8 +235,12 @@ impl Backend {
         }
 
         // ColumnName context - after comma in SELECT (before FROM)
-        if upper_text.contains("SELECT") && !upper_text.contains("FROM") &&
-           Regex::new(r",\s*(\w*)$").unwrap().is_match(&text_before_cursor) {
+        if upper_text.contains("SELECT")
+            && !upper_text.contains("FROM")
+            && Regex::new(r",\s*(\w*)$")
+                .unwrap()
+                .is_match(&text_before_cursor)
+        {
             return QueryPosition {
                 context: CompletionContext::ColumnName,
                 partial_word,
@@ -209,14 +249,20 @@ impl Backend {
         }
 
         // ColumnName context - in WHERE, HAVING, GROUP BY, ORDER BY clauses
-        if Regex::new(r"(?i)\b(WHERE|HAVING|AND|OR)\s+(\w*)$").unwrap().is_match(&text_before_cursor) {
+        if Regex::new(r"(?i)\b(WHERE|HAVING|AND|OR)\s+(\w*)$")
+            .unwrap()
+            .is_match(&text_before_cursor)
+        {
             return QueryPosition {
                 context: CompletionContext::ColumnName,
                 partial_word,
                 table_qualifier: None,
             };
         }
-        if Regex::new(r"(?i)\b(GROUP\s+BY|ORDER\s+BY)\s+(\w*)$").unwrap().is_match(&text_before_cursor) {
+        if Regex::new(r"(?i)\b(GROUP\s+BY|ORDER\s+BY)\s+(\w*)$")
+            .unwrap()
+            .is_match(&text_before_cursor)
+        {
             return QueryPosition {
                 context: CompletionContext::ColumnName,
                 partial_word,
@@ -234,140 +280,491 @@ impl Backend {
 
     fn get_sql_keywords(&self) -> Vec<&'static str> {
         vec![
-            "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "COPY", "TRUNCATE",
-            "CREATE", "ALTER", "DROP", "RENAME", "CLONE", "UNDROP",
-            "TABLE", "VIEW", "MATERIALIZED VIEW", "SEQUENCE", "STAGE", "PIPE",
-            "STREAM", "TASK", "DATABASE", "SCHEMA", "WAREHOUSE", "USER", "ROLE",
-            "FROM", "WHERE", "GROUP BY", "HAVING", "ORDER BY", "LIMIT", "OFFSET",
-            "QUALIFY", "SAMPLE", "TABLESAMPLE",
-            "JOIN", "INNER JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL JOIN", "FULL OUTER JOIN",
-            "CROSS JOIN", "NATURAL JOIN", "LEFT OUTER JOIN", "RIGHT OUTER JOIN",
-            "ON", "USING",
-            "UNION", "UNION ALL", "INTERSECT", "EXCEPT", "MINUS",
-            "CASE", "WHEN", "THEN", "ELSE", "END", "IF", "IFNULL", "NULLIF", "NVL", "IFF",
-            "AND", "OR", "NOT", "IN", "NOT IN", "EXISTS", "NOT EXISTS",
-            "BETWEEN", "LIKE", "ILIKE", "RLIKE", "REGEXP",
-            "IS NULL", "IS NOT NULL", "IS TRUE", "IS FALSE",
-            "DISTINCT", "ALL", "AS", "ASC", "DESC", "NULLS FIRST", "NULLS LAST",
-            "WITH", "RECURSIVE", "LATERAL",
-            "OVER", "PARTITION BY", "ROWS", "RANGE", "UNBOUNDED", "PRECEDING", "FOLLOWING", "CURRENT ROW",
-            "VALUES", "DEFAULT", "NULL", "TRUE", "FALSE",
-            "CAST", "CONVERT", "TRY_CAST", "TRY_TO_NUMBER", "TRY_TO_DATE", "TRY_TO_TIMESTAMP",
-            "SHOW", "DESCRIBE", "DESC", "USE", "SET", "UNSET",
-            "BEGIN", "COMMIT", "ROLLBACK", "TRANSACTION",
-            "GRANT", "REVOKE", "EXECUTE", "USAGE", "OWNERSHIP",
+            "SELECT",
+            "INSERT",
+            "UPDATE",
+            "DELETE",
+            "MERGE",
+            "COPY",
+            "TRUNCATE",
+            "CREATE",
+            "ALTER",
+            "DROP",
+            "RENAME",
+            "CLONE",
+            "UNDROP",
+            "TABLE",
+            "VIEW",
+            "MATERIALIZED VIEW",
+            "SEQUENCE",
+            "STAGE",
+            "PIPE",
+            "STREAM",
+            "TASK",
+            "DATABASE",
+            "SCHEMA",
+            "WAREHOUSE",
+            "USER",
+            "ROLE",
+            "FROM",
+            "WHERE",
+            "GROUP BY",
+            "HAVING",
+            "ORDER BY",
+            "LIMIT",
+            "OFFSET",
+            "QUALIFY",
+            "SAMPLE",
+            "TABLESAMPLE",
+            "JOIN",
+            "INNER JOIN",
+            "LEFT JOIN",
+            "RIGHT JOIN",
+            "FULL JOIN",
+            "FULL OUTER JOIN",
+            "CROSS JOIN",
+            "NATURAL JOIN",
+            "LEFT OUTER JOIN",
+            "RIGHT OUTER JOIN",
+            "ON",
+            "USING",
+            "UNION",
+            "UNION ALL",
+            "INTERSECT",
+            "EXCEPT",
+            "MINUS",
+            "CASE",
+            "WHEN",
+            "THEN",
+            "ELSE",
+            "END",
+            "IF",
+            "IFNULL",
+            "NULLIF",
+            "NVL",
+            "IFF",
+            "AND",
+            "OR",
+            "NOT",
+            "IN",
+            "NOT IN",
+            "EXISTS",
+            "NOT EXISTS",
+            "BETWEEN",
+            "LIKE",
+            "ILIKE",
+            "RLIKE",
+            "REGEXP",
+            "IS NULL",
+            "IS NOT NULL",
+            "IS TRUE",
+            "IS FALSE",
+            "DISTINCT",
+            "ALL",
+            "AS",
+            "ASC",
+            "DESC",
+            "NULLS FIRST",
+            "NULLS LAST",
+            "WITH",
+            "RECURSIVE",
+            "LATERAL",
+            "OVER",
+            "PARTITION BY",
+            "ROWS",
+            "RANGE",
+            "UNBOUNDED",
+            "PRECEDING",
+            "FOLLOWING",
+            "CURRENT ROW",
+            "VALUES",
+            "DEFAULT",
+            "NULL",
+            "TRUE",
+            "FALSE",
+            "CAST",
+            "CONVERT",
+            "TRY_CAST",
+            "TRY_TO_NUMBER",
+            "TRY_TO_DATE",
+            "TRY_TO_TIMESTAMP",
+            "SHOW",
+            "DESCRIBE",
+            "DESC",
+            "USE",
+            "SET",
+            "UNSET",
+            "BEGIN",
+            "COMMIT",
+            "ROLLBACK",
+            "TRANSACTION",
+            "GRANT",
+            "REVOKE",
+            "EXECUTE",
+            "USAGE",
+            "OWNERSHIP",
         ]
     }
 
     fn get_aggregate_functions(&self) -> Vec<&'static str> {
         vec![
-            "COUNT", "SUM", "AVG", "MIN", "MAX", "MEDIAN", "MODE",
-            "STDDEV", "STDDEV_POP", "STDDEV_SAMP", "VARIANCE", "VAR_POP", "VAR_SAMP",
-            "CORR", "COVAR_POP", "COVAR_SAMP",
-            "LISTAGG", "ARRAY_AGG", "OBJECT_AGG",
-            "APPROX_COUNT_DISTINCT", "APPROX_PERCENTILE", "APPROX_TOP_K",
-            "ANY_VALUE", "BITAND_AGG", "BITOR_AGG", "BITXOR_AGG",
-            "BOOLAND_AGG", "BOOLOR_AGG", "BOOLXOR_AGG",
+            "COUNT",
+            "SUM",
+            "AVG",
+            "MIN",
+            "MAX",
+            "MEDIAN",
+            "MODE",
+            "STDDEV",
+            "STDDEV_POP",
+            "STDDEV_SAMP",
+            "VARIANCE",
+            "VAR_POP",
+            "VAR_SAMP",
+            "CORR",
+            "COVAR_POP",
+            "COVAR_SAMP",
+            "LISTAGG",
+            "ARRAY_AGG",
+            "OBJECT_AGG",
+            "APPROX_COUNT_DISTINCT",
+            "APPROX_PERCENTILE",
+            "APPROX_TOP_K",
+            "ANY_VALUE",
+            "BITAND_AGG",
+            "BITOR_AGG",
+            "BITXOR_AGG",
+            "BOOLAND_AGG",
+            "BOOLOR_AGG",
+            "BOOLXOR_AGG",
         ]
     }
 
     fn get_window_functions(&self) -> Vec<&'static str> {
         vec![
-            "ROW_NUMBER", "RANK", "DENSE_RANK", "PERCENT_RANK", "CUME_DIST", "NTILE",
-            "LAG", "LEAD", "FIRST_VALUE", "LAST_VALUE", "NTH_VALUE",
-            "RATIO_TO_REPORT", "WIDTH_BUCKET",
+            "ROW_NUMBER",
+            "RANK",
+            "DENSE_RANK",
+            "PERCENT_RANK",
+            "CUME_DIST",
+            "NTILE",
+            "LAG",
+            "LEAD",
+            "FIRST_VALUE",
+            "LAST_VALUE",
+            "NTH_VALUE",
+            "RATIO_TO_REPORT",
+            "WIDTH_BUCKET",
         ]
     }
 
     fn get_string_functions(&self) -> Vec<&'static str> {
         vec![
-            "CONCAT", "CONCAT_WS", "LENGTH", "LEN", "CHAR_LENGTH", "CHARACTER_LENGTH",
-            "LOWER", "UPPER", "INITCAP", "TRIM", "LTRIM", "RTRIM",
-            "SUBSTR", "SUBSTRING", "LEFT", "RIGHT", "SPLIT", "SPLIT_PART",
-            "REPLACE", "REGEXP_REPLACE", "REGEXP_SUBSTR", "REGEXP_INSTR", "REGEXP_COUNT",
-            "CONTAINS", "STARTSWITH", "ENDSWITH", "POSITION", "CHARINDEX",
-            "REVERSE", "REPEAT", "SPACE", "LPAD", "RPAD",
-            "TRANSLATE", "SOUNDEX", "EDITDISTANCE", "JAROWINKLER_SIMILARITY",
-            "ASCII", "CHR", "UNICODE", "HEX_ENCODE", "HEX_DECODE", "BASE64_ENCODE", "BASE64_DECODE",
-            "MD5", "SHA1", "SHA2", "HASH",
+            "CONCAT",
+            "CONCAT_WS",
+            "LENGTH",
+            "LEN",
+            "CHAR_LENGTH",
+            "CHARACTER_LENGTH",
+            "LOWER",
+            "UPPER",
+            "INITCAP",
+            "TRIM",
+            "LTRIM",
+            "RTRIM",
+            "SUBSTR",
+            "SUBSTRING",
+            "LEFT",
+            "RIGHT",
+            "SPLIT",
+            "SPLIT_PART",
+            "REPLACE",
+            "REGEXP_REPLACE",
+            "REGEXP_SUBSTR",
+            "REGEXP_INSTR",
+            "REGEXP_COUNT",
+            "CONTAINS",
+            "STARTSWITH",
+            "ENDSWITH",
+            "POSITION",
+            "CHARINDEX",
+            "REVERSE",
+            "REPEAT",
+            "SPACE",
+            "LPAD",
+            "RPAD",
+            "TRANSLATE",
+            "SOUNDEX",
+            "EDITDISTANCE",
+            "JAROWINKLER_SIMILARITY",
+            "ASCII",
+            "CHR",
+            "UNICODE",
+            "HEX_ENCODE",
+            "HEX_DECODE",
+            "BASE64_ENCODE",
+            "BASE64_DECODE",
+            "MD5",
+            "SHA1",
+            "SHA2",
+            "HASH",
         ]
     }
 
     fn get_date_time_functions(&self) -> Vec<&'static str> {
         vec![
-            "CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP", "SYSDATE", "SYSTIMESTAMP",
-            "GETDATE", "LOCALTIME", "LOCALTIMESTAMP",
-            "DATE_TRUNC", "TRUNC", "DATE_PART", "DATEADD", "DATEDIFF", "TIMESTAMPADD", "TIMESTAMPDIFF",
-            "YEAR", "QUARTER", "MONTH", "WEEK", "WEEKOFYEAR", "DAYOFWEEK", "DAYOFWEEKISO",
-            "DAYOFYEAR", "DAY", "DAYNAME", "MONTHNAME", "HOUR", "MINUTE", "SECOND",
-            "LAST_DAY", "NEXT_DAY", "PREVIOUS_DAY", "ADD_MONTHS",
-            "TO_DATE", "TO_TIME", "TO_TIMESTAMP", "TO_TIMESTAMP_LTZ", "TO_TIMESTAMP_NTZ", "TO_TIMESTAMP_TZ",
-            "TRY_TO_DATE", "TRY_TO_TIME", "TRY_TO_TIMESTAMP",
-            "DATE_FROM_PARTS", "TIME_FROM_PARTS", "TIMESTAMP_FROM_PARTS",
-            "EXTRACT", "TIME_SLICE", "CONVERT_TIMEZONE",
+            "CURRENT_DATE",
+            "CURRENT_TIME",
+            "CURRENT_TIMESTAMP",
+            "SYSDATE",
+            "SYSTIMESTAMP",
+            "GETDATE",
+            "LOCALTIME",
+            "LOCALTIMESTAMP",
+            "DATE_TRUNC",
+            "TRUNC",
+            "DATE_PART",
+            "DATEADD",
+            "DATEDIFF",
+            "TIMESTAMPADD",
+            "TIMESTAMPDIFF",
+            "YEAR",
+            "QUARTER",
+            "MONTH",
+            "WEEK",
+            "WEEKOFYEAR",
+            "DAYOFWEEK",
+            "DAYOFWEEKISO",
+            "DAYOFYEAR",
+            "DAY",
+            "DAYNAME",
+            "MONTHNAME",
+            "HOUR",
+            "MINUTE",
+            "SECOND",
+            "LAST_DAY",
+            "NEXT_DAY",
+            "PREVIOUS_DAY",
+            "ADD_MONTHS",
+            "TO_DATE",
+            "TO_TIME",
+            "TO_TIMESTAMP",
+            "TO_TIMESTAMP_LTZ",
+            "TO_TIMESTAMP_NTZ",
+            "TO_TIMESTAMP_TZ",
+            "TRY_TO_DATE",
+            "TRY_TO_TIME",
+            "TRY_TO_TIMESTAMP",
+            "DATE_FROM_PARTS",
+            "TIME_FROM_PARTS",
+            "TIMESTAMP_FROM_PARTS",
+            "EXTRACT",
+            "TIME_SLICE",
+            "CONVERT_TIMEZONE",
         ]
     }
 
     fn get_numeric_functions(&self) -> Vec<&'static str> {
         vec![
-            "ABS", "CEIL", "CEILING", "FLOOR", "ROUND", "TRUNCATE", "TRUNC",
-            "MOD", "POWER", "POW", "SQRT", "EXP", "LN", "LOG",
-            "SIGN", "DEGREES", "RADIANS", "SIN", "COS", "TAN", "ASIN", "ACOS", "ATAN", "ATAN2",
-            "SINH", "COSH", "TANH", "ASINH", "ACOSH", "ATANH",
-            "PI", "RANDOM", "UNIFORM", "NORMAL", "ZIPF",
-            "DIV0", "DIV0NULL", "GREATEST", "LEAST",
-            "BITAND", "BITOR", "BITXOR", "BITNOT", "BITSHIFTLEFT", "BITSHIFTRIGHT",
-            "GETBIT", "HAVERSINE", "SQUARE",
+            "ABS",
+            "CEIL",
+            "CEILING",
+            "FLOOR",
+            "ROUND",
+            "TRUNCATE",
+            "TRUNC",
+            "MOD",
+            "POWER",
+            "POW",
+            "SQRT",
+            "EXP",
+            "LN",
+            "LOG",
+            "SIGN",
+            "DEGREES",
+            "RADIANS",
+            "SIN",
+            "COS",
+            "TAN",
+            "ASIN",
+            "ACOS",
+            "ATAN",
+            "ATAN2",
+            "SINH",
+            "COSH",
+            "TANH",
+            "ASINH",
+            "ACOSH",
+            "ATANH",
+            "PI",
+            "RANDOM",
+            "UNIFORM",
+            "NORMAL",
+            "ZIPF",
+            "DIV0",
+            "DIV0NULL",
+            "GREATEST",
+            "LEAST",
+            "BITAND",
+            "BITOR",
+            "BITXOR",
+            "BITNOT",
+            "BITSHIFTLEFT",
+            "BITSHIFTRIGHT",
+            "GETBIT",
+            "HAVERSINE",
+            "SQUARE",
         ]
     }
 
     fn get_conversion_functions(&self) -> Vec<&'static str> {
         vec![
-            "TO_CHAR", "TO_VARCHAR", "TO_NUMBER", "TO_DECIMAL", "TO_NUMERIC",
-            "TO_DOUBLE", "TO_BINARY", "TO_BOOLEAN", "TO_ARRAY", "TO_OBJECT", "TO_VARIANT",
-            "TRY_TO_BINARY", "TRY_TO_BOOLEAN", "TRY_TO_NUMBER", "TRY_TO_DECIMAL", "TRY_TO_NUMERIC", "TRY_TO_DOUBLE",
-            "PARSE_JSON", "PARSE_XML", "TRY_PARSE_JSON",
+            "TO_CHAR",
+            "TO_VARCHAR",
+            "TO_NUMBER",
+            "TO_DECIMAL",
+            "TO_NUMERIC",
+            "TO_DOUBLE",
+            "TO_BINARY",
+            "TO_BOOLEAN",
+            "TO_ARRAY",
+            "TO_OBJECT",
+            "TO_VARIANT",
+            "TRY_TO_BINARY",
+            "TRY_TO_BOOLEAN",
+            "TRY_TO_NUMBER",
+            "TRY_TO_DECIMAL",
+            "TRY_TO_NUMERIC",
+            "TRY_TO_DOUBLE",
+            "PARSE_JSON",
+            "PARSE_XML",
+            "TRY_PARSE_JSON",
         ]
     }
 
     fn get_conditional_functions(&self) -> Vec<&'static str> {
         vec![
-            "COALESCE", "DECODE", "IFF", "IFNULL", "NVL", "NVL2", "NULLIF", "ZEROIFNULL",
-            "EQUAL_NULL", "REGR_VALX", "REGR_VALY",
+            "COALESCE",
+            "DECODE",
+            "IFF",
+            "IFNULL",
+            "NVL",
+            "NVL2",
+            "NULLIF",
+            "ZEROIFNULL",
+            "EQUAL_NULL",
+            "REGR_VALX",
+            "REGR_VALY",
         ]
     }
 
     fn get_semi_structured_functions(&self) -> Vec<&'static str> {
         vec![
-            "ARRAY_CONSTRUCT", "ARRAY_SIZE", "ARRAY_SLICE", "ARRAY_APPEND", "ARRAY_CAT", "ARRAY_COMPACT",
-            "ARRAY_CONTAINS", "ARRAY_INSERT", "ARRAY_INTERSECTION", "ARRAY_POSITION", "ARRAY_PREPEND",
-            "ARRAY_REMOVE", "ARRAY_TO_STRING", "ARRAY_UNIQUE_AGG", "ARRAYS_OVERLAP",
-            "OBJECT_CONSTRUCT", "OBJECT_DELETE", "OBJECT_INSERT", "OBJECT_PICK", "OBJECT_KEYS",
-            "GET", "GET_PATH", "FLATTEN", "PARSE_JSON", "CHECK_JSON", "CHECK_XML",
-            "STRIP_NULL_VALUE", "XMLGET", "AS_ARRAY", "AS_BINARY", "AS_BOOLEAN", "AS_CHAR",
-            "AS_DATE", "AS_DECIMAL", "AS_DOUBLE", "AS_INTEGER", "AS_NUMBER", "AS_OBJECT",
-            "AS_REAL", "AS_TIME", "AS_TIMESTAMP_LTZ", "AS_TIMESTAMP_NTZ", "AS_TIMESTAMP_TZ", "AS_VARCHAR",
+            "ARRAY_CONSTRUCT",
+            "ARRAY_SIZE",
+            "ARRAY_SLICE",
+            "ARRAY_APPEND",
+            "ARRAY_CAT",
+            "ARRAY_COMPACT",
+            "ARRAY_CONTAINS",
+            "ARRAY_INSERT",
+            "ARRAY_INTERSECTION",
+            "ARRAY_POSITION",
+            "ARRAY_PREPEND",
+            "ARRAY_REMOVE",
+            "ARRAY_TO_STRING",
+            "ARRAY_UNIQUE_AGG",
+            "ARRAYS_OVERLAP",
+            "OBJECT_CONSTRUCT",
+            "OBJECT_DELETE",
+            "OBJECT_INSERT",
+            "OBJECT_PICK",
+            "OBJECT_KEYS",
+            "GET",
+            "GET_PATH",
+            "FLATTEN",
+            "PARSE_JSON",
+            "CHECK_JSON",
+            "CHECK_XML",
+            "STRIP_NULL_VALUE",
+            "XMLGET",
+            "AS_ARRAY",
+            "AS_BINARY",
+            "AS_BOOLEAN",
+            "AS_CHAR",
+            "AS_DATE",
+            "AS_DECIMAL",
+            "AS_DOUBLE",
+            "AS_INTEGER",
+            "AS_NUMBER",
+            "AS_OBJECT",
+            "AS_REAL",
+            "AS_TIME",
+            "AS_TIMESTAMP_LTZ",
+            "AS_TIMESTAMP_NTZ",
+            "AS_TIMESTAMP_TZ",
+            "AS_VARCHAR",
         ]
     }
 
     fn get_context_functions(&self) -> Vec<&'static str> {
         vec![
-            "CURRENT_ACCOUNT", "CURRENT_CLIENT", "CURRENT_DATABASE", "CURRENT_ROLE",
-            "CURRENT_SCHEMA", "CURRENT_SCHEMAS", "CURRENT_SESSION", "CURRENT_STATEMENT",
-            "CURRENT_TRANSACTION", "CURRENT_USER", "CURRENT_VERSION", "CURRENT_WAREHOUSE",
-            "INVOKER_ROLE", "INVOKER_SHARE", "IS_GRANTED_TO_INVOKER_ROLE", "IS_ROLE_IN_SESSION",
+            "CURRENT_ACCOUNT",
+            "CURRENT_CLIENT",
+            "CURRENT_DATABASE",
+            "CURRENT_ROLE",
+            "CURRENT_SCHEMA",
+            "CURRENT_SCHEMAS",
+            "CURRENT_SESSION",
+            "CURRENT_STATEMENT",
+            "CURRENT_TRANSACTION",
+            "CURRENT_USER",
+            "CURRENT_VERSION",
+            "CURRENT_WAREHOUSE",
+            "INVOKER_ROLE",
+            "INVOKER_SHARE",
+            "IS_GRANTED_TO_INVOKER_ROLE",
+            "IS_ROLE_IN_SESSION",
         ]
     }
 
     fn get_data_types(&self) -> Vec<&'static str> {
         vec![
-            "NUMBER", "DECIMAL", "NUMERIC", "INT", "INTEGER", "BIGINT", "SMALLINT", "TINYINT", "BYTEINT",
-            "FLOAT", "FLOAT4", "FLOAT8", "DOUBLE", "DOUBLE PRECISION", "REAL",
-            "VARCHAR", "CHAR", "CHARACTER", "STRING", "TEXT", "BINARY", "VARBINARY",
+            "NUMBER",
+            "DECIMAL",
+            "NUMERIC",
+            "INT",
+            "INTEGER",
+            "BIGINT",
+            "SMALLINT",
+            "TINYINT",
+            "BYTEINT",
+            "FLOAT",
+            "FLOAT4",
+            "FLOAT8",
+            "DOUBLE",
+            "DOUBLE PRECISION",
+            "REAL",
+            "VARCHAR",
+            "CHAR",
+            "CHARACTER",
+            "STRING",
+            "TEXT",
+            "BINARY",
+            "VARBINARY",
             "BOOLEAN",
-            "DATE", "DATETIME", "TIME", "TIMESTAMP", "TIMESTAMP_LTZ", "TIMESTAMP_NTZ", "TIMESTAMP_TZ",
-            "VARIANT", "OBJECT", "ARRAY",
-            "GEOGRAPHY", "GEOMETRY",
+            "DATE",
+            "DATETIME",
+            "TIME",
+            "TIMESTAMP",
+            "TIMESTAMP_LTZ",
+            "TIMESTAMP_NTZ",
+            "TIMESTAMP_TZ",
+            "VARIANT",
+            "OBJECT",
+            "ARRAY",
+            "GEOGRAPHY",
+            "GEOMETRY",
         ]
     }
 
@@ -405,13 +802,27 @@ impl Backend {
         let mut formatted = sql.to_string();
 
         // Add newlines before major keywords
-        for keyword in &["FROM", "WHERE", "JOIN", "INNER JOIN", "LEFT JOIN", "RIGHT JOIN",
-                         "FULL JOIN", "GROUP BY", "ORDER BY", "HAVING", "LIMIT", "OFFSET"] {
+        for keyword in &[
+            "FROM",
+            "WHERE",
+            "JOIN",
+            "INNER JOIN",
+            "LEFT JOIN",
+            "RIGHT JOIN",
+            "FULL JOIN",
+            "GROUP BY",
+            "ORDER BY",
+            "HAVING",
+            "LIMIT",
+            "OFFSET",
+        ] {
             let pattern = format!(r"(?i)\s+({})\s+", regex::escape(keyword));
             if let Ok(re) = Regex::new(&pattern) {
-                formatted = re.replace_all(&formatted, |caps: &regex::Captures| {
-                    format!("\n{} ", caps.get(1).unwrap().as_str().to_uppercase())
-                }).to_string();
+                formatted = re
+                    .replace_all(&formatted, |caps: &regex::Captures| {
+                        format!("\n{} ", caps.get(1).unwrap().as_str().to_uppercase())
+                    })
+                    .to_string();
             }
         }
 
@@ -435,9 +846,12 @@ impl Backend {
             }
 
             // Decrease indent for certain keywords
-            if trimmed.starts_with("FROM") || trimmed.starts_with("WHERE") ||
-               trimmed.starts_with("GROUP BY") || trimmed.starts_with("ORDER BY") ||
-               trimmed.starts_with("HAVING") {
+            if trimmed.starts_with("FROM")
+                || trimmed.starts_with("WHERE")
+                || trimmed.starts_with("GROUP BY")
+                || trimmed.starts_with("ORDER BY")
+                || trimmed.starts_with("HAVING")
+            {
                 indent_level = 1;
             } else if trimmed.starts_with("SELECT") {
                 indent_level = 0;
@@ -464,19 +878,18 @@ impl Backend {
             };
 
             match engine.get_query_suggestions(&current_query).await {
-                Ok(suggestions) => {
-                    suggestions.into_iter().map(|suggestion| {
-                        CompletionItem {
-                            label: suggestion.clone(),
-                            kind: Some(CompletionItemKind::TEXT),
-                            detail: Some("Cortex AI Suggestion".to_string()),
-                            insert_text: Some(suggestion),
-                            insert_text_format: Some(InsertTextFormat::PLAIN_TEXT),
-                            ..Default::default()
-                        }
-                    }).collect()
-                }
-                Err(_) => vec![]
+                Ok(suggestions) => suggestions
+                    .into_iter()
+                    .map(|suggestion| CompletionItem {
+                        label: suggestion.clone(),
+                        kind: Some(CompletionItemKind::TEXT),
+                        detail: Some("Cortex AI Suggestion".to_string()),
+                        insert_text: Some(suggestion),
+                        insert_text_format: Some(InsertTextFormat::PLAIN_TEXT),
+                        ..Default::default()
+                    })
+                    .collect(),
+                Err(_) => vec![],
             }
         } else {
             vec![]
@@ -493,10 +906,17 @@ impl LanguageServer for Backend {
                 version: Some("1.0.0".to_string()),
             }),
             capabilities: ServerCapabilities {
-                text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
+                text_document_sync: Some(TextDocumentSyncCapability::Kind(
+                    TextDocumentSyncKind::FULL,
+                )),
                 completion_provider: Some(CompletionOptions {
                     resolve_provider: Some(false),
-                    trigger_characters: Some(vec![".".to_string(), " ".to_string(), ",".to_string(), "(".to_string()]),
+                    trigger_characters: Some(vec![
+                        ".".to_string(),
+                        " ".to_string(),
+                        ",".to_string(),
+                        "(".to_string(),
+                    ]),
                     work_done_progress_options: Default::default(),
                     all_commit_characters: None,
                     completion_item: None,
@@ -533,7 +953,9 @@ impl LanguageServer for Backend {
     }
 
     async fn initialized(&self, _: InitializedParams) {
-        self.client.log_message(MessageType::INFO, "Snowflake LSP initialized!").await;
+        self.client
+            .log_message(MessageType::INFO, "Snowflake LSP initialized!")
+            .await;
 
         let engine_lock = self.engine.lock().await;
         if let Some(engine) = &*engine_lock {
@@ -541,17 +963,27 @@ impl LanguageServer for Backend {
                 Ok(schema) => {
                     *self.schema_cache.lock().await = schema;
                     let count = self.schema_cache.lock().await.len();
-                    self.client.log_message(MessageType::INFO, &format!("Schema cached: {} columns", count)).await;
+                    self.client
+                        .log_message(
+                            MessageType::INFO,
+                            &format!("Schema cached: {} columns", count),
+                        )
+                        .await;
                 }
                 Err(e) => {
-                    self.client.log_message(MessageType::ERROR, &format!("Schema fetch failed: {}", e)).await;
+                    self.client
+                        .log_message(MessageType::ERROR, &format!("Schema fetch failed: {}", e))
+                        .await;
                 }
             }
         }
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
-        self.document_map.insert(params.text_document.uri.to_string(), params.text_document.text);
+        self.document_map.insert(
+            params.text_document.uri.to_string(),
+            params.text_document.text,
+        );
     }
 
     async fn did_change(&self, mut params: DidChangeTextDocumentParams) {
@@ -570,14 +1002,17 @@ impl LanguageServer for Backend {
                         if let Some(line_match) = caps.get(1) {
                             if let Ok(line) = line_match.as_str().parse::<u32>() {
                                 let line = if line > 0 { line - 1 } else { 0 };
-                                range = Range::new(Position::new(line, 0), Position::new(line, 1000));
+                                range =
+                                    Range::new(Position::new(line, 0), Position::new(line, 1000));
                             }
                         }
                     }
                     vec![Diagnostic::new_simple(range, e)]
                 }
             };
-            self.client.publish_diagnostics(params.text_document.uri, diagnostics, None).await;
+            self.client
+                .publish_diagnostics(params.text_document.uri, diagnostics, None)
+                .await;
         }
     }
 
@@ -598,7 +1033,15 @@ impl LanguageServer for Backend {
         let query_pos = self.analyze_query_context(text, position);
         let partial_word = &query_pos.partial_word;
 
-        self.client.log_message(MessageType::INFO, &format!("Context: {:?}, partial: '{}'", query_pos.context, partial_word)).await;
+        self.client
+            .log_message(
+                MessageType::INFO,
+                &format!(
+                    "Context: {:?}, partial: '{}'",
+                    query_pos.context, partial_word
+                ),
+            )
+            .await;
 
         let mut items = Vec::new();
         let schema_cache = self.schema_cache.lock().await;
@@ -616,12 +1059,18 @@ impl LanguageServer for Backend {
                     if seen.insert(item.table_name.clone()) {
                         let score = self.calculate_completion_score(&item.table_name, partial_word);
                         if score > 0 {
-                            items.push((score, CompletionItem {
-                                label: item.table_name.clone(),
-                                kind: Some(CompletionItemKind::CLASS),
-                                detail: Some(format!("{}.{}", item.table_schema, item.table_name)),
-                                ..Default::default()
-                            }));
+                            items.push((
+                                score,
+                                CompletionItem {
+                                    label: item.table_name.clone(),
+                                    kind: Some(CompletionItemKind::CLASS),
+                                    detail: Some(format!(
+                                        "{}.{}",
+                                        item.table_schema, item.table_name
+                                    )),
+                                    ..Default::default()
+                                },
+                            ));
                         }
                     }
                 }
@@ -630,14 +1079,21 @@ impl LanguageServer for Backend {
                 if let Some(table) = &query_pos.table_qualifier {
                     for item in schema_cache.iter() {
                         if item.table_name.eq_ignore_ascii_case(table) {
-                            let score = self.calculate_completion_score(&item.column_name, partial_word);
+                            let score =
+                                self.calculate_completion_score(&item.column_name, partial_word);
                             if score > 0 {
-                                items.push((score, CompletionItem {
-                                    label: item.column_name.clone(),
-                                    kind: Some(CompletionItemKind::FIELD),
-                                    detail: Some(format!("{} ({})", item.data_type, item.table_name)),
-                                    ..Default::default()
-                                }));
+                                items.push((
+                                    score,
+                                    CompletionItem {
+                                        label: item.column_name.clone(),
+                                        kind: Some(CompletionItemKind::FIELD),
+                                        detail: Some(format!(
+                                            "{} ({})",
+                                            item.data_type, item.table_name
+                                        )),
+                                        ..Default::default()
+                                    },
+                                ));
                             }
                         }
                     }
@@ -647,40 +1103,55 @@ impl LanguageServer for Backend {
                     for item in schema_cache.iter() {
                         let key = format!("{}:{}", item.column_name, item.data_type);
                         if seen.insert(key) {
-                            let score = self.calculate_completion_score(&item.column_name, partial_word);
+                            let score =
+                                self.calculate_completion_score(&item.column_name, partial_word);
                             if score > 0 {
-                                let in_query = tables_in_query.iter().any(|t| t.eq_ignore_ascii_case(&item.table_name));
+                                let in_query = tables_in_query
+                                    .iter()
+                                    .any(|t| t.eq_ignore_ascii_case(&item.table_name));
                                 let final_score = if in_query { score + 300 } else { score };
-                                items.push((final_score, CompletionItem {
-                                    label: item.column_name.clone(),
-                                    kind: Some(CompletionItemKind::FIELD),
-                                    detail: Some(format!("{} ({})", item.data_type, item.table_name)),
-                                    ..Default::default()
-                                }));
+                                items.push((
+                                    final_score,
+                                    CompletionItem {
+                                        label: item.column_name.clone(),
+                                        kind: Some(CompletionItemKind::FIELD),
+                                        detail: Some(format!(
+                                            "{} ({})",
+                                            item.data_type, item.table_name
+                                        )),
+                                        ..Default::default()
+                                    },
+                                ));
                             }
                         }
                     }
                 }
             }
             CompletionContext::FunctionName | CompletionContext::CaseExpression => {
-                for func in self.get_aggregate_functions().iter()
+                for func in self
+                    .get_aggregate_functions()
+                    .iter()
                     .chain(self.get_string_functions().iter())
                     .chain(self.get_date_time_functions().iter())
                     .chain(self.get_numeric_functions().iter())
                     .chain(self.get_conditional_functions().iter())
                     .chain(self.get_conversion_functions().iter())
                     .chain(self.get_semi_structured_functions().iter())
-                    .chain(self.get_context_functions().iter()) {
+                    .chain(self.get_context_functions().iter())
+                {
                     let score = self.calculate_completion_score(func, partial_word);
                     if score > 0 {
-                        items.push((score, CompletionItem {
-                            label: func.to_string(),
-                            kind: Some(CompletionItemKind::FUNCTION),
-                            detail: Some("Function".to_string()),
-                            insert_text: Some(format!("{}(${{1}})", func)),
-                            insert_text_format: Some(InsertTextFormat::SNIPPET),
-                            ..Default::default()
-                        }));
+                        items.push((
+                            score,
+                            CompletionItem {
+                                label: func.to_string(),
+                                kind: Some(CompletionItemKind::FUNCTION),
+                                detail: Some("Function".to_string()),
+                                insert_text: Some(format!("{}(${{1}})", func)),
+                                insert_text_format: Some(InsertTextFormat::SNIPPET),
+                                ..Default::default()
+                            },
+                        ));
                     }
                 }
             }
@@ -688,12 +1159,15 @@ impl LanguageServer for Backend {
                 for dtype in self.get_data_types() {
                     let score = self.calculate_completion_score(dtype, partial_word);
                     if score > 0 {
-                        items.push((score, CompletionItem {
-                            label: dtype.to_string(),
-                            kind: Some(CompletionItemKind::TYPE_PARAMETER),
-                            detail: Some("Data Type".to_string()),
-                            ..Default::default()
-                        }));
+                        items.push((
+                            score,
+                            CompletionItem {
+                                label: dtype.to_string(),
+                                kind: Some(CompletionItemKind::TYPE_PARAMETER),
+                                detail: Some("Data Type".to_string()),
+                                ..Default::default()
+                            },
+                        ));
                     }
                 }
             }
@@ -701,39 +1175,52 @@ impl LanguageServer for Backend {
                 for func in self.get_window_functions() {
                     let score = self.calculate_completion_score(func, partial_word);
                     if score > 0 {
-                        items.push((score, CompletionItem {
-                            label: format!("{} PARTITION BY", func),
-                            kind: Some(CompletionItemKind::FUNCTION),
-                            detail: Some("Window Function".to_string()),
-                            insert_text: Some(format!("PARTITION BY ${{1:column}}")),
-                            insert_text_format: Some(InsertTextFormat::SNIPPET),
-                            ..Default::default()
-                        }));
+                        items.push((
+                            score,
+                            CompletionItem {
+                                label: format!("{} PARTITION BY", func),
+                                kind: Some(CompletionItemKind::FUNCTION),
+                                detail: Some("Window Function".to_string()),
+                                insert_text: Some("PARTITION BY ${1:column}".to_string()),
+                                insert_text_format: Some(InsertTextFormat::SNIPPET),
+                                ..Default::default()
+                            },
+                        ));
                     }
                 }
-                items.push((1000, CompletionItem {
-                    label: "ORDER BY".to_string(),
-                    kind: Some(CompletionItemKind::KEYWORD),
-                    insert_text: Some("ORDER BY ${1:column}".to_string()),
-                    insert_text_format: Some(InsertTextFormat::SNIPPET),
-                    ..Default::default()
-                }));
+                items.push((
+                    1000,
+                    CompletionItem {
+                        label: "ORDER BY".to_string(),
+                        kind: Some(CompletionItemKind::KEYWORD),
+                        insert_text: Some("ORDER BY ${1:column}".to_string()),
+                        insert_text_format: Some(InsertTextFormat::SNIPPET),
+                        ..Default::default()
+                    },
+                ));
             }
             CompletionContext::JoinCondition => {
                 let tables_in_query = self.extract_tables_from_query(text);
                 let mut seen = std::collections::HashSet::new();
                 for item in schema_cache.iter() {
-                    if tables_in_query.iter().any(|t| t.eq_ignore_ascii_case(&item.table_name)) {
+                    if tables_in_query
+                        .iter()
+                        .any(|t| t.eq_ignore_ascii_case(&item.table_name))
+                    {
                         let key = item.column_name.clone();
                         if seen.insert(key) {
-                            let score = self.calculate_completion_score(&item.column_name, partial_word);
+                            let score =
+                                self.calculate_completion_score(&item.column_name, partial_word);
                             if score > 0 {
-                                items.push((score + 500, CompletionItem {
-                                    label: format!("{}.{}", item.table_name, item.column_name),
-                                    kind: Some(CompletionItemKind::FIELD),
-                                    detail: Some(format!("{}", item.data_type)),
-                                    ..Default::default()
-                                }));
+                                items.push((
+                                    score + 500,
+                                    CompletionItem {
+                                        label: format!("{}.{}", item.table_name, item.column_name),
+                                        kind: Some(CompletionItemKind::FIELD),
+                                        detail: Some(item.data_type.to_string()),
+                                        ..Default::default()
+                                    },
+                                ));
                             }
                         }
                     }
@@ -741,22 +1228,28 @@ impl LanguageServer for Backend {
             }
             CompletionContext::SubQuery => {
                 for kw in &["SELECT", "WITH", "FROM", "WHERE", "GROUP BY", "ORDER BY"] {
-                    items.push((500, CompletionItem {
-                        label: kw.to_string(),
-                        kind: Some(CompletionItemKind::KEYWORD),
-                        ..Default::default()
-                    }));
+                    items.push((
+                        500,
+                        CompletionItem {
+                            label: kw.to_string(),
+                            kind: Some(CompletionItemKind::KEYWORD),
+                            ..Default::default()
+                        },
+                    ));
                 }
             }
             CompletionContext::Keyword => {
                 for kw in self.get_sql_keywords() {
                     let score = self.calculate_completion_score(kw, partial_word);
                     if score > 0 {
-                        items.push((score, CompletionItem {
-                            label: kw.to_string(),
-                            kind: Some(CompletionItemKind::KEYWORD),
-                            ..Default::default()
-                        }));
+                        items.push((
+                            score,
+                            CompletionItem {
+                                label: kw.to_string(),
+                                kind: Some(CompletionItemKind::KEYWORD),
+                                ..Default::default()
+                            },
+                        ));
                     }
                 }
 
@@ -765,12 +1258,15 @@ impl LanguageServer for Backend {
                     if seen.insert(item.table_name.clone()) {
                         let score = self.calculate_completion_score(&item.table_name, partial_word);
                         if score > 0 {
-                            items.push((score, CompletionItem {
-                                label: item.table_name.clone(),
-                                kind: Some(CompletionItemKind::CLASS),
-                                detail: Some("Table".to_string()),
-                                ..Default::default()
-                            }));
+                            items.push((
+                                score,
+                                CompletionItem {
+                                    label: item.table_name.clone(),
+                                    kind: Some(CompletionItemKind::CLASS),
+                                    detail: Some("Table".to_string()),
+                                    ..Default::default()
+                                },
+                            ));
                         }
                     }
                 }
@@ -778,14 +1274,24 @@ impl LanguageServer for Backend {
         }
 
         items.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.label.cmp(&b.1.label)));
-        let completion_items: Vec<CompletionItem> = items.into_iter().map(|(_, item)| item).take(200).collect();
+        let completion_items: Vec<CompletionItem> =
+            items.into_iter().map(|(_, item)| item).take(200).collect();
 
-        self.client.log_message(MessageType::INFO, &format!("Returning {} completions", completion_items.len())).await;
+        self.client
+            .log_message(
+                MessageType::INFO,
+                &format!("Returning {} completions", completion_items.len()),
+            )
+            .await;
         Ok(Some(CompletionResponse::Array(completion_items)))
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
-        let uri = params.text_document_position_params.text_document.uri.to_string();
+        let uri = params
+            .text_document_position_params
+            .text_document
+            .uri
+            .to_string();
         let position = params.text_document_position_params.position;
 
         let document = match self.document_map.get(&uri) {
@@ -810,7 +1316,11 @@ impl LanguageServer for Backend {
         }
 
         if !table_columns.is_empty() {
-            let content = format!("**Table: {}**\n\nColumns:\n{}", word, table_columns.join("\n"));
+            let content = format!(
+                "**Table: {}**\n\nColumns:\n{}",
+                word,
+                table_columns.join("\n")
+            );
             return Ok(Some(Hover {
                 contents: HoverContents::Markup(MarkupContent {
                     kind: MarkupKind::Markdown,
@@ -840,8 +1350,15 @@ impl LanguageServer for Backend {
         Ok(None)
     }
 
-    async fn goto_definition(&self, params: GotoDefinitionParams) -> Result<Option<GotoDefinitionResponse>> {
-        let uri = params.text_document_position_params.text_document.uri.to_string();
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        let uri = params
+            .text_document_position_params
+            .text_document
+            .uri
+            .to_string();
         let position = params.text_document_position_params.position;
 
         let document = match self.document_map.get(&uri) {
@@ -859,7 +1376,9 @@ impl LanguageServer for Backend {
 
         // Find first occurrence of the table or column
         for item in schema_cache.iter() {
-            if item.table_name.eq_ignore_ascii_case(&word) || item.column_name.eq_ignore_ascii_case(&word) {
+            if item.table_name.eq_ignore_ascii_case(&word)
+                || item.column_name.eq_ignore_ascii_case(&word)
+            {
                 // Return the location in the document where it's first used
                 let re = Regex::new(&format!(r"(?i)\b{}\b", regex::escape(&word))).unwrap();
                 if let Some(mat) = re.find(text) {
@@ -869,7 +1388,11 @@ impl LanguageServer for Backend {
                     let char_offset = start - line_start;
 
                     let location = Location {
-                        uri: params.text_document_position_params.text_document.uri.clone(),
+                        uri: params
+                            .text_document_position_params
+                            .text_document
+                            .uri
+                            .clone(),
                         range: Range::new(
                             Position::new(lines_before as u32, char_offset as u32),
                             Position::new(lines_before as u32, (char_offset + word.len()) as u32),
@@ -883,7 +1406,10 @@ impl LanguageServer for Backend {
         Ok(None)
     }
 
-    async fn document_symbol(&self, params: DocumentSymbolParams) -> Result<Option<DocumentSymbolResponse>> {
+    async fn document_symbol(
+        &self,
+        params: DocumentSymbolParams,
+    ) -> Result<Option<DocumentSymbolResponse>> {
         let uri = params.text_document.uri.to_string();
 
         let document = match self.document_map.get(&uri) {
@@ -956,7 +1482,11 @@ impl LanguageServer for Backend {
     }
 
     async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
-        let uri = params.text_document_position_params.text_document.uri.to_string();
+        let uri = params
+            .text_document_position_params
+            .text_document
+            .uri
+            .to_string();
         let position = params.text_document_position_params.position;
 
         let document = match self.document_map.get(&uri) {
@@ -993,7 +1523,10 @@ impl LanguageServer for Backend {
                 "CAST" => ("CAST(value AS type)", "Converts value to specified type"),
                 "COALESCE" => ("COALESCE(val1, val2, ...)", "Returns first non-null value"),
                 "DATEADD" => ("DATEADD(unit, amount, date)", "Adds time to a date"),
-                "DATEDIFF" => ("DATEDIFF(unit, start_date, end_date)", "Calculates difference between dates"),
+                "DATEDIFF" => (
+                    "DATEDIFF(unit, start_date, end_date)",
+                    "Calculates difference between dates",
+                ),
                 _ => return Ok(None),
             };
 
@@ -1012,19 +1545,32 @@ impl LanguageServer for Backend {
         Ok(None)
     }
 
-    async fn execute_command(&self, params: ExecuteCommandParams) -> Result<Option<serde_json::Value>> {
+    async fn execute_command(
+        &self,
+        params: ExecuteCommandParams,
+    ) -> Result<Option<serde_json::Value>> {
         match params.command.as_str() {
             "snowflake.generateQuery" => {
-                if let Some(natural_language) = params.arguments.get(0).and_then(|v| v.as_str()) {
+                if let Some(natural_language) = params.arguments.first().and_then(|v| v.as_str()) {
                     let mut engine_lock = self.engine.lock().await; // Changed to mut
                     if let Some(engine) = &mut *engine_lock {
-                        match engine.execute_with_cortex_context(natural_language, false).await {
+                        match engine
+                            .execute_with_cortex_context(natural_language, false)
+                            .await
+                        {
                             Ok(result) => {
-                                self.client.log_message(MessageType::INFO, "Query generated successfully").await;
+                                self.client
+                                    .log_message(MessageType::INFO, "Query generated successfully")
+                                    .await;
                                 return Ok(Some(result));
                             }
                             Err(e) => {
-                                self.client.log_message(MessageType::ERROR, &format!("Cortex error: {}", e)).await;
+                                self.client
+                                    .log_message(
+                                        MessageType::ERROR,
+                                        &format!("Cortex error: {}", e),
+                                    )
+                                    .await;
                                 return Ok(Some(serde_json::json!({ "error": e })));
                             }
                         }
@@ -1032,21 +1578,30 @@ impl LanguageServer for Backend {
                 }
             }
             "snowflake.uploadSemanticModel" => {
-                if let Some(path_str) = params.arguments.get(0).and_then(|v| v.as_str()) {
+                if let Some(path_str) = params.arguments.first().and_then(|v| v.as_str()) {
                     let mut engine_lock = self.engine.lock().await;
                     if let Some(engine) = &mut *engine_lock {
                         let path = std::path::PathBuf::from(path_str);
-                        let stage_name = params.arguments.get(1)
+                        let stage_name = params
+                            .arguments
+                            .get(1)
                             .and_then(|v| v.as_str())
                             .unwrap_or("cortex_analyst_semantic_models");
 
                         match engine.upload_semantic_model(&path, stage_name).await {
                             Ok(msg) => {
                                 self.client.log_message(MessageType::INFO, &msg).await;
-                                return Ok(Some(serde_json::json!({ "success": true, "message": msg })));
+                                return Ok(Some(
+                                    serde_json::json!({ "success": true, "message": msg }),
+                                ));
                             }
                             Err(e) => {
-                                self.client.log_message(MessageType::ERROR, &format!("Upload failed: {}", e)).await;
+                                self.client
+                                    .log_message(
+                                        MessageType::ERROR,
+                                        &format!("Upload failed: {}", e),
+                                    )
+                                    .await;
                                 return Ok(Some(serde_json::json!({ "error": e })));
                             }
                         }
@@ -1059,7 +1614,12 @@ impl LanguageServer for Backend {
                     match engine.verify_semantic_model().await {
                         Ok(warnings) => {
                             if warnings.is_empty() {
-                                self.client.log_message(MessageType::INFO, "Semantic model verified successfully").await;
+                                self.client
+                                    .log_message(
+                                        MessageType::INFO,
+                                        "Semantic model verified successfully",
+                                    )
+                                    .await;
                             } else {
                                 for warning in &warnings {
                                     self.client.log_message(MessageType::WARNING, warning).await;
@@ -1068,7 +1628,12 @@ impl LanguageServer for Backend {
                             return Ok(Some(serde_json::json!({ "warnings": warnings })));
                         }
                         Err(e) => {
-                            self.client.log_message(MessageType::ERROR, &format!("Verification failed: {}", e)).await;
+                            self.client
+                                .log_message(
+                                    MessageType::ERROR,
+                                    &format!("Verification failed: {}", e),
+                                )
+                                .await;
                             return Ok(Some(serde_json::json!({ "error": e })));
                         }
                     }
@@ -1079,19 +1644,28 @@ impl LanguageServer for Backend {
                 if let Some(engine) = &*engine_lock {
                     match engine.generate_semantic_model_from_schema().await {
                         Ok(model) => {
-                            self.client.log_message(MessageType::INFO, "Semantic model generated").await;
+                            self.client
+                                .log_message(MessageType::INFO, "Semantic model generated")
+                                .await;
                             return Ok(Some(serde_json::to_value(&model).unwrap_or_default()));
                         }
                         Err(e) => {
-                            self.client.log_message(MessageType::ERROR, &format!("Generation failed: {}", e)).await;
+                            self.client
+                                .log_message(
+                                    MessageType::ERROR,
+                                    &format!("Generation failed: {}", e),
+                                )
+                                .await;
                             return Ok(Some(serde_json::json!({ "error": e })));
                         }
                     }
                 }
             }
             "snowflake.chatWithAnalyst" => {
-                if let Some(message) = params.arguments.get(0).and_then(|v| v.as_str()) {
-                    let use_history = params.arguments.get(1)
+                if let Some(message) = params.arguments.first().and_then(|v| v.as_str()) {
+                    let use_history = params
+                        .arguments
+                        .get(1)
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
 
@@ -1099,10 +1673,14 @@ impl LanguageServer for Backend {
                     if let Some(engine) = &mut *engine_lock {
                         match engine.chat_with_analyst(message, use_history).await {
                             Ok(response) => {
-                                return Ok(Some(serde_json::to_value(&response).unwrap_or_default()));
+                                return Ok(Some(
+                                    serde_json::to_value(&response).unwrap_or_default(),
+                                ));
                             }
                             Err(e) => {
-                                self.client.log_message(MessageType::ERROR, &format!("Chat failed: {}", e)).await;
+                                self.client
+                                    .log_message(MessageType::ERROR, &format!("Chat failed: {}", e))
+                                    .await;
                                 return Ok(Some(serde_json::json!({ "error": e })));
                             }
                         }

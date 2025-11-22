@@ -1,9 +1,9 @@
-use serde::{Deserialize, Serialize};
-use std::pin::Pin;
-use futures::Stream;
 use eventsource_stream::Eventsource;
+use futures::Stream;
 use futures::StreamExt;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
 
 // ============================================================================
@@ -41,11 +41,12 @@ pub struct ContentItem {
 impl Message {
     #[pyo3(name = "get_content")]
     pub fn get_content(&self) -> String {
-        self.content.clone()
+        self.content
+            .clone()
             .or_else(|| {
-                self.content_list.as_ref().and_then(|list| {
-                    list.first().map(|item| item.text.clone())
-                })
+                self.content_list
+                    .as_ref()
+                    .and_then(|list| list.first().map(|item| item.text.clone()))
             })
             .unwrap_or_default()
     }
@@ -136,12 +137,6 @@ pub struct ToolInputSchema {
     pub required: Option<Vec<String>>,
 }
 
-
-
-
-
-
-
 #[pyclass]
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ToolResource {
@@ -192,7 +187,7 @@ pub enum ToolChoice {
     Specific {
         #[serde(rename = "type")]
         tool_type: String,
-        function: FunctionName
+        function: FunctionName,
     },
 }
 
@@ -254,7 +249,11 @@ pub struct ToolCall {
 impl ToolCall {
     #[new]
     fn new(id: String, tool_type: String, function: FunctionCall) -> Self {
-        Self { id, tool_type, function }
+        Self {
+            id,
+            tool_type,
+            function,
+        }
     }
 }
 
@@ -310,7 +309,8 @@ pub struct StreamChunk {
 #[pymethods]
 impl StreamChunk {
     fn to_json_string(&self) -> PyResult<String> {
-        serde_json::to_string(self).map_err(|e| PyErr::new::<PyAny, _>(format!("Failed to serialize StreamChunk: {}", e)))
+        serde_json::to_string(self)
+            .map_err(|e| PyErr::new::<PyAny, _>(format!("Failed to serialize StreamChunk: {}", e)))
     }
 }
 
@@ -681,7 +681,8 @@ impl AgentsClient {
     }
 
     pub fn add_assistant_response(&mut self, content: String) {
-        self.conversation_history.push(Message::new_assistant(content));
+        self.conversation_history
+            .push(Message::new_assistant(content));
     }
 
     pub fn update_metadata_and_stats(&mut self, metadata: CompletionMetadata) {
@@ -700,11 +701,14 @@ impl AgentsClient {
     }
 
     pub fn add_system_message(&mut self, content: &str) {
-        self.conversation_history.insert(0, Message {
-            role: Some("system".to_string()),
-            content: Some(content.to_string()),
-            content_list: None,
-        });
+        self.conversation_history.insert(
+            0,
+            Message {
+                role: Some("system".to_string()),
+                content: Some(content.to_string()),
+                content_list: None,
+            },
+        );
     }
 
     pub fn get_usage_stats(&self) -> UsageStats {
@@ -738,14 +742,16 @@ impl AgentsClient {
         }
 
         if let Some(metadata) = &self.last_metadata {
-            report.push_str(&format!("\nLast Request:\n"));
+            report.push_str("\nLast Request:\n");
             report.push_str(&format!("  ID: {}\n", metadata.request_id));
             report.push_str(&format!("  Model: {}\n", metadata.model));
             report.push_str(&format!("  Object: {}\n", metadata.object));
             report.push_str(&format!("  Created: {}\n", metadata.created));
             if let Some(usage) = &metadata.usage {
-                report.push_str(&format!("  Usage: {} prompt + {} completion = {} total tokens\n",
-                    usage.prompt_tokens, usage.completion_tokens, usage.total_tokens));
+                report.push_str(&format!(
+                    "  Usage: {} prompt + {} completion = {} total tokens\n",
+                    usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
+                ));
             }
         }
 
@@ -760,7 +766,13 @@ impl AgentsClient {
         top_p: Option<f32>,
         max_tokens: Option<i32>,
         tools: Option<Vec<Tool>>,
-    ) -> Result<(Pin<Box<dyn Stream<Item = Result<StreamChunk, String>> + Send>>, CompletionMetadata), String> {
+    ) -> Result<
+        (
+            Pin<Box<dyn Stream<Item = Result<StreamChunk, String>> + Send>>,
+            CompletionMetadata,
+        ),
+        String,
+    > {
         let url = format!(
             "https://{}.snowflakecomputing.com/api/v2/cortex/inference:complete",
             self.account
@@ -778,7 +790,8 @@ impl AgentsClient {
             stream: true,
         };
 
-        let request_body_json = serde_json::to_string_pretty(&request_body).unwrap_or_else(|e| format!("Failed to serialize request body: {}", e));
+        let request_body_json = serde_json::to_string_pretty(&request_body)
+            .unwrap_or_else(|e| format!("Failed to serialize request body: {}", e));
         if std::env::var("SNOWFLAKE_DEBUG").is_ok() {
             println!("[CORTEX REQUEST BODY]:\n{}", request_body_json);
         }
@@ -799,7 +812,10 @@ impl AgentsClient {
 
         let status = response.status();
         if !status.is_success() {
-            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
             return Err(format!("Cortex API error {}: {}", status, error_text));
         }
 
@@ -913,7 +929,10 @@ impl AgentsClient {
 
         let status = response.status();
         if !status.is_success() {
-            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
             return Err(format!("Cortex API error {}: {}", status, error_text));
         }
 
@@ -925,7 +944,8 @@ impl AgentsClient {
         let complete_response: CompleteResponse = serde_json::from_str(&response_text)
             .map_err(|e| format!("Failed to parse response: {}. Body: {}", e, response_text))?;
 
-        self.usage_stats.add_usage(&complete_response.model, &complete_response.usage);
+        self.usage_stats
+            .add_usage(&complete_response.model, &complete_response.usage);
         self.last_metadata = Some(CompletionMetadata {
             request_id: complete_response.id.clone(),
             model: complete_response.model.clone(),
@@ -935,10 +955,12 @@ impl AgentsClient {
         });
 
         if use_history {
-            self.conversation_history.push(Message::new_user(message.to_string()));
+            self.conversation_history
+                .push(Message::new_user(message.to_string()));
 
             if let Some(choice) = complete_response.choices.first() {
-                self.conversation_history.push(Message::new_assistant(choice.message.get_content()));
+                self.conversation_history
+                    .push(Message::new_assistant(choice.message.get_content()));
             }
         }
 
@@ -1000,7 +1022,10 @@ impl AgentsClient {
             .map_err(|e| format!("Cortex API request failed: {}", e))?;
         let status = response.status();
         if !status.is_success() {
-            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
             return Err(format!("Cortex API error {}: {}", status, error_text));
         }
         let response_text = response
@@ -1010,7 +1035,8 @@ impl AgentsClient {
         let complete_response: CompleteResponse = serde_json::from_str(&response_text)
             .map_err(|e| format!("Failed to parse response: {}. Body: {}", e, response_text))?;
 
-        self.usage_stats.add_usage(&complete_response.model, &complete_response.usage);
+        self.usage_stats
+            .add_usage(&complete_response.model, &complete_response.usage);
         self.last_metadata = Some(CompletionMetadata {
             request_id: complete_response.id.clone(),
             model: complete_response.model.clone(),
@@ -1020,9 +1046,11 @@ impl AgentsClient {
         });
 
         if use_history {
-            self.conversation_history.push(Message::new_user(message.to_string()));
+            self.conversation_history
+                .push(Message::new_user(message.to_string()));
             if let Some(choice) = complete_response.choices.first() {
-                self.conversation_history.push(Message::new_assistant(choice.message.get_content()));
+                self.conversation_history
+                    .push(Message::new_assistant(choice.message.get_content()));
             }
         }
 
@@ -1057,7 +1085,10 @@ impl AgentsClient {
 
         let status = response.status();
         if !status.is_success() {
-            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
             return Err(format!("Agent creation failed {}: {}", status, error_text));
         }
 
@@ -1086,7 +1117,10 @@ impl AgentsClient {
 
         let status = response.status();
         if !status.is_success() {
-            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
             return Err(format!("Failed to get agent {}: {}", status, error_text));
         }
 
@@ -1136,7 +1170,10 @@ impl AgentsClient {
 
         let status = response.status();
         if !status.is_success() {
-            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
             return Err(format!("Failed to list agents {}: {}", status, error_text));
         }
 
@@ -1171,7 +1208,10 @@ impl AgentsClient {
 
         let status = response.status();
         if !status.is_success() {
-            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
             return Err(format!("Failed to update agent {}: {}", status, error_text));
         }
 
@@ -1182,7 +1222,11 @@ impl AgentsClient {
         Ok(agent)
     }
 
-    pub async fn delete_agent(&self, agent_name: &str, if_exists: Option<bool>) -> Result<(), String> {
+    pub async fn delete_agent(
+        &self,
+        agent_name: &str,
+        if_exists: Option<bool>,
+    ) -> Result<(), String> {
         let mut url = format!(
             "https://{}.snowflakecomputing.com/api/v2/databases/{}/schemas/{}/agents/{}",
             self.account, self.database, self.schema, agent_name
@@ -1204,7 +1248,10 @@ impl AgentsClient {
 
         let status = response.status();
         if !status.is_success() {
-            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
             return Err(format!("Failed to delete agent {}: {}", status, error_text));
         }
 
@@ -1242,8 +1289,14 @@ impl AgentsClient {
 
         let status = response.status();
         if !status.is_success() {
-            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(format!("Session creation failed {}: {}", status, error_text));
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(format!(
+                "Session creation failed {}: {}",
+                status, error_text
+            ));
         }
 
         let session: AgentSession = response
@@ -1273,7 +1326,10 @@ impl AgentsClient {
 
         let status = response.status();
         if !status.is_success() {
-            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
             return Err(format!("Failed to get session {}: {}", status, error_text));
         }
 
@@ -1304,8 +1360,14 @@ impl AgentsClient {
 
         let status = response.status();
         if !status.is_success() {
-            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(format!("Failed to list sessions {}: {}", status, error_text));
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(format!(
+                "Failed to list sessions {}: {}",
+                status, error_text
+            ));
         }
 
         let list_response: ListSessionsResponse = response
@@ -1334,14 +1396,24 @@ impl AgentsClient {
 
         let status = response.status();
         if !status.is_success() {
-            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(format!("Failed to delete session {}: {}", status, error_text));
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(format!(
+                "Failed to delete session {}: {}",
+                status, error_text
+            ));
         }
 
         Ok(())
     }
 
-    pub async fn send_message(&self, session_id: &str, content: &str) -> Result<MessageResponse, String> {
+    pub async fn send_message(
+        &self,
+        session_id: &str,
+        content: &str,
+    ) -> Result<MessageResponse, String> {
         let url = format!(
             "https://{}.snowflakecomputing.com/api/v2/cortex/agents/sessions/{}/messages",
             self.account, session_id
@@ -1371,7 +1443,10 @@ impl AgentsClient {
 
         let status = response.status();
         if !status.is_success() {
-            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
             return Err(format!("Failed to send message {}: {}", status, error_text));
         }
 
@@ -1416,7 +1491,10 @@ impl AgentsClient {
 
         let status = response.status();
         if !status.is_success() {
-            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
             return Err(format!("Failed to send message {}: {}", status, error_text));
         }
 
@@ -1462,8 +1540,14 @@ impl AgentsClient {
 
         let status = response.status();
         if !status.is_success() {
-            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(format!("Failed to list messages {}: {}", status, error_text));
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(format!(
+                "Failed to list messages {}: {}",
+                status, error_text
+            ));
         }
 
         let list_response: ListMessagesResponse = response
@@ -1473,7 +1557,11 @@ impl AgentsClient {
         Ok(list_response.messages)
     }
 
-    pub async fn get_message(&self, session_id: &str, message_id: &str) -> Result<AgentMessage, String> {
+    pub async fn get_message(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> Result<AgentMessage, String> {
         let url = format!(
             "https://{}.snowflakecomputing.com/api/v2/cortex/agents/sessions/{}/messages/{}",
             self.account, session_id, message_id
@@ -1493,7 +1581,10 @@ impl AgentsClient {
 
         let status = response.status();
         if !status.is_success() {
-            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
             return Err(format!("Failed to get message {}: {}", status, error_text));
         }
 

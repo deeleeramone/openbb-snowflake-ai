@@ -4,16 +4,15 @@ pub mod agents;
 pub mod cache;
 pub mod engine;
 
-use pyo3::prelude::*;
 use crate::agents::Message;
+use futures::StreamExt;
+use pyo3::prelude::*;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use futures::StreamExt;
-use std::pin::Pin;
 
 use crate::agents::StreamChunk;
 use crate::engine::SnowflakeEngine;
-
 
 #[pyclass]
 struct SnowflakeAI {
@@ -33,14 +32,16 @@ impl SnowflakeAI {
         database: String,
         schema: String,
     ) -> PyResult<Self> {
-        let runtime = Arc::new(
-            tokio::runtime::Runtime::new()?
-        );
+        let runtime = Arc::new(tokio::runtime::Runtime::new()?);
 
-        let engine = runtime.block_on(async {
-            SnowflakeEngine::new(&user, &password, &account, &role, &warehouse, &database, &schema)
+        let engine = runtime
+            .block_on(async {
+                SnowflakeEngine::new(
+                    &user, &password, &account, &role, &warehouse, &database, &schema,
+                )
                 .await
-        }).map_err(|e| PyErr::new::<pyo3::exceptions::PyConnectionError, _>(e.to_string()))?;
+            })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyConnectionError, _>(e.to_string()))?;
 
         Ok(Self {
             engine: Arc::new(Mutex::new(engine)),
@@ -74,10 +75,13 @@ impl SnowflakeAI {
                 "max_tokens": max_tokens,
             });
 
-            engine.ai_complete(&model, &full_prompt, Some(options), tools).await
+            engine
+                .ai_complete(&model, &full_prompt, Some(options), tools)
+                .await
         });
 
-        result.map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
+        result
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
             .map(|s| s.replace("\\_", "_"))
     }
 
@@ -122,10 +126,13 @@ impl SnowflakeAI {
                 "max_tokens": max_tokens,
             });
 
-            engine.ai_complete(&model, &full_prompt, Some(options), tools).await
+            engine
+                .ai_complete(&model, &full_prompt, Some(options), tools)
+                .await
         });
 
-        result.map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
+        result
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
             .map(|s| s.replace("\\_", "_"))
     }
 
@@ -168,23 +175,23 @@ impl SnowflakeAI {
         let result = self.runtime.block_on(async move {
             let mut engine = engine.lock().await;
             let mut agent_client = engine.create_agents_client()?;
-            agent_client.stream_complete(
-                &model,
-                rust_messages,
-                Some(temperature),
-                None, // top_p
-                Some(max_tokens),
-                tools,
-            ).await
+            agent_client
+                .stream_complete(
+                    &model,
+                    rust_messages,
+                    Some(temperature),
+                    None, // top_p
+                    Some(max_tokens),
+                    tools,
+                )
+                .await
         });
 
         match result {
-            Ok((stream, _metadata)) => {
-                Ok(PyStream {
-                    stream: std::sync::Mutex::new(stream),
-                    runtime,
-                })
-            }
+            Ok((stream, _metadata)) => Ok(PyStream {
+                stream: std::sync::Mutex::new(stream),
+                runtime,
+            }),
             Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e)),
         }
     }
@@ -227,10 +234,12 @@ impl SnowflakeAI {
     /// Close the cache connection
     fn close(&self) -> PyResult<()> {
         let engine = Arc::clone(&self.engine);
-        self.runtime.block_on(async move {
-            let mut engine = engine.lock().await;
-            engine.close().await
-        }).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        self.runtime
+            .block_on(async move {
+                let mut engine = engine.lock().await;
+                engine.close().await
+            })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
         Ok(())
     }
 
@@ -239,10 +248,13 @@ impl SnowflakeAI {
         let engine = Arc::clone(&self.engine);
         let runtime = Arc::clone(&self.runtime);
 
-        let agent_client = self.runtime.block_on(async move {
-            let mut engine = engine.lock().await;
-            engine.create_agents_client()
-        }).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
+        let agent_client = self
+            .runtime
+            .block_on(async move {
+                let mut engine = engine.lock().await;
+                engine.create_agents_client()
+            })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
 
         Ok(SnowflakeAgent {
             client: Arc::new(Mutex::new(agent_client)),
@@ -378,14 +390,16 @@ impl SnowflakeAI {
 
             if let (Some(db), Some(sch)) = (database, schema) {
                 if !db.is_empty() && !sch.is_empty() {
-                    engine.use_database_schema(db, sch).await.map_err(|e| e.to_string())?;
+                    engine
+                        .use_database_schema(db, sch)
+                        .await
+                        .map_err(|e| e.to_string())?;
                 }
             } else if let Some(db) = database {
                 if !db.is_empty() {
                     engine.use_database(db).await.map_err(|e| e.to_string())?;
                 }
-            }
-            else if let Some(sch) = schema {
+            } else if let Some(sch) = schema {
                 if !sch.is_empty() {
                     engine.use_schema(sch).await.map_err(|e| e.to_string())?;
                 }
@@ -436,7 +450,10 @@ impl SnowflakeAI {
 
             if let (Some(db), Some(sch)) = (database, schema) {
                 if !db.is_empty() && !sch.is_empty() {
-                    engine.use_database_schema(db, sch).await.map_err(|e| e.to_string())?;
+                    engine
+                        .use_database_schema(db, sch)
+                        .await
+                        .map_err(|e| e.to_string())?;
                 }
             } else if let Some(sch) = schema {
                 if !sch.is_empty() {
@@ -451,31 +468,47 @@ impl SnowflakeAI {
 
     /// Set conversation-specific data in the cache
     #[pyo3(signature = (conversation_id, key, value))]
-    fn set_conversation_data(&self, conversation_id: String, key: String, value: String) -> PyResult<()> {
+    fn set_conversation_data(
+        &self,
+        conversation_id: String,
+        key: String,
+        value: String,
+    ) -> PyResult<()> {
         let engine = Arc::clone(&self.engine);
-        self.runtime.block_on(async move {
-            let cache = {
-                let engine = engine.lock().await;
-                engine.cache.clone()
-            };
-            let guard = cache.lock().await;
-            guard.set_conversation_data(conversation_id, key, value).await
-        }).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        self.runtime
+            .block_on(async move {
+                let cache = {
+                    let engine = engine.lock().await;
+                    engine.cache.clone()
+                };
+                let guard = cache.lock().await;
+                guard
+                    .set_conversation_data(conversation_id, key, value)
+                    .await
+            })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
         Ok(())
     }
 
     /// Get conversation-specific data from the cache
     #[pyo3(signature = (conversation_id, key))]
-    fn get_conversation_data(&self, conversation_id: String, key: String) -> PyResult<Option<String>> {
+    fn get_conversation_data(
+        &self,
+        conversation_id: String,
+        key: String,
+    ) -> PyResult<Option<String>> {
         let engine = Arc::clone(&self.engine);
-        let result = self.runtime.block_on(async move {
-            let cache = {
-                let engine = engine.lock().await;
-                engine.cache.clone()
-            };
-            let guard = cache.lock().await;
-            guard.get_conversation_data(&conversation_id, &key).await
-        }).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        let result = self
+            .runtime
+            .block_on(async move {
+                let cache = {
+                    let engine = engine.lock().await;
+                    engine.cache.clone()
+                };
+                let guard = cache.lock().await;
+                guard.get_conversation_data(&conversation_id, &key).await
+            })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
         Ok(result)
     }
 
@@ -483,14 +516,16 @@ impl SnowflakeAI {
     #[pyo3(signature = (conversation_id, key))]
     fn delete_conversation_data(&self, conversation_id: String, key: String) -> PyResult<()> {
         let engine = Arc::clone(&self.engine);
-        self.runtime.block_on(async move {
-            let cache = {
-                let engine = engine.lock().await;
-                engine.cache.clone()
-            };
-            let guard = cache.lock().await;
-            guard.delete_conversation_data(&conversation_id, &key).await
-        }).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        self.runtime
+            .block_on(async move {
+                let cache = {
+                    let engine = engine.lock().await;
+                    engine.cache.clone()
+                };
+                let guard = cache.lock().await;
+                guard.delete_conversation_data(&conversation_id, &key).await
+            })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
         Ok(())
     }
 
@@ -513,57 +548,76 @@ impl SnowflakeAI {
     #[pyo3(signature = (conversation_id))]
     fn clear_conversation(&self, conversation_id: String) -> PyResult<()> {
         let engine = Arc::clone(&self.engine);
-        self.runtime.block_on(async move {
-            let cache = {
-                let engine = engine.lock().await;
-                engine.cache.clone()
-            };
-            let guard = cache.lock().await;
-            guard.clear_conversation(&conversation_id).await
-        }).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        self.runtime
+            .block_on(async move {
+                let cache = {
+                    let engine = engine.lock().await;
+                    engine.cache.clone()
+                };
+                let guard = cache.lock().await;
+                guard.clear_conversation(&conversation_id).await
+            })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
         Ok(())
     }
 
     /// Add a message to the conversation cache
     #[pyo3(signature = (conversation_id, message_id, role, content))]
-    fn add_message(&self, conversation_id: String, message_id: String, role: String, content: String) -> PyResult<()> {
+    fn add_message(
+        &self,
+        conversation_id: String,
+        message_id: String,
+        role: String,
+        content: String,
+    ) -> PyResult<()> {
         let engine = Arc::clone(&self.engine);
-        self.runtime.block_on(async move {
-            let cache = {
-                let engine = engine.lock().await;
-                engine.cache.clone()
-            };
-            let guard = cache.lock().await;
-            guard.add_message(conversation_id, message_id, role, content).await
-        }).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        self.runtime
+            .block_on(async move {
+                let cache = {
+                    let engine = engine.lock().await;
+                    engine.cache.clone()
+                };
+                let guard = cache.lock().await;
+                guard
+                    .add_message(conversation_id, message_id, role, content)
+                    .await
+            })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
         Ok(())
     }
 
     /// Get all messages for a conversation (ordered by timestamp)
     fn get_messages(&self, conversation_id: String) -> PyResult<Vec<(String, String, String)>> {
         let engine = Arc::clone(&self.engine);
-        self.runtime.block_on(async move {
-            let cache = {
-                let engine = engine.lock().await;
-                engine.cache.clone()
-            };
-            let guard = cache.lock().await;
-            guard.get_messages(&conversation_id).await
-        }).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+        self.runtime
+            .block_on(async move {
+                let cache = {
+                    let engine = engine.lock().await;
+                    engine.cache.clone()
+                };
+                let guard = cache.lock().await;
+                guard.get_messages(&conversation_id).await
+            })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
     }
 
     /// Get conversation history from the cache (DEPRECATED - use get_messages instead)
     #[pyo3(signature = (conversation_id))]
     fn get_conversation_history(&self, conversation_id: String) -> PyResult<Option<String>> {
         let engine = Arc::clone(&self.engine);
-        let result = self.runtime.block_on(async move {
-            let cache = {
-                let engine = engine.lock().await;
-                engine.cache.clone()
-            };
-            let guard = cache.lock().await;
-            guard.get_conversation_data(&conversation_id, "conversation_history").await
-        }).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        let result = self
+            .runtime
+            .block_on(async move {
+                let cache = {
+                    let engine = engine.lock().await;
+                    engine.cache.clone()
+                };
+                let guard = cache.lock().await;
+                guard
+                    .get_conversation_data(&conversation_id, "conversation_history")
+                    .await
+            })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
         Ok(result)
     }
 
@@ -571,14 +625,22 @@ impl SnowflakeAI {
     #[pyo3(signature = (conversation_id, history))]
     fn set_conversation_history(&self, conversation_id: String, history: String) -> PyResult<()> {
         let engine = Arc::clone(&self.engine);
-        self.runtime.block_on(async move {
-            let cache = {
-                let engine = engine.lock().await;
-                engine.cache.clone()
-            };
-            let guard = cache.lock().await;
-            guard.set_conversation_data(conversation_id, "conversation_history".to_string(), history).await
-        }).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        self.runtime
+            .block_on(async move {
+                let cache = {
+                    let engine = engine.lock().await;
+                    engine.cache.clone()
+                };
+                let guard = cache.lock().await;
+                guard
+                    .set_conversation_data(
+                        conversation_id,
+                        "conversation_history".to_string(),
+                        history,
+                    )
+                    .await
+            })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
         Ok(())
     }
 
@@ -653,7 +715,9 @@ impl SnowflakeAI {
             tool_spec: agents::ToolSpec {
                 tool_type: "generic".to_string(),
                 name: "get_multiple_table_definitions".to_string(),
-                description: "Retrieves the column definitions (schema) for a list of specified tables.".to_string(),
+                description:
+                    "Retrieves the column definitions (schema) for a list of specified tables."
+                        .to_string(),
                 input_schema: agents::ToolInputSchema {
                     schema_type: "object".to_string(),
                     description: None,
@@ -662,7 +726,9 @@ impl SnowflakeAI {
                             "table_names".to_string(),
                             agents::ToolInputSchema {
                                 schema_type: "array".to_string(),
-                                description: Some("The list of fully qualified table names.".to_string()),
+                                description: Some(
+                                    "The list of fully qualified table names.".to_string(),
+                                ),
                                 properties: None,
                                 items: Some(Box::new(agents::ToolInputSchema {
                                     schema_type: "string".to_string(),
@@ -761,7 +827,9 @@ impl SnowflakeAI {
                                 "schema".to_string(),
                                 agents::ToolInputSchema {
                                     schema_type: "string".to_string(),
-                                    description: Some("The name of the schema within the database.".to_string()),
+                                    description: Some(
+                                        "The name of the schema within the database.".to_string(),
+                                    ),
                                     properties: None,
                                     items: None,
                                     required: None,
@@ -853,7 +921,8 @@ struct SnowflakeAgent {
 
 #[pyclass]
 struct PyStream {
-    stream: std::sync::Mutex<Pin<Box<dyn futures::Stream<Item = Result<StreamChunk, String>> + Send>>>,
+    stream:
+        std::sync::Mutex<Pin<Box<dyn futures::Stream<Item = Result<StreamChunk, String>> + Send>>>,
     runtime: Arc<tokio::runtime::Runtime>,
 }
 
@@ -890,23 +959,23 @@ impl SnowflakeAgent {
 
         let result = self.runtime.block_on(async move {
             let mut client = client.lock().await;
-            client.stream_complete(
-                &model,
-                vec![Message::new_user(message.to_string())],
-                temperature,
-                None, // top_p
-                max_tokens,
-                None, // tools
-            ).await
+            client
+                .stream_complete(
+                    &model,
+                    vec![Message::new_user(message.to_string())],
+                    temperature,
+                    None, // top_p
+                    max_tokens,
+                    None, // tools
+                )
+                .await
         });
 
         match result {
-            Ok((stream, _metadata)) => {
-                Ok(PyStream {
-                    stream: std::sync::Mutex::new(stream),
-                    runtime,
-                })
-            }
+            Ok((stream, _metadata)) => Ok(PyStream {
+                stream: std::sync::Mutex::new(stream),
+                runtime,
+            }),
             Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e)),
         }
     }
@@ -925,7 +994,9 @@ impl SnowflakeAgent {
 
         let result = self.runtime.block_on(async move {
             let mut client = client.lock().await;
-            client.complete(&model, &message, use_history, temperature, None, max_tokens).await
+            client
+                .complete(&model, &message, use_history, temperature, None, max_tokens)
+                .await
         });
 
         match result {
@@ -933,7 +1004,9 @@ impl SnowflakeAgent {
                 if let Some(choice) = response.choices.first() {
                     Ok(choice.message.get_content())
                 } else {
-                    Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("No response from model"))
+                    Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                        "No response from model",
+                    ))
                 }
             }
             Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e)),
@@ -954,21 +1027,30 @@ impl SnowflakeAgent {
         let client = Arc::clone(&self.client);
         let model = model.to_string();
 
-        let rust_tool_choice = tool_choice.map(|tc_str| {
-            match tc_str.as_str() {
-                "auto" => agents::ToolChoice::Auto("auto".to_string()),
-                "required" => agents::ToolChoice::Required("required".to_string()),
-                "none" => agents::ToolChoice::None("none".to_string()),
-                _ => agents::ToolChoice::Specific {
-                    tool_type: "function".to_string(),
-                    function: agents::FunctionName { name: tc_str },
-                },
-            }
+        let rust_tool_choice = tool_choice.map(|tc_str| match tc_str.as_str() {
+            "auto" => agents::ToolChoice::Auto("auto".to_string()),
+            "required" => agents::ToolChoice::Required("required".to_string()),
+            "none" => agents::ToolChoice::None("none".to_string()),
+            _ => agents::ToolChoice::Specific {
+                tool_type: "function".to_string(),
+                function: agents::FunctionName { name: tc_str },
+            },
         });
 
         let result = self.runtime.block_on(async move {
             let mut client = client.lock().await;
-            client.complete_with_tools(&model, &message, use_history, temperature, None, max_tokens, tools, rust_tool_choice).await
+            client
+                .complete_with_tools(
+                    &model,
+                    &message,
+                    use_history,
+                    temperature,
+                    None,
+                    max_tokens,
+                    tools,
+                    rust_tool_choice,
+                )
+                .await
         });
 
         match result {
@@ -976,7 +1058,9 @@ impl SnowflakeAgent {
                 if let Some(choice) = response.choices.first() {
                     Ok(choice.message.get_content())
                 } else {
-                    Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("No response from model"))
+                    Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                        "No response from model",
+                    ))
                 }
             }
             Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e)),
@@ -997,13 +1081,17 @@ impl SnowflakeAgent {
 
         let result = self.runtime.block_on(async move {
             let mut client = client.lock().await;
-            client.complete(&model, &message, use_history, temperature, None, max_tokens).await
+            client
+                .complete(&model, &message, use_history, temperature, None, max_tokens)
+                .await
         });
 
         match result {
             Ok(response) => {
                 if let Some(choice) = response.choices.first() {
-                    let finish_reason = choice.finish_reason.as_ref()
+                    let finish_reason = choice
+                        .finish_reason
+                        .as_ref()
                         .map(|s| s.as_str())
                         .unwrap_or("unknown");
 
@@ -1016,7 +1104,9 @@ impl SnowflakeAgent {
                         response.usage.total_tokens,
                     ))
                 } else {
-                    Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("No response from model"))
+                    Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                        "No response from model",
+                    ))
                 }
             }
             Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e)),
@@ -1036,10 +1126,16 @@ impl SnowflakeAgent {
         let client = Arc::clone(&self.client);
         let history = self.runtime.block_on(async move {
             let client = client.lock().await;
-            client.get_conversation_history()
+            client
+                .get_conversation_history()
                 .iter()
                 .map(|msg| {
-                    let role = msg.role.as_ref().map(|s| s.as_str()).unwrap_or("unknown").to_string();
+                    let role = msg
+                        .role
+                        .as_ref()
+                        .map(|s| s.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
                     let content = msg.get_content();
                     (role, content)
                 })
@@ -1115,39 +1211,69 @@ impl SnowflakeAgent {
         let client = Arc::clone(&self.client);
 
         let tools_vec = tools.map(|t| {
-            t.into_iter().map(|(name, desc, params_json)| {
-                let params: serde_json::Value = serde_json::from_str(&params_json).unwrap_or(serde_json::json!({}));
+            t.into_iter()
+                .map(|(name, desc, params_json)| {
+                    let params: serde_json::Value =
+                        serde_json::from_str(&params_json).unwrap_or(serde_json::json!({}));
 
-                // Convert JSON value to ToolInputSchema
-                let input_schema = agents::ToolInputSchema {
-                    schema_type: params.get("type").and_then(|v| v.as_str()).unwrap_or("object").to_string(),
-                    description: params.get("description").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                    properties: params.get("properties").and_then(|v| v.as_object()).map(|props| {
-                        props.iter().map(|(k, v)| {
-                            (k.clone(), agents::ToolInputSchema {
-                                schema_type: v.get("type").and_then(|t| t.as_str()).unwrap_or("string").to_string(),
-                                description: v.get("description").and_then(|d| d.as_str()).map(|s| s.to_string()),
-                                properties: None,
-                                items: None,
-                                required: None,
-                            })
-                        }).collect()
-                    }),
-                    items: None,
-                    required: params.get("required").and_then(|v| v.as_array()).map(|arr| {
-                        arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()
-                    }),
-                };
+                    // Convert JSON value to ToolInputSchema
+                    let input_schema = agents::ToolInputSchema {
+                        schema_type: params
+                            .get("type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("object")
+                            .to_string(),
+                        description: params
+                            .get("description")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                        properties: params.get("properties").and_then(|v| v.as_object()).map(
+                            |props| {
+                                props
+                                    .iter()
+                                    .map(|(k, v)| {
+                                        (
+                                            k.clone(),
+                                            agents::ToolInputSchema {
+                                                schema_type: v
+                                                    .get("type")
+                                                    .and_then(|t| t.as_str())
+                                                    .unwrap_or("string")
+                                                    .to_string(),
+                                                description: v
+                                                    .get("description")
+                                                    .and_then(|d| d.as_str())
+                                                    .map(|s| s.to_string()),
+                                                properties: None,
+                                                items: None,
+                                                required: None,
+                                            },
+                                        )
+                                    })
+                                    .collect()
+                            },
+                        ),
+                        items: None,
+                        required: params
+                            .get("required")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                    .collect()
+                            }),
+                    };
 
-                agents::Tool {
-                    tool_spec: agents::ToolSpec {
-                        tool_type: "generic".to_string(),
-                        name,
-                        description: desc,
-                        input_schema,
+                    agents::Tool {
+                        tool_spec: agents::ToolSpec {
+                            tool_type: "generic".to_string(),
+                            name,
+                            description: desc,
+                            input_schema,
+                        },
                     }
-                }
-            }).collect()
+                })
+                .collect()
         });
 
         let request = agents::CreateAgentRequest {
@@ -1190,7 +1316,8 @@ impl SnowflakeAgent {
                     "created_on": agent.created_on,
                     "updated_on": agent.updated_on,
                 });
-                serde_json::to_string(&json).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+                serde_json::to_string(&json)
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
             }
             Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e)),
         }
@@ -1198,12 +1325,18 @@ impl SnowflakeAgent {
 
     /// Create agent from JSON file
     #[pyo3(signature = (file_path, create_mode=None))]
-    fn create_agent_from_file(&self, file_path: String, create_mode: Option<String>) -> PyResult<String> {
+    fn create_agent_from_file(
+        &self,
+        file_path: String,
+        create_mode: Option<String>,
+    ) -> PyResult<String> {
         let client = Arc::clone(&self.client);
 
         let result = self.runtime.block_on(async move {
             let client = client.lock().await;
-            client.create_agent_from_file(&file_path, create_mode.as_deref()).await
+            client
+                .create_agent_from_file(&file_path, create_mode.as_deref())
+                .await
         });
 
         match result {
@@ -1221,7 +1354,8 @@ impl SnowflakeAgent {
                     "created_on": agent.created_on,
                     "updated_on": agent.updated_on,
                 });
-                serde_json::to_string(&json).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+                serde_json::to_string(&json)
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
             }
             Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e)),
         }
@@ -1251,7 +1385,8 @@ impl SnowflakeAgent {
                     "created_on": agent.created_on,
                     "updated_on": agent.updated_on,
                 });
-                serde_json::to_string(&json).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+                serde_json::to_string(&json)
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
             }
             Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e)),
         }
@@ -1259,35 +1394,42 @@ impl SnowflakeAgent {
 
     /// List all agents
     #[pyo3(signature = (like=None, from_name=None, show_limit=None))]
-    fn list_agents(&self, like: Option<String>, from_name: Option<String>, show_limit: Option<i32>) -> PyResult<String> {
+    fn list_agents(
+        &self,
+        like: Option<String>,
+        from_name: Option<String>,
+        show_limit: Option<i32>,
+    ) -> PyResult<String> {
         let client = Arc::clone(&self.client);
 
         let result = self.runtime.block_on(async move {
             let client = client.lock().await;
-            client.list_agents(
-                like.as_deref(),
-                from_name.as_deref(),
-                show_limit
-            ).await
+            client
+                .list_agents(like.as_deref(), from_name.as_deref(), show_limit)
+                .await
         });
 
         match result {
             Ok(agents) => {
-                let json_agents: Vec<_> = agents.into_iter().map(|agent| {
-                    serde_json::json!({
-                        "id": agent.id,
-                        "name": agent.name,
-                        "model": agent.models.model,
-                        "comment": agent.comment,
-                        "instructions": agent.instructions.response,
-                        "temperature": agent.models.temperature,
-                        "top_p": agent.models.top_p,
-                        "max_tokens": agent.models.max_tokens,
-                        "created_on": agent.created_on,
-                        "updated_on": agent.updated_on,
+                let json_agents: Vec<_> = agents
+                    .into_iter()
+                    .map(|agent| {
+                        serde_json::json!({
+                            "id": agent.id,
+                            "name": agent.name,
+                            "model": agent.models.model,
+                            "comment": agent.comment,
+                            "instructions": agent.instructions.response,
+                            "temperature": agent.models.temperature,
+                            "top_p": agent.models.top_p,
+                            "max_tokens": agent.models.max_tokens,
+                            "created_on": agent.created_on,
+                            "updated_on": agent.updated_on,
+                        })
                     })
-                }).collect();
-                serde_json::to_string(&json_agents).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+                    .collect();
+                serde_json::to_string(&json_agents)
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
             }
             Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e)),
         }
@@ -1311,41 +1453,75 @@ impl SnowflakeAgent {
         let client = Arc::clone(&self.client);
 
         let tools_vec = tools.map(|t| {
-            t.into_iter().map(|(name, desc, params_json)| {
-                let params: serde_json::Value = serde_json::from_str(&params_json).unwrap_or(serde_json::json!({}));
+            t.into_iter()
+                .map(|(name, desc, params_json)| {
+                    let params: serde_json::Value =
+                        serde_json::from_str(&params_json).unwrap_or(serde_json::json!({}));
 
-                let input_schema = agents::ToolInputSchema {
-                    schema_type: params.get("type").and_then(|v| v.as_str()).unwrap_or("object").to_string(),
-                    description: params.get("description").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                    properties: params.get("properties").and_then(|v| v.as_object()).map(|props| {
-                        props.iter().map(|(k, v)| {
-                            (k.clone(), agents::ToolInputSchema {
-                                schema_type: v.get("type").and_then(|t| t.as_str()).unwrap_or("string").to_string(),
-                                description: v.get("description").and_then(|d| d.as_str()).map(|s| s.to_string()),
-                                properties: None,
-                                items: None,
-                                required: None,
-                            })
-                        }).collect()
-                    }),
-                    items: None,
-                    required: params.get("required").and_then(|v| v.as_array()).map(|arr| {
-                        arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()
-                    }),
-                };
+                    let input_schema = agents::ToolInputSchema {
+                        schema_type: params
+                            .get("type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("object")
+                            .to_string(),
+                        description: params
+                            .get("description")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                        properties: params.get("properties").and_then(|v| v.as_object()).map(
+                            |props| {
+                                props
+                                    .iter()
+                                    .map(|(k, v)| {
+                                        (
+                                            k.clone(),
+                                            agents::ToolInputSchema {
+                                                schema_type: v
+                                                    .get("type")
+                                                    .and_then(|t| t.as_str())
+                                                    .unwrap_or("string")
+                                                    .to_string(),
+                                                description: v
+                                                    .get("description")
+                                                    .and_then(|d| d.as_str())
+                                                    .map(|s| s.to_string()),
+                                                properties: None,
+                                                items: None,
+                                                required: None,
+                                            },
+                                        )
+                                    })
+                                    .collect()
+                            },
+                        ),
+                        items: None,
+                        required: params
+                            .get("required")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                    .collect()
+                            }),
+                    };
 
-                agents::Tool {
-                    tool_spec: agents::ToolSpec {
-                        tool_type: "generic".to_string(),
-                        name,
-                        description: desc,
-                        input_schema,
+                    agents::Tool {
+                        tool_spec: agents::ToolSpec {
+                            tool_type: "generic".to_string(),
+                            name,
+                            description: desc,
+                            input_schema,
+                        },
                     }
-                }
-            }).collect()
+                })
+                .collect()
         });
 
-        let models = if model.is_some() || temperature.is_some() || top_p.is_some() || max_tokens.is_some() {
+        let models = if model.is_some()
+            || temperature.is_some()
+            || top_p.is_some()
+            || max_tokens.is_some()
+        {
             Some(agents::ModelConfig {
                 model: model.unwrap_or_default(),
                 temperature,
@@ -1397,7 +1573,8 @@ impl SnowflakeAgent {
                     "created_on": agent.created_on,
                     "updated_on": agent.updated_on,
                 });
-                serde_json::to_string(&json).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+                serde_json::to_string(&json)
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
             }
             Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e)),
         }
@@ -1437,7 +1614,8 @@ impl SnowflakeAgent {
                     "updated_on": session.updated_on,
                     "metadata": session.metadata,
                 });
-                serde_json::to_string(&json).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+                serde_json::to_string(&json)
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
             }
             Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e)),
         }
@@ -1461,7 +1639,8 @@ impl SnowflakeAgent {
                     "updated_on": session.updated_on,
                     "metadata": session.metadata,
                 });
-                serde_json::to_string(&json).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+                serde_json::to_string(&json)
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
             }
             Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e)),
         }
@@ -1478,16 +1657,20 @@ impl SnowflakeAgent {
 
         match result {
             Ok(sessions) => {
-                let json_sessions: Vec<_> = sessions.into_iter().map(|s| {
-                    serde_json::json!({
-                        "id": s.id,
-                        "agent_id": s.agent_id,
-                        "created_on": s.created_on,
-                        "updated_on": s.updated_on,
-                        "metadata": s.metadata,
+                let json_sessions: Vec<_> = sessions
+                    .into_iter()
+                    .map(|s| {
+                        serde_json::json!({
+                            "id": s.id,
+                            "agent_id": s.agent_id,
+                            "created_on": s.created_on,
+                            "updated_on": s.updated_on,
+                            "metadata": s.metadata,
+                        })
                     })
-                }).collect();
-                serde_json::to_string(&json_sessions).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+                    .collect();
+                serde_json::to_string(&json_sessions)
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
             }
             Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e)),
         }
@@ -1525,7 +1708,8 @@ impl SnowflakeAgent {
                     "created_on": response.created_on,
                     "usage": response.usage,
                 });
-                serde_json::to_string(&json).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+                serde_json::to_string(&json)
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
             }
             Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e)),
         }
@@ -1542,16 +1726,20 @@ impl SnowflakeAgent {
 
         match result {
             Ok(messages) => {
-                let json_messages: Vec<_> = messages.into_iter().map(|m| {
-                    serde_json::json!({
-                        "id": m.id,
-                        "session_id": m.session_id,
-                        "role": m.role,
-                        "content": m.content,
-                        "created_on": m.created_on,
+                let json_messages: Vec<_> = messages
+                    .into_iter()
+                    .map(|m| {
+                        serde_json::json!({
+                            "id": m.id,
+                            "session_id": m.session_id,
+                            "role": m.role,
+                            "content": m.content,
+                            "created_on": m.created_on,
+                        })
                     })
-                }).collect();
-                serde_json::to_string(&json_messages).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+                    .collect();
+                serde_json::to_string(&json_messages)
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
             }
             Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e)),
         }
@@ -1575,7 +1763,8 @@ impl SnowflakeAgent {
                     "content": message.content,
                     "created_on": message.created_on,
                 });
-                serde_json::to_string(&json).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+                serde_json::to_string(&json)
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
             }
             Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e)),
         }
