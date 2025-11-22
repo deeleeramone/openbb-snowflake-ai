@@ -85,6 +85,21 @@ jobs:
           python-version: "3.13"
           architecture: ${{ matrix.python-architecture || 'x64' }}
 
+      - name: Install dependencies (macOS)
+        if: matrix.os == 'macos'
+        run: |
+          brew install openssl@3 sqlcipher pkg-config
+          echo "OPENSSL_DIR=$(brew --prefix openssl@3)" >> $GITHUB_ENV
+          echo "PKG_CONFIG_PATH=$(brew --prefix openssl@3)/lib/pkgconfig:$(brew --prefix sqlcipher)/lib/pkgconfig" >> $GITHUB_ENV
+
+      - name: Install dependencies (Windows)
+        if: matrix.os == 'windows'
+        run: |
+          vcpkg install openssl:x64-windows sqlcipher:x64-windows
+          echo "OPENSSL_DIR=C:/vcpkg/installed/x64-windows" >> $GITHUB_ENV
+          echo "SQLCIPHER_LIB_DIR=C:/vcpkg/installed/x64-windows/lib" >> $GITHUB_ENV
+          echo "SQLCIPHER_INCLUDE_DIR=C:/vcpkg/installed/x64-windows/include" >> $GITHUB_ENV
+
       - run: pip install -U twine ruff typing_extensions
 
       - name: build wheels
@@ -97,11 +112,12 @@ jobs:
           docker-options: -e CI
           before-script-linux: |
             if command -v apk > /dev/null; then
-              apk add pkgconfig openssl-dev
+              apk add pkgconfig openssl-dev sqlcipher-dev
             elif command -v yum > /dev/null; then
-              yum install -y pkgconfig openssl-devel
+              yum install -y epel-release || true
+              yum install -y pkgconfig openssl-devel sqlcipher-devel
             elif command -v apt-get > /dev/null; then
-              apt-get update && apt-get install -y pkg-config libssl-dev
+              apt-get update && apt-get install -y pkg-config libssl-dev libsqlcipher-dev
             fi
 
       - run: ${{ (matrix.os == 'windows' && 'dir') || 'ls -lh' }} dist/
