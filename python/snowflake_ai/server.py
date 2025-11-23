@@ -12,7 +12,7 @@ import threading
 import traceback
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Optional, Iterator as TypingIterator
+from typing import Optional
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -405,7 +405,7 @@ async def stream(request_obj: Request, request: QueryRequest):
         else:
             # Normal message processing (happens AFTER widget data is fetched)
             try:
-                agent = get_or_create_agent(conv_id)
+                _ = get_or_create_agent(conv_id)
                 client = client_pool[conv_id]
 
                 current_messages = []
@@ -568,7 +568,7 @@ async def stream(request_obj: Request, request: QueryRequest):
                                     needs_response = True
                                     if os.environ.get("SNOWFLAKE_DEBUG"):
                                         print(
-                                            f"[DEBUG] Last user message needs a response"
+                                            "[DEBUG] Last user message needs a response"
                                         )
 
                 # Only process if we have a new user message OR need to respond to existing one
@@ -878,16 +878,11 @@ and present the full schema definition as a flat table."""
                         inject_widget_data=False,
                     )
 
-                    # CRITICAL FIX: Ensure formatted tuples don't end with assistant when using tools
                     if supports_tools and tools and ai_messages_formatted_tuples:
                         while (
                             ai_messages_formatted_tuples
                             and ai_messages_formatted_tuples[-1][0] == "assistant"
                         ):
-                            if os.environ.get("SNOWFLAKE_DEBUG"):
-                                print(
-                                    f"[DEBUG] Removing trailing assistant from formatted tuples: {ai_messages_formatted_tuples[-1]}"
-                                )
                             ai_messages_formatted_tuples.pop()
 
                         # Ensure we still have messages after cleanup
@@ -906,7 +901,7 @@ and present the full schema definition as a flat table."""
                                     )
                                     if os.environ.get("SNOWFLAKE_DEBUG"):
                                         print(
-                                            f"[DEBUG] Added user message to fix structure"
+                                            "[DEBUG] Added user message to fix structure"
                                         )
                                     break
 
@@ -968,7 +963,7 @@ and present the full schema definition as a flat table."""
                                 pass
 
                         if stream_state["full_text"].strip():
-                            # Check if this assistant response is already in cache to avoid duplicates
+                            # Check if this assistant response is already in cache
                             response_already_cached = False
                             for cached_msg in all_messages[
                                 -5:
@@ -1051,7 +1046,6 @@ and present the full schema definition as a flat table."""
                                 elif event_type == "tool_call":
                                     stream_state["tool_calls"].append(event_data)
                                 elif event_type == "complete":
-                                    # CRITICAL: Extract tool_calls from the complete event
                                     if isinstance(event_data, dict):
                                         stream_state["tool_calls"] = event_data.get(
                                             "tool_calls", []
@@ -1148,16 +1142,6 @@ and present the full schema definition as a flat table."""
                             for tool_call in stream_state["tool_calls"]:
                                 tool_name = tool_call.function.name
                                 tool_args_str = tool_call.function.arguments
-
-                                try:
-                                    tool_args_parsed = (
-                                        json.loads(tool_args_str)
-                                        if tool_args_str
-                                        else {}
-                                    )
-                                except json.JSONDecodeError:
-                                    tool_args_parsed = {"raw": tool_args_str}
-
                                 # Yield reasoning step with arguments
                                 yield to_sse(
                                     reasoning_step(
@@ -1214,7 +1198,7 @@ and present the full schema definition as a flat table."""
                                     ("user", f"[Tool Result]\n{tool_result_formatted}")
                                 )
 
-                                # Store COMPLETE tool result in cache
+                                # Store tool result in cache
                                 tool_result_text = f"[Tool Result from {tool_name}]\n{current_tool_output_for_llm}"
 
                                 tool_msg_id = str(uuid.uuid4())
@@ -1236,9 +1220,8 @@ and present the full schema definition as a flat table."""
                                         json.dumps(raw_tool_data),
                                     )
 
-                            # If we processed tool calls, we need to continue to get the final response
+                            # Continue to get the final response
                             if has_tool_calls:
-                                # Yield reasoning step that we're generating the final response
                                 yield to_sse(
                                     reasoning_step(
                                         "Processing results and generating response...",
@@ -1258,15 +1241,13 @@ and present the full schema definition as a flat table."""
                                             f"[DEBUG]   {i}: {msg[0]}: {msg[1][:200]}..."
                                         )
 
-                                # Continue to next iteration - the LLM will now interpret the tool results.
+                                # Continue, LLM will now interpret the tool results.
                                 continue
                             else:
                                 # No more tool calls - we're done
                                 break
 
             except Exception as e:
-                import traceback
-
                 tb = traceback.format_exc()
                 yield to_sse(
                     reasoning_step(f"Error: {str(e)}\n{tb}", event_type="ERROR")

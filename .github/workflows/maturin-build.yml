@@ -120,6 +120,22 @@ jobs:
             Write-Host "Library directory not found!"
           }
 
+          # If sqlcipher.lib is missing but sqlite3.lib exists, create a copy as a fallback
+          if (-not (Test-Path "$installPath\lib\sqlcipher.lib")) {
+            if (Test-Path "$installPath\lib\sqlite3.lib") {
+              Write-Host "sqlcipher.lib missing — creating from sqlite3.lib as fallback"
+              Copy-Item "$installPath\lib\sqlite3.lib" "$installPath\lib\sqlcipher.lib" -Force
+              Write-Host "Created $installPath\lib\sqlcipher.lib"
+            } else {
+              Write-Host "Neither sqlcipher.lib nor sqlite3.lib found in $installPath\lib"
+            }
+          } else {
+            Write-Host "sqlcipher.lib already present"
+          }
+
+          # Export LIB so MSVC link.exe can find vcpkg libs
+          echo "LIB=$installPath\lib" >> $env:GITHUB_ENV
+          
       - run: pip install -U ruff typing_extensions setuptools
 
       - name: Install Rust
@@ -290,7 +306,7 @@ jobs:
           $vcpkgTriplet = "${arch}-windows-static"
           $installPath = "C:\vcpkg\installed\$vcpkgTriplet"
           
-          # Set environment variables for the build (ensure linker finds OpenSSL)
+          # Set environment variables for the build (ensure linker finds OpenSSL and sqlcipher)
           $env:OPENSSL_DIR = $installPath
           $env:OPENSSL_LIB_DIR = "$installPath\lib"
           $env:OPENSSL_INCLUDE_DIR = "$installPath\include"
@@ -299,13 +315,15 @@ jobs:
           $env:SQLITE3_LIB_DIR = "$installPath\lib"
           # ensure rustc/cargo pass the OpenSSL libs to the MSVC linker
           $env:RUSTFLAGS = "-L $installPath\lib -C link-arg=libcrypto.lib -C link-arg=libssl.lib"
-          # also set LIB so link.exe will search the directory
+          # also set LIB so link.exe will search the directory (runtime)
           $env:LIB = "$installPath\lib;$env:LIB"
           $env:OPENSSL_STATIC = "1"
-          
-          # For ARM64, use bundled SQLite
-          if ("${{ matrix.target }}" -eq "aarch64") {
-            $env:LIBSQLITE3_SYS_USE_BUNDLED = "1"
+
+          # Confirm sqlcipher.lib exists (helpful debug)
+          if (Test-Path "$installPath\lib\sqlcipher.lib") {
+            Write-Host "sqlcipher.lib found at $installPath\lib"
+          } else {
+            Write-Host "WARNING: sqlcipher.lib not found at $installPath\lib — link may fail"
           }
           
           # Build wheels for each Python version
@@ -377,6 +395,8 @@ jobs:
           # Generate SHA256 hashes for all files
           cd wheelhouse
           echo "Generating hash signatures..."
+          
+          # Create per-file .sha256 and master CHECKSUMS.sha256
           for file in *.whl *.tar.gz; do
             if [ -f "$file" ]; then
               sha256sum "$file" > "$file.sha256"
@@ -384,11 +404,13 @@ jobs:
             fi
           done
           
-          # Create a summary file with all hashes
-          echo "# SHA256 Checksums" > CHECKSUMS.sha256
-          echo "Generated on: $(date -u)" >> CHECKSUMS.sha256
-          echo "" >> CHECKSUMS.sha256
-          cat *.sha256 >> CHECKSUMS.sha256
+          # Create master checksums file
+          {
+            echo "# SHA256 Checksums"
+            echo "Generated on: $(date -u)"
+            echo ""
+            sha256sum *.whl *.tar.gz 2>/dev/null || true
+          } > CHECKSUMS.sha256
           
           # Display summary
           echo "=================== Wheelhouse Contents ==================="
@@ -397,52 +419,9 @@ jobs:
           echo "=================== Checksums ==================="
           cat CHECKSUMS.sha256
       
-      - name: Create requirements file for each platform
-        run: |
-          cd wheelhouse
-          
-          # Create platform-specific requirement files
-          echo "# Linux AMD64/x86_64 Requirements" > requirements-linux-amd64.txt
-          ls | grep -E "linux.*x86_64|linux.*amd64" | grep ".whl" >> requirements-linux-amd64.txt || true
-          
-          echo "# Linux ARM64/aarch64 Requirements" > requirements-linux-aarch64.txt
-          ls | grep -E "linux.*aarch64" | grep ".whl" >> requirements-linux-aarch64.txt || true
-          
-          echo "# macOS x86_64 Requirements" > requirements-macos-x86_64.txt
-          ls | grep -E "macosx.*x86_64" | grep ".whl" >> requirements-macos-x86_64.txt || true
-          
-          echo "# macOS ARM64 Requirements" > requirements-macos-arm64.txt
-          ls | grep -E "macosx.*arm64|macosx.*universal2" | grep ".whl" >> requirements-macos-arm64.txt || true
-          
-          echo "# Windows AMD64 Requirements" > requirements-windows-amd64.txt
-          ls | grep -E "win.*amd64" | grep ".whl" >> requirements-windows-amd64.txt || true
-          
-          echo "# Windows ARM64 Requirements" > requirements-windows-arm64.txt
-          ls | grep -E "win.*arm64" | grep ".whl" >> requirements-windows-arm64.txt || true
-      
       - name: Upload wheelhouse
         uses: actions/upload-artifact@v4
         with:
           name: wheelhouse
           path: wheelhouse/
-          retention-days: 30
-      
-      - name: Create release archive
-        run: |
-          tar czf wheelhouse.tar.gz wheelhouse/
-          zip -r wheelhouse.zip wheelhouse/
-          
-          # Generate hashes for archives
-          sha256sum wheelhouse.tar.gz > wheelhouse.tar.gz.sha256
-          sha256sum wheelhouse.zip > wheelhouse.zip.sha256
-      
-      - name: Upload release archives
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-archives
-          path: |
-            wheelhouse.tar.gz
-            wheelhouse.tar.gz.sha256
-            wheelhouse.zip
-            wheelhouse.zip.sha256
           retention-days: 30

@@ -111,7 +111,7 @@ explore the available Snowflake databases, and manage context.
 
 #### Context Switching:
 
-These commands help the conversation flow easier by narrowing the focus.
+These commands help the conversation flow by narrowing the focus.
 
 - `/use_database <name>` - Switch to a different database
 - `/use_schema <name>` - Switch to a different schema
