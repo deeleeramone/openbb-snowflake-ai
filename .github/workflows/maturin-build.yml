@@ -72,6 +72,10 @@ jobs:
         if: matrix.os == 'windows'
         shell: pwsh
         run: |
+          # Determine architecture
+          $arch = if ("${{ matrix.target }}" -eq "aarch64") { "arm64" } else { "x64" }
+          $vcpkgTriplet = "${arch}-windows-static"
+          
           # Check if vcpkg exists and clean it if needed
           if (Test-Path "C:\vcpkg") {
             Remove-Item -Path "C:\vcpkg" -Recurse -Force
@@ -83,51 +87,35 @@ jobs:
           .\bootstrap-vcpkg.bat
           .\vcpkg integrate install
           
-          # Install OpenSSL and SQLite3 (sqlcipher might not be available)
-          .\vcpkg install openssl:x64-windows-static sqlite3:x64-windows-static
+          # Install OpenSSL and SQLite3 for the correct architecture
+          Write-Host "Installing packages for $vcpkgTriplet"
+          .\vcpkg install "openssl:$vcpkgTriplet" "sqlite3:$vcpkgTriplet"
           
-          # Try to install sqlcipher, but if it fails, we'll build from source
-          $sqlcipherInstalled = $false
-          try {
-            .\vcpkg install sqlcipher:x64-windows-static
-            $sqlcipherInstalled = $true
-          } catch {
-            Write-Host "SQLCipher not available in vcpkg, will build from source"
-          }
+          # Set environment variables for the correct architecture
+          $installPath = "C:\vcpkg\installed\$vcpkgTriplet"
           
-          if (-not $sqlcipherInstalled) {
-            # Build SQLCipher from source
-            Write-Host "Building SQLCipher from source..."
-            cd C:\
-            
-            # Download and extract SQLCipher
-            Invoke-WebRequest -Uri "https://github.com/sqlcipher/sqlcipher/archive/refs/tags/v4.6.1.zip" -OutFile "sqlcipher.zip"
-            Expand-Archive -Path "sqlcipher.zip" -DestinationPath "."
-            cd sqlcipher-4.6.1
-            
-            # Use nmake to build (Windows equivalent)
-            # This is complex on Windows, so let's use a prebuilt alternative
-            Write-Host "Using sqlite3 as fallback (SQLCipher build on Windows is complex)"
-            $env:SQLCIPHER_LIB_DIR = "C:\vcpkg\installed\x64-windows-static\lib"
-            $env:SQLCIPHER_INCLUDE_DIR = "C:\vcpkg\installed\x64-windows-static\include"
+          echo "OPENSSL_DIR=$installPath" >> $env:GITHUB_ENV
+          echo "OPENSSL_LIB_DIR=$installPath\lib" >> $env:GITHUB_ENV
+          echo "OPENSSL_INCLUDE_DIR=$installPath\include" >> $env:GITHUB_ENV
+          echo "SQLCIPHER_LIB_DIR=$installPath\lib" >> $env:GITHUB_ENV
+          echo "SQLCIPHER_INCLUDE_DIR=$installPath\include" >> $env:GITHUB_ENV
+          echo "SQLITE3_LIB_DIR=$installPath\lib" >> $env:GITHUB_ENV
+          # Export RUSTFLAGS including explicit link args for MSVC linker to bring in OpenSSL
+          echo "RUSTFLAGS=-L $installPath\lib -C link-arg=libcrypto.lib -C link-arg=libssl.lib" >> $env:GITHUB_ENV
+          echo "OPENSSL_STATIC=1" >> $env:GITHUB_ENV
+          
+          # For ARM64, we need to use the bundled SQLite since cross-compilation is complex
+          if ("${{ matrix.target }}" -eq "aarch64") {
+            echo "LIBSQLITE3_SYS_USE_BUNDLED=1" >> $env:GITHUB_ENV
+            Write-Host "Using bundled SQLite for ARM64"
           } else {
-            $env:SQLCIPHER_LIB_DIR = "C:\vcpkg\installed\x64-windows-static\lib"
-            $env:SQLCIPHER_INCLUDE_DIR = "C:\vcpkg\installed\x64-windows-static\include"
+            echo "LIBSQLITE3_SYS_USE_PKG_CONFIG=1" >> $env:GITHUB_ENV
           }
-          
-          # Set environment variables
-          echo "OPENSSL_DIR=C:\vcpkg\installed\x64-windows-static" >> $env:GITHUB_ENV
-          echo "OPENSSL_LIB_DIR=C:\vcpkg\installed\x64-windows-static\lib" >> $env:GITHUB_ENV
-          echo "OPENSSL_INCLUDE_DIR=C:\vcpkg\installed\x64-windows-static\include" >> $env:GITHUB_ENV
-          echo "SQLCIPHER_LIB_DIR=C:\vcpkg\installed\x64-windows-static\lib" >> $env:GITHUB_ENV
-          echo "SQLCIPHER_INCLUDE_DIR=C:\vcpkg\installed\x64-windows-static\include" >> $env:GITHUB_ENV
-          echo "RUSTFLAGS=-L C:\vcpkg\installed\x64-windows-static\lib" >> $env:GITHUB_ENV
-          echo "LIBSQLITE3_SYS_USE_PKG_CONFIG=1" >> $env:GITHUB_ENV
           
           # Verify the libraries exist
-          if (Test-Path "C:\vcpkg\installed\x64-windows-static\lib") {
+          if (Test-Path "$installPath\lib") {
             Write-Host "Library directory found. Contents:"
-            Get-ChildItem "C:\vcpkg\installed\x64-windows-static\lib" | Select-Object Name
+            Get-ChildItem "$installPath\lib" | Select-Object Name
           } else {
             Write-Host "Library directory not found!"
           }
@@ -297,14 +285,28 @@ jobs:
         if: matrix.os == 'windows'
         shell: pwsh
         run: |
-          # Set environment variables for the build
-          $env:OPENSSL_DIR = "C:\vcpkg\installed\x64-windows-static"
-          $env:OPENSSL_LIB_DIR = "C:\vcpkg\installed\x64-windows-static\lib"
-          $env:OPENSSL_INCLUDE_DIR = "C:\vcpkg\installed\x64-windows-static\include"
-          $env:SQLCIPHER_LIB_DIR = "C:\vcpkg\installed\x64-windows-static\lib"
-          $env:SQLCIPHER_INCLUDE_DIR = "C:\vcpkg\installed\x64-windows-static\include"
-          $env:RUSTFLAGS = "-L C:\vcpkg\installed\x64-windows-static\lib"
+          # Determine architecture paths
+          $arch = if ("${{ matrix.target }}" -eq "aarch64") { "arm64" } else { "x64" }
+          $vcpkgTriplet = "${arch}-windows-static"
+          $installPath = "C:\vcpkg\installed\$vcpkgTriplet"
+          
+          # Set environment variables for the build (ensure linker finds OpenSSL)
+          $env:OPENSSL_DIR = $installPath
+          $env:OPENSSL_LIB_DIR = "$installPath\lib"
+          $env:OPENSSL_INCLUDE_DIR = "$installPath\include"
+          $env:SQLCIPHER_LIB_DIR = "$installPath\lib"
+          $env:SQLCIPHER_INCLUDE_DIR = "$installPath\include"
+          $env:SQLITE3_LIB_DIR = "$installPath\lib"
+          # ensure rustc/cargo pass the OpenSSL libs to the MSVC linker
+          $env:RUSTFLAGS = "-L $installPath\lib -C link-arg=libcrypto.lib -C link-arg=libssl.lib"
+          # also set LIB so link.exe will search the directory
+          $env:LIB = "$installPath\lib;$env:LIB"
           $env:OPENSSL_STATIC = "1"
+          
+          # For ARM64, use bundled SQLite
+          if ("${{ matrix.target }}" -eq "aarch64") {
+            $env:LIBSQLITE3_SYS_USE_BUNDLED = "1"
+          }
           
           # Build wheels for each Python version
           switch ("${{ matrix.target }}") {
@@ -318,7 +320,7 @@ jobs:
           
           $pythonVersions = "${{ matrix.interpreter }}".Split()
           foreach ($py in $pythonVersions) {
-            Write-Host "Building for Python $py"
+            Write-Host "Building for Python $py on $rustTarget"
             maturin build --release --target $rustTarget --interpreter $py
           }
           

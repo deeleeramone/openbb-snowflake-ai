@@ -14,6 +14,8 @@ There are no pre-built wheels, so it is currently installable from the source co
 - Python environment: `>=3.10,<3.14`
 - Rust: Cargo must be on `$PATH`
 - Maturin: Install in the environment with, `pip install maturin`
+- OpenSSL
+- SQLCipher
 
 ### Steps
 
