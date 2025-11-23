@@ -189,7 +189,7 @@ jobs:
           
           # Verify the files are actually there
           echo "Contents of /tmp/wheelhouse-save:"
-          ls -la /tmp/wheelhouse-save/
+          ls -la /tmp/wheelhouse-save/ | head -20
           
           # Clean up wheelhouse from working directory to avoid checkout conflicts
           rm -rf wheelhouse
@@ -200,82 +200,70 @@ jobs:
           echo "Switching to build branch..."
           git checkout -B build origin/develop
           
-          # Save existing .gitkeep and .gitattributes if they exist
-          if [ -f "wheelhouse/.gitkeep" ]; then
-            cp wheelhouse/.gitkeep /tmp/.gitkeep-save
-          fi
-          if [ -f "wheelhouse/.gitattributes" ]; then
-            cp wheelhouse/.gitattributes /tmp/.gitattributes-save
-          fi
-          
-          # Clean out any existing wheelhouse in the build branch BUT keep git files
+          # Remove ALL existing wheelhouse content with git rm
           if [ -d "wheelhouse" ]; then
-            # Remove only wheel and archive files, keep .git* files
-            find wheelhouse -type f \( -name "*.whl" -o -name "*.tar.gz" -o -name "*.sha256" -o -name "CHECKSUMS.sha256" \) -exec git rm {} \; 2>/dev/null || true
-          else
-            mkdir -p wheelhouse
+            echo "Removing existing wheelhouse directory from git..."
+            git rm -rf wheelhouse/ || true
           fi
           
-          # Restore saved .gitkeep and .gitattributes if they existed
-          if [ -f "/tmp/.gitkeep-save" ]; then
-            cp /tmp/.gitkeep-save wheelhouse/.gitkeep
-          fi
-          if [ -f "/tmp/.gitattributes-save" ]; then
-            cp /tmp/.gitattributes-save wheelhouse/.gitattributes
-          fi
+          # Create fresh wheelhouse directory
+          mkdir -p wheelhouse
           
-          # Copy new wheelhouse files (will overwrite if they exist)
-          echo "Restoring wheelhouse files..."
+          # Copy new wheelhouse files
+          echo "Copying new wheelhouse files..."
           cp -r /tmp/wheelhouse-save/* wheelhouse/
           
           # Verify files are in wheelhouse
           echo "Files in wheelhouse directory:"
-          ls -la wheelhouse/
+          ls -la wheelhouse/ | head -20
           
-          echo "adding wheelhouse files with -f flag..."
-          for file in wheelhouse/*; do
-            if [ -f "$file" ]; then
-              echo "Force adding: $file"
-              git add -f "$file"
-            fi
-          done
+          echo "Force adding wheelhouse directory and all its contents..."
+          # Force add the entire directory, bypassing .gitignore
+          git add -f wheelhouse/
           
           COMMIT_MSG="chore: update wheelhouse artifacts for run ${RUN_ID}"
           
           # Check what's staged
-          echo "Staged files:"
-          git status --short
-          
-          # Count staged files
+          echo "Checking staged files..."
           STAGED_COUNT=$(git diff --cached --name-only | wc -l)
           echo "Number of staged files: $STAGED_COUNT"
           
+          if [ "$STAGED_COUNT" -gt 0 ]; then
+            echo "Staged files:"
+            git diff --cached --name-only | head -20
+          fi
+          
           if [ "$STAGED_COUNT" -eq 0 ]; then
-            echo "ERROR: No files were staged despite force adding!"
-            echo "Checking .gitignore..."
-            cat .gitignore || echo "No .gitignore file"
-            echo ""
-            echo "Trying to stage with git add -A -f wheelhouse/"
-            git add -A -f wheelhouse/
+            echo "WARNING: No changes detected. Files might be identical to what's already in the branch."
+            echo "Checking if files exist in working directory..."
+            ls -la wheelhouse/*.whl 2>/dev/null | head -5 || echo "No .whl files found"
+            
+            echo "Checking git status..."
+            git status
+            
+            # Force a change by updating CHECKSUMS file with timestamp
+            echo "# Updated: $(date -u)" >> wheelhouse/CHECKSUMS.sha256
+            git add -f wheelhouse/CHECKSUMS.sha256
+            
             STAGED_COUNT=$(git diff --cached --name-only | wc -l)
-            echo "After -A -f, staged files: $STAGED_COUNT"
+            echo "After updating CHECKSUMS, staged files: $STAGED_COUNT"
           fi
           
           if git diff --cached --quiet; then
-            echo "ERROR: Still no changes to commit after trying to add files!"
-            exit 1
+            echo "No changes to commit - files are identical to what's already in the branch"
+            echo "Skipping commit and push"
           else
             echo "Committing $STAGED_COUNT files..."
             git commit -m "${COMMIT_MSG}"
             
             # Show what was committed
             echo "Committed files:"
-            git show --stat
+            git show --stat --name-only | head -50
+            
+            echo "Force pushing to build branch..."
+            git push --force origin build
+            echo "Successfully pushed wheelhouse files!"
           fi
-
-          echo "Force pushing to build branch..."
-          git push --force origin build
-          echo "Successfully pushed wheelhouse files!"
 
       - name: Create or update Pull Request (build → develop)
         id: create_or_update_pr
