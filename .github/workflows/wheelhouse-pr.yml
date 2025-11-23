@@ -271,11 +271,13 @@ jobs:
 
           echo "Push branch to origin"
           git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          git push --force-with-lease origin build:refs/heads/build
+          git push --force origin build
+
       - name: Create or update Pull Request (build → develop)
         id: create_or_update_pr
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARTIFACTS_URL: ${{ env.RUN_URL }}
         run: |
           set -euo pipefail
           OWNER_REPO="${GITHUB_REPOSITORY}"
@@ -311,7 +313,10 @@ jobs:
           fi
 
       - name: Add PR comment with instructions
-        if: ${{ env.PR_CREATED || env.PR_UPDATED || always() }}
+        if: ${{ env.PR_CREATED || env.PR_UPDATED }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARTIFACTS_URL: ${{ env.RUN_URL }}
         run: |
           # prefer PR number from env (created or updated)
           PR_NUM="${PR_CREATED:-${PR_UPDATED:-}}"
