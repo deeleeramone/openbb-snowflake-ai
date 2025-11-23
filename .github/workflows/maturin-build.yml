@@ -142,9 +142,9 @@ jobs:
               cargo add openssl --features vendored
             fi
 
-            # Build SQLCipher from source
-            # Detect cross-compiler based on TARGET env var or existing CC
+            # Setup Cross-Compiler Environment
             HOST_ARG=""
+            OSSL_TARGET=""
             
             if [[ "$TARGET" == *"aarch64"* ]]; then
                 if command -v aarch64-unknown-linux-gnu-gcc >/dev/null; then
@@ -152,11 +152,13 @@ jobs:
                     export AR=aarch64-unknown-linux-gnu-ar
                     export RANLIB=aarch64-unknown-linux-gnu-ranlib
                     HOST_ARG="--host=aarch64-unknown-linux-gnu"
+                    OSSL_TARGET="linux-aarch64"
                 elif command -v aarch64-unknown-linux-musl-gcc >/dev/null; then
                     export CC=aarch64-unknown-linux-musl-gcc
                     export AR=aarch64-unknown-linux-musl-ar
                     export RANLIB=aarch64-unknown-linux-musl-ranlib
                     HOST_ARG="--host=aarch64-unknown-linux-musl"
+                    OSSL_TARGET="linux-aarch64"
                 fi
             elif [[ "$TARGET" == *"armv7"* ]]; then
                 if command -v armv7-unknown-linux-gnueabihf-gcc >/dev/null; then
@@ -164,11 +166,13 @@ jobs:
                     export AR=armv7-unknown-linux-gnueabihf-ar
                     export RANLIB=armv7-unknown-linux-gnueabihf-ranlib
                     HOST_ARG="--host=armv7-unknown-linux-gnueabihf"
+                    OSSL_TARGET="linux-armv4"
                 elif command -v armv7-unknown-linux-musleabihf-gcc >/dev/null; then
                     export CC=armv7-unknown-linux-musleabihf-gcc
                     export AR=armv7-unknown-linux-musleabihf-ar
                     export RANLIB=armv7-unknown-linux-musleabihf-ranlib
                     HOST_ARG="--host=armv7-unknown-linux-musleabihf"
+                    OSSL_TARGET="linux-armv4"
                 fi
             fi
             
@@ -177,15 +181,30 @@ jobs:
                 HOST_TRIPLE="${CC%-gcc}"
                 HOST_ARG="--host=$HOST_TRIPLE"
             fi
-            
+
+            # Build OpenSSL from source if cross-compiling
+            # (System openssl-devel is x86_64, we need target arch for SQLCipher linking)
+            if [ -n "${OSSL_TARGET:-}" ]; then
+                echo "Building OpenSSL for $TARGET ($OSSL_TARGET)..."
+                curl -L https://www.openssl.org/source/openssl-3.0.13.tar.gz -o openssl.tar.gz
+                tar xzf openssl.tar.gz
+                (
+                    cd openssl-3.0.13
+                    ./Configure $OSSL_TARGET no-shared --prefix=/usr/local --openssldir=/usr/local
+                    make
+                    make install_sw
+                )
+            fi
+
+            # Build SQLCipher from source
             curl -L https://github.com/sqlcipher/sqlcipher/archive/v4.6.0.tar.gz -o sqlcipher.tar.gz
             tar xzf sqlcipher.tar.gz
             (
               cd sqlcipher-4.6.0
-              # Explicitly set flags to help configure find OpenSSL if pkg-config fails or isn't used by default
-              # In manylinux (CentOS), openssl is in /usr/include and /usr/lib64
-              export LDFLAGS="-L/usr/lib64 -L/usr/lib"
-              export CFLAGS="-I/usr/include -DSQLITE_HAS_CODEC"
+              # Explicitly set flags to help configure find OpenSSL
+              # We prioritize /usr/local where we might have installed the cross-compiled OpenSSL
+              export LDFLAGS="-L/usr/local/lib64 -L/usr/local/lib -L/usr/lib64 -L/usr/lib"
+              export CFLAGS="-I/usr/local/include -I/usr/include -DSQLITE_HAS_CODEC"
               
               ./configure --enable-tempstore=yes --disable-tcl $HOST_ARG
               make
@@ -194,7 +213,7 @@ jobs:
             
             # Verify installation
             echo "Listing /usr/local/lib:"
-            ls -l /usr/local/lib
+            ls -l /usr/local/lib || true
 
       - run: ${{ (matrix.os == 'windows' && 'dir') || 'ls -lh' }} dist/
 
