@@ -237,6 +237,23 @@ jobs:
                   CROSS_INCLUDE_DIR=""
                   ;;
               esac
+
+              if [ -n "${CROSS_ARCH}" ]; then
+                sudo dpkg --add-architecture "${CROSS_ARCH}"
+                # Handle Ubuntu ports for cross compilation
+                if . /etc/os-release && [ "$ID" = "ubuntu" ]; then
+                   HOST_ARCH=$(dpkg --print-architecture)
+                   # Restrict main repos to host arch to avoid 404 on foreign arch
+                   sudo sed -i "s/^deb \([^\[]\)/deb [arch=${HOST_ARCH}] \1/g" /etc/apt/sources.list
+
+                   # Add ports repos for target arch
+                   CODENAME=${VERSION_CODENAME:-jammy}
+                   echo "deb [arch=${CROSS_ARCH}] http://ports.ubuntu.com/ubuntu-ports ${CODENAME} main restricted universe multiverse" | sudo tee /etc/apt/sources.list.d/ports.list
+                   echo "deb [arch=${CROSS_ARCH}] http://ports.ubuntu.com/ubuntu-ports ${CODENAME}-updates main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list.d/ports.list
+                   echo "deb [arch=${CROSS_ARCH}] http://ports.ubuntu.com/ubuntu-ports ${CODENAME}-security main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list.d/ports.list
+                fi
+              fi
+
               export DEBIAN_FRONTEND=noninteractive
               export TZ=Etc/UTC
               sudo ln -fs "/usr/share/zoneinfo/${TZ}" /etc/localtime
