@@ -324,16 +324,36 @@ jobs:
           PR_NUM="${PR_CREATED:-${PR_UPDATED:-}}"
 
           if [ -z "$PR_NUM" ]; then
-            # fetch PR number robustly (handle array/object responses)
+            # fetch PR number robustly (use Python to handle array/object responses)
             resp=$(curl -s -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/${GITHUB_REPOSITORY}/pulls?head=${GITHUB_REPOSITORY%/*}:build&base=develop&state=open")
-            PR_NUM=$(echo "$resp" | jq -r 'if type=="array" then (.[0]?.number // "") else (.number // "") end')
-          fi
+            PR_NUM=$(python - <<'PY'
+            import sys, json
+            try:
+                d = json.load(sys.stdin)
+            except Exception:
+                print("")
+                sys.exit(0)
+            if isinstance(d, list):
+                print(d[0].get("number","") if d else "")
+            elif isinstance(d, dict):
+                # API may return single object or paginated structure
+                if "number" in d:
+                    print(d.get("number",""))
+                elif "items" in d and isinstance(d["items"], list) and d["items"]:
+                    print(d["items"][0].get("number",""))
+                else:
+                    print("")
+            else:
+                print("")
+            PY
+            <<<"$resp")
+                      fi
 
-          if [ -z "$PR_NUM" ]; then
-            echo "No PR found to comment on." >&2
-            exit 0
-          fi
+                      if [ -z "$PR_NUM" ]; then
+                        echo "No PR found to comment on." >&2
+                        exit 0
+                      fi
 
           COMMENT_BODY="$(cat <<'EOF'
           ## 📦 Installation Instructions
