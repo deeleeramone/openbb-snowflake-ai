@@ -6,6 +6,10 @@ on:
     types:
       - completed
   workflow_dispatch:
+    inputs:
+      run_id:
+        description: '(optional) Build wheels workflow run id to download artifacts from'
+        required: false
 
 permissions:
   contents: write
@@ -15,7 +19,8 @@ permissions:
 jobs:
   create-wheelhouse-pr:
     name: Create PR with wheelhouse
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    # Allow this job to run when triggered by a successful workflow_run OR when manually dispatched
+    if: ${{ (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success') || (github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
     
     steps:
