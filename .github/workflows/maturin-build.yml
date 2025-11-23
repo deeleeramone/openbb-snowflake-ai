@@ -205,7 +205,10 @@ jobs:
                 export SQLCIPHER_LIB_DIR="${SQLCIPHER_PREFIX}/lib"
                 export SQLCIPHER_INCLUDE_DIR="${SQLCIPHER_PREFIX}/include"
               fi
+              export PKG_CONFIG_PATH="${SQLCIPHER_LIB_DIR}/pkgconfig:${PKG_CONFIG_PATH}"
               export LD_LIBRARY_PATH="${SQLCIPHER_LIB_DIR}:${LD_LIBRARY_PATH}"
+              export LIBRARY_PATH="${SQLCIPHER_LIB_DIR}:${LIBRARY_PATH}"
+              export RUSTFLAGS="${RUSTFLAGS} -L${SQLCIPHER_LIB_DIR}"
             elif command -v apt-get > /dev/null; then
               case "${TARGET}" in
                 aarch64|aarch64-unknown-linux-gnu)
@@ -235,6 +238,9 @@ jobs:
 
               if [ -n "${CROSS_ARCH}" ]; then
                 sudo dpkg --add-architecture "${CROSS_ARCH}" || true
+                if ! grep -q "\[arch=amd64\]" /etc/apt/sources.list; then
+                  sudo sed -i 's/^deb \(http[^ ]*\)/deb [arch=amd64] \1/' /etc/apt/sources.list
+                fi
                 sudo tee "/etc/apt/sources.list.d/${CROSS_ARCH}.list" >/dev/null <<EOF
                 deb [arch=${CROSS_ARCH}] http://ports.ubuntu.com/ubuntu-ports jammy main restricted universe multiverse
                 deb [arch=${CROSS_ARCH}] http://ports.ubuntu.com/ubuntu-ports jammy-updates main restricted universe multiverse
@@ -273,6 +279,8 @@ jobs:
                 export PKG_CONFIG_PATH="${SQLCIPHER_LIB_DIR}/pkgconfig:${PKG_CONFIG_PATH}"
               fi
               export LD_LIBRARY_PATH="${SQLCIPHER_LIB_DIR}:${LD_LIBRARY_PATH}"
+              export LIBRARY_PATH="${SQLCIPHER_LIB_DIR}:${LIBRARY_PATH}"
+              export RUSTFLAGS="${RUSTFLAGS} -L${SQLCIPHER_LIB_DIR}"
               export OPENSSL_DIR=/usr
               export OPENSSL_STATIC=1
             fi
