@@ -163,8 +163,8 @@ jobs:
           # Move the new wheelhouse into place
           mv wheelhouse-temp wheelhouse
           
-          # Remove ALL non-wheel and non-sha256 files
-          find wheelhouse -type f ! \( -name "*.whl" -o -name "*.sha256" -o -name "*.tar.gz" \) -delete
+          # Remove ALL non-wheel and non-sha256 files (like broken requirements files)
+          find wheelhouse -type f ! \( -name "*.whl" -o -name "*.sha256" -o -name "*.tar.gz" -o -name "CHECKSUMS.sha256" \) -delete
           
           # Remove any files >100MB to avoid GitHub push limits
           find wheelhouse -type f -size +100M -delete
@@ -185,8 +185,11 @@ jobs:
           echo "Fetching all branches..."
           git fetch origin
           
-          echo "Creating fresh build branch from main..."
-          git checkout -B build origin/main
+          echo "Creating fresh build branch from develop..."
+          git checkout -B build origin/develop
+          e
+          # Remove any existing wheelhouse to avoid conflicts
+          git rm -rf wheelhouse/ 2>/dev/null || true
           
           echo "Ensure wheelhouse directory exists..."
           if [ ! -d "wheelhouse" ]; then
@@ -195,25 +198,8 @@ jobs:
             exit 1
           fi
 
-          echo "Create .gitattributes for LFS tracking and add it"
-          cat > .gitattributes <<'EOF'
-          *.whl filter=lfs diff=lfs merge=lfs -text
-          *.tar.gz filter=lfs diff=lfs merge=lfs -text
-          *.zip filter=lfs diff=lfs merge=lfs -text
-          EOF
-          git add .gitattributes
-
-          echo "Track file patterns with git-lfs (local)"
-          git lfs track "*.whl" || true
-          git lfs track "*.tar.gz" || true
-          git lfs track "*.zip" || true
-          git add .gitattributes
-
-          # wheelhouse is already in the repository workspace root (moved earlier)
-          echo "Using wheelhouse directory present in workspace for commit."
-
-          echo "Add files (LFS will handle large files)"
-          git add -A wheelhouse
+          echo "Add wheelhouse files"
+          git add wheelhouse/
 
           COMMIT_MSG="chore: update wheelhouse artifacts for run ${RUN_ID}"
           if git diff --cached --quiet; then
@@ -284,23 +270,7 @@ jobs:
             exit 0
           fi
 
-          COMMENT_BODY="## 📦 Installation Instructions
+          COMMENT_BODY="## 📦 Wheelhouse
 
-          This PR includes the wheelhouse files in branch \`build\`. Large binaries are stored with Git LFS.
-
-          To get the artifacts:
-
-          \`\`\`bash
-          # Clone and fetch LFS objects
-          git clone --branch build https://github.com/${GITHUB_REPOSITORY}.git
-          cd $(basename ${GITHUB_REPOSITORY})
-          git lfs pull
-          pip install wheelhouse/<appropriate-wheel-file>.whl
-          \`\`\`
-
-          Or download artifacts directly from the Actions run:
-          ${ARTIFACTS_URL}"
-
-          curl -s -X POST -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json" \
-            -d "$(jq -n --arg body "$COMMENT_BODY" '{body:$body}')" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues/${PR_NUM}/comments"
+          This PR includes the wheelhouse files built by Maturin.
+          Wheels include Python versions '>=3.10,<3.14' for Linux, macOS, and Windows.
