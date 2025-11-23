@@ -112,13 +112,16 @@ jobs:
             curl -fsSL https://github.com/sqlcipher/sqlcipher/archive/refs/tags/v4.6.1.tar.gz | tar xz
             cd sqlcipher-4.6.1
             
-            CFLAGS="-DSQLITE_HAS_CODEC" \
+            CFLAGS="-DSQLITE_HAS_CODEC -fPIC" \
+            CPPFLAGS="-fPIC" \
+            LDFLAGS="-fPIC" \
             ./configure \
               --prefix=/usr/local \
               --enable-tempstore=yes \
               --enable-static=yes \
               --disable-shared \
-              --with-crypto-lib=openssl
+              --with-crypto-lib=openssl \
+              --with-pic
             
             make -j$(nproc)
             sudo make install
