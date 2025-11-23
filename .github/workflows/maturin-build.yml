@@ -314,24 +314,92 @@ jobs:
               ;;
           esac
           
+          # Force dynamic linking by hiding static libraries
+          echo "Forcing dynamic linking by hiding static libraries..."
+          OPENSSL_PREFIX=$(brew --prefix openssl@3)
+          SQLCIPHER_PREFIX=$(brew --prefix sqlcipher)
+          
+          echo "OpenSSL prefix: $OPENSSL_PREFIX"
+          echo "SQLCipher prefix: $SQLCIPHER_PREFIX"
+          
+          # Temporarily move ALL static libraries to force dynamic linking
+          find "$OPENSSL_PREFIX/lib" -name "*.a" | while read -r static_lib; do
+            sudo mv "$static_lib" "${static_lib}.bak"
+            echo "Moved $static_lib to ${static_lib}.bak"
+          done
+          find "$SQLCIPHER_PREFIX/lib" -name "*.a" 2>/dev/null | while read -r static_lib; do
+            sudo mv "$static_lib" "${static_lib}.bak"
+            echo "Moved $static_lib to ${static_lib}.bak"
+          done
+          
+          # Also check for and move static libs in system paths that might be found first
+          if [ -d "/usr/local/lib" ]; then
+            find /usr/local/lib -name "libssl.a" -o -name "libcrypto.a" -o -name "libsqlcipher.a" 2>/dev/null | while read -r static_lib; do
+              sudo mv "$static_lib" "${static_lib}.bak" 2>/dev/null || true
+              echo "Moved system $static_lib to ${static_lib}.bak"
+            done
+          fi
+          
           # Export dynamic linking flags for each build
           export OPENSSL_STATIC=0
           export SQLCIPHER_STATIC=0
-          export OPENSSL_DIR=$(brew --prefix openssl@3)
-          export PKG_CONFIG_PATH="$(brew --prefix openssl@3)/lib/pkgconfig:$(brew --prefix sqlcipher)/lib/pkgconfig"
-          export RUSTFLAGS="-L $(brew --prefix sqlcipher)/lib -L $(brew --prefix openssl@3)/lib"
+          export OPENSSL_DIR=$OPENSSL_PREFIX
+          export OPENSSL_LIB_DIR="$OPENSSL_PREFIX/lib"
+          export OPENSSL_INCLUDE_DIR="$OPENSSL_PREFIX/include"
+          export PKG_CONFIG_PATH="$OPENSSL_PREFIX/lib/pkgconfig:$SQLCIPHER_PREFIX/lib/pkgconfig"
+          # Force the linker to use dylibs with explicit paths
+          export RUSTFLAGS="-L $SQLCIPHER_PREFIX/lib -L $OPENSSL_PREFIX/lib -C link-arg=-Wl,-rpath,$OPENSSL_PREFIX/lib"
+          # Tell the linker to prefer dynamic libraries
+          export OPENSSL_NO_VENDOR=1
+          # Force dynamic for libsqlite3-sys as well
+          export LIBSQLITE3_SYS_USE_PKG_CONFIG=1
           
           # Debug: Check what we're linking against
           echo "OPENSSL_DIR=$OPENSSL_DIR"
           echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH"
           echo "RUSTFLAGS=$RUSTFLAGS"
           echo "OPENSSL_STATIC=$OPENSSL_STATIC"
+          echo "Available dylibs:"
+          ls -la $OPENSSL_PREFIX/lib/*.dylib || true
+          ls -la $SQLCIPHER_PREFIX/lib/*.dylib || true
           
           sdist_flag="--sdist"
           for py in ${{ matrix.interpreter }}; do
             echo "Building for Python ${py} on ${RUST_TARGET}"
             maturin build --release --target ${RUST_TARGET} --interpreter ${py} ${sdist_flag}
             sdist_flag=""
+          done
+          
+          # Restore static libraries
+          find "$OPENSSL_PREFIX/lib" -name "*.a.bak" | while read -r backup; do
+            original="${backup%.bak}"
+            sudo mv "$backup" "$original"
+            echo "Restored $original"
+          done
+          find "$SQLCIPHER_PREFIX/lib" -name "*.a.bak" 2>/dev/null | while read -r backup; do
+            original="${backup%.bak}"
+            sudo mv "$backup" "$original"
+            echo "Restored $original"
+          done
+          if [ -d "/usr/local/lib" ]; then
+            find /usr/local/lib -name "*.a.bak" 2>/dev/null | while read -r backup; do
+              original="${backup%.bak}"
+              sudo mv "$backup" "$original" 2>/dev/null || true
+              echo "Restored system $original"
+            done
+          fi
+          
+          # Verify dynamic linking before delocating
+          echo "Checking for dynamic dependencies in built wheels..."
+          for wheel in target/wheels/*.whl; do
+            echo "Checking $wheel"
+            tmpdir=$(mktemp -d)
+            unzip -q "$wheel" -d "$tmpdir"
+            echo "Contents of wheel:"
+            find "$tmpdir" -name "*.so" -o -name "*.dylib" | head -5
+            echo "Dynamic dependencies:"
+            find "$tmpdir" -name "*.so" -exec otool -L {} \; | grep -E "(libssl|libcrypto|sqlcipher)" || echo "WARNING: No external dylib deps found!"
+            rm -rf "$tmpdir"
           done
           
           # Bundle dependent dylibs so end users do not need Homebrew-installed libraries.
