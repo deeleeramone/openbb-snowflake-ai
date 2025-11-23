@@ -121,6 +121,9 @@ jobs:
             -e CFLAGS_armv7_unknown_linux_gnueabihf
             -e CFLAGS_armv7_unknown_linux_musleabihf
             -e PKG_CONFIG_PATH=/usr/lib/pkgconfig:/usr/lib64/pkgconfig:/usr/share/pkgconfig:/usr/local/lib/pkgconfig:/usr/local/lib64/pkgconfig
+            -e OPENSSL_DIR=/usr
+            -e OPENSSL_LIB_DIR=/usr/lib
+            -e OPENSSL_INCLUDE_DIR=/usr/include
           before-script-linux: |
             set -e
             set -x
@@ -137,19 +140,16 @@ jobs:
               # CentOS/RHEL (manylinux2014)
               # sqlcipher might be in EPEL
               yum install -y epel-release || true
-              yum install -y pkgconfig perl-core make gcc git openssl-devel tcl sqlcipher-devel || {
-                 echo "sqlcipher-devel not found in yum. This platform might fail if sqlcipher is required."
-              }
+              yum install -y pkgconfig perl-core make gcc git openssl-devel tcl || true
+              # Try to install sqlcipher-devel but don't fail if it's not available
+              yum install -y sqlcipher-devel || echo "sqlcipher-devel not found in yum"
             elif command -v apt-get > /dev/null; then
               # Debian/Ubuntu
               apt-get update
               apt-get install -y pkg-config build-essential git libssl-dev tcl libsqlcipher-dev
             fi
-
-            # We rely on system packages for OpenSSL and SQLCipher.
-            # Do NOT force vendored openssl here as it conflicts with system sqlcipher.
             
-            # Verify installation and set environment variables if needed
+            # Verify installation
             if pkg-config --exists sqlcipher; then
                 echo "sqlcipher found via pkg-config"
             elif pkg-config --exists libsqlcipher; then
@@ -158,14 +158,12 @@ jobs:
                  echo "WARNING: sqlcipher not found via pkg-config."
             fi
             
-            # Explicitly set OPENSSL_DIR if pkg-config fails to find it, 
-            # though PKG_CONFIG_PATH should handle it.
-            if ! pkg-config --exists openssl; then
-                echo "openssl not found via pkg-config, setting OPENSSL_DIR=/usr"
-                export OPENSSL_DIR=/usr
-                export OPENSSL_LIB_DIR=/usr/lib
-                export OPENSSL_INCLUDE_DIR=/usr/include
-            fi
+            # Debug: show where OpenSSL is installed
+            echo "OpenSSL headers should be in:"
+            ls -la /usr/include/openssl/ || echo "Not found in /usr/include/openssl/"
+            echo "OpenSSL libraries should be in:"
+            ls -la /usr/lib/*ssl* || echo "Not found in /usr/lib/"
+            ls -la /usr/lib64/*ssl* || echo "Not found in /usr/lib64/"
 
       - run: ${{ (matrix.os == 'windows' && 'dir') || 'ls -lh' }} dist/
 
