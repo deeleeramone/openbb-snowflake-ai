@@ -117,12 +117,66 @@ jobs:
           set(VCPKG_BUILD_TYPE release)
           "@ | Out-File -FilePath $tripletPath -Encoding utf8
           
-          # Install OpenSSL and SQLite3 as DYNAMIC libraries using custom triplet
-          Write-Host "Installing packages with dynamic linkage for ${arch}-windows-dynamic"
-          .\vcpkg install "openssl:${arch}-windows-dynamic" "sqlite3:${arch}-windows-dynamic"
+          # Install OpenSSL as DYNAMIC library using custom triplet
+          Write-Host "Installing OpenSSL with dynamic linkage for ${arch}-windows-dynamic"
+          .\vcpkg install "openssl:${arch}-windows-dynamic"
           
           # Set environment variables for the correct architecture
           $installPath = "C:\vcpkg\installed\${arch}-windows-dynamic"
+          
+          # Now BUILD SQLCipher from source using the OpenSSL we just installed
+          Write-Host "Building SQLCipher from source..."
+          cd C:\
+          git clone https://github.com/sqlcipher/sqlcipher.git
+          cd sqlcipher
+          git checkout v4.6.1
+          
+          # Set up Visual Studio environment
+          $vsPath = "${env:ProgramFiles}\Microsoft Visual Studio\2022\Enterprise"
+          if (-not (Test-Path $vsPath)) {
+            $vsPath = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\Enterprise"
+          }
+          
+          # Run vcvarsall.bat to set up the build environment
+          $vcvarsScript = "$vsPath\VC\Auxiliary\Build\vcvarsall.bat"
+          if ($arch -eq "arm64") {
+            & cmd /c "`"$vcvarsScript`" amd64_arm64 && set" | ForEach-Object {
+              if ($_ -match '^([^=]+)=(.*)') {
+                [System.Environment]::SetEnvironmentVariable($matches[1], $matches[2])
+              }
+            }
+          } else {
+            & cmd /c "`"$vcvarsScript`" x64 && set" | ForEach-Object {
+              if ($_ -match '^([^=]+)=(.*)') {
+                [System.Environment]::SetEnvironmentVariable($matches[1], $matches[2])
+              }
+            }
+          }
+          
+          # Configure SQLCipher build with OpenSSL from vcpkg
+          $env:CFLAGS = "/DSQLITE_HAS_CODEC /DSQLCIPHER_CRYPTO_OPENSSL /I$installPath\include"
+          $env:LDFLAGS = "/LIBPATH:$installPath\lib"
+          $env:LIBS = "libcrypto.lib libssl.lib"
+          
+          # Build SQLCipher using nmake
+          Write-Host "Configuring SQLCipher..."
+          nmake /f Makefile.msc sqlite3.dll sqlite3.lib SQLITE_TEMP_STORE=2 `
+            OPT_FEATURE_FLAGS="-DSQLITE_HAS_CODEC -DSQLCIPHER_CRYPTO_OPENSSL" `
+            LTLINKOPTS="$installPath\lib\libcrypto.lib $installPath\lib\libssl.lib" `
+            LTLIBPATHS="/LIBPATH:$installPath\lib" `
+            OPTS="-DSQLITE_HAS_CODEC -I$installPath\include"
+          
+          # Copy the built SQLCipher libraries to vcpkg install directory
+          Write-Host "Installing SQLCipher to vcpkg directory..."
+          Copy-Item sqlite3.dll "$installPath\bin\sqlcipher.dll" -Force
+          Copy-Item sqlite3.lib "$installPath\lib\sqlcipher.lib" -Force
+          Copy-Item sqlite3.h "$installPath\include\sqlcipher.h" -Force
+          
+          # Also keep sqlite3 named versions for compatibility
+          Copy-Item sqlite3.dll "$installPath\bin\sqlite3.dll" -Force
+          Copy-Item sqlite3.lib "$installPath\lib\sqlite3.lib" -Force
+          
+          cd $env:GITHUB_WORKSPACE
           
           echo "OPENSSL_DIR=$installPath" >> $env:GITHUB_ENV
           echo "OPENSSL_LIB_DIR=$installPath\lib" >> $env:GITHUB_ENV
@@ -134,6 +188,8 @@ jobs:
           echo "RUSTFLAGS=-L $installPath\lib" >> $env:GITHUB_ENV
           # Explicitly tell OpenSSL to NOT use static linking
           echo "OPENSSL_STATIC=0" >> $env:GITHUB_ENV
+          # Force OpenSSL to use vcpkg version, not native Windows TLS
+          echo "OPENSSL_NO_VENDOR=1" >> $env:GITHUB_ENV
           
           # For ARM64, we need to use the bundled SQLite since cross-compilation is complex
           if ("${{ matrix.target }}" -eq "aarch64") {
@@ -147,7 +203,7 @@ jobs:
           Write-Host "=== Checking bin directory for DLLs ==="
           if (Test-Path "$installPath\bin") {
             Write-Host "Bin directory found. DLL Contents:"
-            Get-ChildItem "$installPath\bin\*.dll" | Select-Object Name
+            Get-ChildItem "$installPath\bin\*.dll" | Select-Object Name, @{Name="Size(MB)";Expression={[math]::Round($_.Length / 1MB, 2)}}
           } else {
             Write-Host "WARNING: Bin directory not found - no DLLs to bundle!"
           }
@@ -159,22 +215,12 @@ jobs:
             Write-Host "Library directory not found!"
           }
 
-          # If sqlcipher.lib is missing but sqlite3.lib exists, create a copy as a fallback
-          if (-not (Test-Path "$installPath\lib\sqlcipher.lib")) {
-            if (Test-Path "$installPath\lib\sqlite3.lib") {
-              Write-Host "sqlcipher.lib missing — creating from sqlite3.lib as fallback"
-              Copy-Item "$installPath\lib\sqlite3.lib" "$installPath\lib\sqlcipher.lib" -Force
-              Write-Host "Created $installPath\lib\sqlcipher.lib"
-            } else {
-              Write-Host "Neither sqlcipher.lib nor sqlite3.lib found in $installPath\lib"
-            }
-          } else {
-            Write-Host "sqlcipher.lib already present"
-          }
-
           # Export LIB and PATH so MSVC link.exe can find vcpkg libs and DLLs
-          echo "LIB=$installPath\lib" >> $env:GITHUB_ENV
+          echo "LIB=$installPath\lib;$env:LIB" >> $env:GITHUB_ENV
           echo "PATH=$installPath\bin;$env:PATH" >> $env:GITHUB_ENV
+          
+          # Force the use of dynamic OpenSSL by setting feature flags
+          echo "CARGO_FEATURE_VENDORED=0" >> $env:GITHUB_ENV
       - run: pip install -U ruff typing_extensions setuptools delocate delvewheel
 
       - name: Install Rust
@@ -481,6 +527,19 @@ jobs:
             "aarch64" {
               $rustTarget = "aarch64-pc-windows-msvc"
             }
+          }
+          
+          # Before building, verify OpenSSL is found
+          Write-Host "=== Verifying OpenSSL configuration ==="
+          Write-Host "OPENSSL_DIR: $env:OPENSSL_DIR"
+          Write-Host "OPENSSL_LIB_DIR: $env:OPENSSL_LIB_DIR"
+          Write-Host "OPENSSL_STATIC: $env:OPENSSL_STATIC"
+          Write-Host "Checking for OpenSSL libs:"
+          if (Test-Path "$env:OPENSSL_LIB_DIR\libssl.lib") {
+            Write-Host "  Found libssl.lib"
+          }
+          if (Test-Path "$env:OPENSSL_LIB_DIR\libcrypto.lib") {
+            Write-Host "  Found libcrypto.lib"
           }
           
           $pythonVersions = "${{ matrix.interpreter }}".Split()
