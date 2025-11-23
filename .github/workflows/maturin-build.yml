@@ -128,6 +128,9 @@ jobs:
             -e CFLAGS_armv7_unknown_linux_gnueabihf
             -e CFLAGS_armv7_unknown_linux_musleabihf
           before-script-linux: |
+            set -e
+            set -x
+            
             # Install build tools and dependencies
             if command -v apk > /dev/null; then
               apk add pkgconfig perl make gcc musl-dev git openssl-dev tcl
@@ -193,7 +196,7 @@ jobs:
                     ./Configure $OSSL_TARGET no-shared no-tests --prefix=/usr/local --openssldir=/usr/local
                     make -j$(nproc)
                     make install_sw
-                ) || exit 1
+                )
             fi
             
             # Update PKG_CONFIG_PATH to include the newly installed openssl
@@ -208,17 +211,14 @@ jobs:
               # Use pkg-config to find OpenSSL flags if available
               if pkg-config --exists libcrypto; then
                   echo "Found libcrypto via pkg-config"
-                  export LDFLAGS="${LDFLAGS:-} $(pkg-config --libs-only-L libcrypto)"
-                  export CFLAGS="${CFLAGS:-} $(pkg-config --cflags libcrypto)"
-                  export LIBS="${LIBS:-} $(pkg-config --libs-only-l libcrypto)"
+                  export LDFLAGS="${LDFLAGS:-} $(pkg-config --static --libs-only-L libcrypto)"
+                  export CFLAGS="${CFLAGS:-} $(pkg-config --static --cflags libcrypto)"
+                  export LIBS="${LIBS:-} $(pkg-config --static --libs-only-l libcrypto)"
               else
                   echo "libcrypto not found via pkg-config, falling back to manual flags"
                   export LDFLAGS="-L/usr/local/lib64 -L/usr/local/lib"
                   export CFLAGS="-I/usr/local/include"
-                  # For static linking, we might need dl and pthread. 
-                  # On musl, these are empty/implicit, but on glibc they are needed.
-                  # We add them just in case; linker should ignore if not needed or duplicate.
-                  export LIBS="-ldl -lpthread"
+                  export LIBS="-lcrypto -ldl -lpthread"
               fi
               
               # Ensure CFLAGS has -DSQLITE_HAS_CODEC
@@ -229,7 +229,7 @@ jobs:
               ./configure --enable-tempstore=yes --disable-tcl $HOST_ARG
               make -j$(nproc)
               make install
-            ) || exit 1
+            )
             
             # Verify installation
             echo "Listing /usr/local/lib:"
