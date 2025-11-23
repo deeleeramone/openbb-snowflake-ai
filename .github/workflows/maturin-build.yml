@@ -84,196 +84,135 @@ jobs:
           CFLAGS_aarch64_unknown_linux_gnu: "-D__ARM_ARCH=8"
           # Workaround for ring crate build failure on armv7
           CFLAGS_armv7_unknown_linux_gnueabihf: "-D__ARM_ARCH=7"
+          # Force static linking
+          OPENSSL_STATIC: "1"
+          SQLCIPHER_STATIC: "1"
         with:
-          target: ${{ matrix.target }}
-          args: --release --out dist --interpreter ${{ matrix.interpreter || '3.10 3.11 3.12 3.13' }}
+          target: ${{ matrix.target }}-unknown-linux-gnu
+          args: --release --out dist --interpreter ${{ matrix.interpreter || '3.10 3.11 3.12 3.13' }} --compatibility linux
           rust-toolchain: stable
-          container: 'off'  # Disable default container
+          manylinux: 'off'
+          container: 'off'
           before-script-linux: |
-            # Only run this inside a container or with proper permissions
-            if [ -f /.dockerenv ] || [ -n "${GITHUB_ACTIONS}" ]; then
-              # If we're on GitHub Actions runner directly, we need sudo
-              if [ -n "${GITHUB_ACTIONS}" ] && [ ! -f /.dockerenv ]; then
-                echo "Running on GitHub Actions runner, using system packages"
-                sudo apt-get update
-                sudo apt-get install -y build-essential pkg-config libssl-dev libsqlcipher-dev
-                
-                # Set environment for system packages
-                export OPENSSL_DIR=/usr
-                export OPENSSL_STATIC=1
-                export SQLCIPHER_LIB_DIR=/usr/lib/x86_64-linux-gnu
-                export SQLCIPHER_INCLUDE_DIR=/usr/include
-                export PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig
-                
-                # Target is from matrix
-                TARGET="${{ matrix.target }}"
-                case "${TARGET}" in
-                  x86_64)
-                    export X86_64_UNKNOWN_LINUX_GNU_OPENSSL_DIR=/usr
-                    export X86_64_UNKNOWN_LINUX_GNU_OPENSSL_STATIC=1
-                    ;;
-                  aarch64)
-                    export AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_DIR=/usr
-                    export AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_STATIC=1
-                    ;;
-                  armv7)
-                    export ARMV7_UNKNOWN_LINUX_GNUEABIHF_OPENSSL_DIR=/usr
-                    export ARMV7_UNKNOWN_LINUX_GNUEABIHF_OPENSSL_STATIC=1
-                    ;;
-                esac
-              else
-                # Inside Docker container - build from source
-                set -e
-                set -x
-                
-                ORIGINAL_DIR=$(pwd)
-                echo "=================== BUILD SETUP (CONTAINER) ==================="
-                echo "TARGET=${{ matrix.target }}"
-                echo "PWD=$(pwd)"
-                
-                # Install base build tools (no sudo needed in container)
-                if command -v apt-get > /dev/null; then
-                  apt-get update
-                  apt-get install -y build-essential pkg-config curl ca-certificates tcl autoconf automake libtool
-                elif command -v apk > /dev/null; then
-                  apk update
-                  apk add --no-cache build-base pkgconfig curl ca-certificates tcl autoconf automake libtool perl make
-                elif command -v yum > /dev/null; then
-                  yum install -y gcc gcc-c++ make perl-core pkgconfig curl tcl autoconf automake libtool
-                fi
-                
-                # Set installation prefix
-                PREFIX=/opt/deps
-                mkdir -p "${PREFIX}"
-                
-                # Build OpenSSL
-                echo "=================== BUILDING OPENSSL ==================="
-                OPENSSL_VERSION=3.3.2
-                OPENSSL_BUILD_DIR=$(mktemp -d)
-                
-                curl -fsSL "https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz" | tar -xz -C "${OPENSSL_BUILD_DIR}"
-                cd "${OPENSSL_BUILD_DIR}/openssl-${OPENSSL_VERSION}"
-                
-                # Configure OpenSSL based on target
-                case "${{ matrix.target }}" in
-                  x86_64)
-                    OPENSSL_TARGET=linux-x86_64
-                    ;;
-                  aarch64)
-                    OPENSSL_TARGET=linux-aarch64
-                    ;;
-                  armv7)
-                    OPENSSL_TARGET=linux-armv4
-                    ;;
-                  *)
-                    OPENSSL_TARGET=linux-x86_64
-                    ;;
-                esac
-                
-                ./Configure \
-                  "${OPENSSL_TARGET}" \
-                  --prefix="${PREFIX}" \
-                  --openssldir="${PREFIX}/ssl" \
-                  no-shared \
-                  no-async \
-                  -fPIC
-                
-                make -j"$(nproc)"
-                make install_sw
-                cd "${ORIGINAL_DIR}"
-                rm -rf "${OPENSSL_BUILD_DIR}"
-                
-                # Build SQLCipher
-                echo "=================== BUILDING SQLCIPHER ==================="
-                SQLCIPHER_VERSION=4.5.6
-                SQLCIPHER_BUILD_DIR=$(mktemp -d)
-                
-                curl -fsSL "https://github.com/sqlcipher/sqlcipher/archive/refs/tags/v${SQLCIPHER_VERSION}.tar.gz" | tar -xz -C "${SQLCIPHER_BUILD_DIR}"
-                cd "${SQLCIPHER_BUILD_DIR}/sqlcipher-${SQLCIPHER_VERSION}"
-                
-                # Configure SQLCipher with static OpenSSL
-                CFLAGS="-I${PREFIX}/include -DSQLITE_HAS_CODEC" \
-                LDFLAGS="-L${PREFIX}/lib" \
-                LIBS="${PREFIX}/lib/libcrypto.a -lpthread" \
-                ./configure \
-                  --prefix="${PREFIX}" \
-                  --enable-tempstore=yes \
-                  --disable-tcl \
-                  --disable-shared \
-                  --enable-static \
-                  --with-crypto-lib=openssl \
-                  --enable-fts5
-                
-                make -j"$(nproc)"
-                make install
-                cd "${ORIGINAL_DIR}"
-                rm -rf "${SQLCIPHER_BUILD_DIR}"
-                
-                # Export environment variables for Rust
-                echo "=================== SETTING ENVIRONMENT ==================="
-                export OPENSSL_DIR="${PREFIX}"
-                export OPENSSL_STATIC=1
-                export OPENSSL_LIB_DIR="${PREFIX}/lib"
-                export OPENSSL_INCLUDE_DIR="${PREFIX}/include"
-                export SQLCIPHER_LIB_DIR="${PREFIX}/lib"
-                export SQLCIPHER_INCLUDE_DIR="${PREFIX}/include"
-                export PKG_CONFIG_PATH="${PREFIX}/lib/pkgconfig"
-                export PKG_CONFIG_ALLOW_CROSS=1
-                
-                # Set target-specific environment variables
-                case "${{ matrix.target }}" in
-                  x86_64)
-                    export X86_64_UNKNOWN_LINUX_GNU_OPENSSL_DIR="${PREFIX}"
-                    export X86_64_UNKNOWN_LINUX_GNU_OPENSSL_STATIC=1
-                    ;;
-                  aarch64)
-                    export AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_DIR="${PREFIX}"
-                    export AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_STATIC=1
-                    ;;
-                  armv7)
-                    export ARMV7_UNKNOWN_LINUX_GNUEABIHF_OPENSSL_DIR="${PREFIX}"
-                    export ARMV7_UNKNOWN_LINUX_GNUEABIHF_OPENSSL_STATIC=1
-                    ;;
-                esac
-                
-                # Set common flags
-                export RUSTFLAGS="${RUSTFLAGS:-} -L${PREFIX}/lib"
-                export LD_LIBRARY_PATH="${PREFIX}/lib:${LD_LIBRARY_PATH:-}"
-                export LIBRARY_PATH="${PREFIX}/lib:${LIBRARY_PATH:-}"
-                
-                # Verify installation
-                echo "=================== VERIFICATION ==================="
-                echo "Checking OpenSSL installation:"
-                if [ -f "${PREFIX}/include/openssl/opensslv.h" ]; then
-                  echo "✓ OpenSSL headers found at ${PREFIX}/include"
-                else
-                  echo "✗ OpenSSL headers missing!"
-                  exit 1
-                fi
-                
-                if [ -f "${PREFIX}/lib/libcrypto.a" ]; then
-                  echo "✓ OpenSSL libcrypto.a found at ${PREFIX}/lib"
-                else
-                  echo "✗ OpenSSL libcrypto.a missing!"
-                  exit 1
-                fi
-                
-                echo "Checking SQLCipher installation:"
-                if [ -f "${PREFIX}/lib/libsqlcipher.a" ]; then
-                  echo "✓ SQLCipher library found at ${PREFIX}/lib"
-                else
-                  echo "✗ SQLCipher library missing!"
-                  exit 1
-                fi
-                
-                echo "Environment variables set:"
-                echo "OPENSSL_DIR=${OPENSSL_DIR}"
-                echo "OPENSSL_LIB_DIR=${OPENSSL_LIB_DIR}"
-                echo "OPENSSL_INCLUDE_DIR=${OPENSSL_INCLUDE_DIR}"
-                echo "SQLCIPHER_LIB_DIR=${SQLCIPHER_LIB_DIR}"
-                echo "PKG_CONFIG_PATH=${PKG_CONFIG_PATH}"
-                echo "RUSTFLAGS=${RUSTFLAGS}"
-                echo "=================== SETUP COMPLETE ==================="
+            set -e
+            set -x
+            
+            echo "=================== DIRECT BUILD - NO CONTAINERS ==================="
+            echo "Building for target: ${{ matrix.target }}"
+            
+            # Install cross-compilation tools
+            sudo apt-get update
+            sudo apt-get install -y \
+              build-essential \
+              pkg-config \
+              libssl-dev \
+              libsqlcipher-dev \
+              curl \
+              gcc \
+              g++ \
+              make \
+              cmake \
+              autoconf \
+              automake \
+              libtool
+            
+            # Install cross-compilation toolchains for non-x86_64
+            case "${{ matrix.target }}" in
+              aarch64)
+                sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+                export CC=aarch64-linux-gnu-gcc
+                export CXX=aarch64-linux-gnu-g++
+                export AR=aarch64-linux-gnu-ar
+                export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+                ;;
+              armv7)
+                sudo apt-get install -y gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
+                export CC=arm-linux-gnueabihf-gcc
+                export CXX=arm-linux-gnueabihf-g++
+                export AR=arm-linux-gnueabihf-ar
+                export CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER=arm-linux-gnueabihf-gcc
+                ;;
+              x86_64)
+                export CC=gcc
+                export CXX=g++
+                ;;
+            esac
+            
+            # Build and install OpenSSL for target
+            PREFIX=/tmp/openssl-sqlcipher
+            mkdir -p "${PREFIX}"
+            
+            echo "Building OpenSSL 3.3.2"
+            cd /tmp
+            curl -fsSL https://www.openssl.org/source/openssl-3.3.2.tar.gz | tar xz
+            cd openssl-3.3.2
+            
+            case "${{ matrix.target }}" in
+              x86_64)
+                ./Configure linux-x86_64 --prefix="${PREFIX}" no-shared -fPIC
+                ;;
+              aarch64)
+                ./Configure linux-aarch64 --prefix="${PREFIX}" no-shared -fPIC --cross-compile-prefix=aarch64-linux-gnu-
+                ;;
+              armv7)
+                ./Configure linux-armv4 --prefix="${PREFIX}" no-shared -fPIC --cross-compile-prefix=arm-linux-gnueabihf-
+                ;;
+            esac
+            
+            make -j$(nproc)
+            make install_sw
+            
+            # Build SQLCipher
+            echo "Building SQLCipher 4.6.1"
+            cd /tmp
+            curl -fsSL https://github.com/sqlcipher/sqlcipher/archive/refs/tags/v4.6.1.tar.gz | tar xz
+            cd sqlcipher-4.6.1
+            
+            CFLAGS="-I${PREFIX}/include -DSQLITE_HAS_CODEC" \
+            LDFLAGS="-L${PREFIX}/lib" \
+            ./configure \
+              --prefix="${PREFIX}" \
+              --enable-tempstore=yes \
+              --enable-static=yes \
+              --disable-shared \
+              --with-crypto-lib=openssl \
+              --host=${{ matrix.target == 'aarch64' && 'aarch64-linux-gnu' || matrix.target == 'armv7' && 'arm-linux-gnueabihf' || '' }}
+            
+            make -j$(nproc)
+            make install
+            
+            # Set environment variables for Rust
+            export OPENSSL_DIR="${PREFIX}"
+            export OPENSSL_LIB_DIR="${PREFIX}/lib"
+            export OPENSSL_INCLUDE_DIR="${PREFIX}/include"
+            export SQLCIPHER_LIB_DIR="${PREFIX}/lib"
+            export SQLCIPHER_INCLUDE_DIR="${PREFIX}/include"
+            export PKG_CONFIG_PATH="${PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH}"
+            
+            # Target-specific exports
+            case "${{ matrix.target }}" in
+              x86_64)
+                echo "X86_64_UNKNOWN_LINUX_GNU_OPENSSL_DIR=${PREFIX}" >> $GITHUB_ENV
+                echo "X86_64_UNKNOWN_LINUX_GNU_OPENSSL_STATIC=1" >> $GITHUB_ENV
+                ;;
+              aarch64)
+                echo "AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_DIR=${PREFIX}" >> $GITHUB_ENV
+                echo "AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_STATIC=1" >> $GITHUB_ENV
+                ;;
+              armv7)
+                echo "ARMV7_UNKNOWN_LINUX_GNUEABIHF_OPENSSL_DIR=${PREFIX}" >> $GITHUB_ENV
+                echo "ARMV7_UNKNOWN_LINUX_GNUEABIHF_OPENSSL_STATIC=1" >> $GITHUB_ENV
+                ;;
+            esac
+            
+            # Export to GitHub env for maturin
+            echo "OPENSSL_DIR=${PREFIX}" >> $GITHUB_ENV
+            echo "OPENSSL_STATIC=1" >> $GITHUB_ENV
+            echo "SQLCIPHER_LIB_DIR=${PREFIX}/lib" >> $GITHUB_ENV
+            echo "SQLCIPHER_INCLUDE_DIR=${PREFIX}/include" >> $GITHUB_ENV
+            echo "PKG_CONFIG_PATH=${PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH}" >> $GITHUB_ENV
+            
+            echo "=================== BUILD SETUP COMPLETE ==================="
       - run: ${{ (matrix.os == 'windows' && 'dir') || 'ls -lh' }} dist/
 
       - uses: actions/upload-artifact@v4
