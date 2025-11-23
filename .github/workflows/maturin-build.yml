@@ -132,7 +132,7 @@ jobs:
             Write-Host "Library directory not found!"
           }
 
-      - run: pip install -U ruff typing_extensions
+      - run: pip install -U ruff typing_extensions setuptools
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
