@@ -95,6 +95,7 @@ jobs:
           sudo apt-get install -y \
             build-essential \
             pkg-config \
+            libssl-dev \
             curl \
             gcc \
             g++ \
@@ -104,106 +105,130 @@ jobs:
             automake \
             libtool
           
-          # Install cross-compilation tools if needed
-          case "${{ matrix.target }}" in
-            aarch64)
-              sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
-              export CC=aarch64-linux-gnu-gcc
-              export CXX=aarch64-linux-gnu-g++
-              export AR=aarch64-linux-gnu-ar
-              export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
-              RUST_TARGET="aarch64-unknown-linux-gnu"
-              ;;
-            armv7)
-              sudo apt-get install -y gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
-              export CC=arm-linux-gnueabihf-gcc
-              export CXX=arm-linux-gnueabihf-g++
-              export AR=arm-linux-gnueabihf-ar
-              export CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER=arm-linux-gnueabihf-gcc
-              RUST_TARGET="armv7-unknown-linux-gnueabihf"
-              ;;
-            x86_64)
-              export CC=gcc
-              export CXX=g++
-              RUST_TARGET="x86_64-unknown-linux-gnu"
-              ;;
-          esac
-          
-          # Build OpenSSL
-          PREFIX=/tmp/openssl-sqlcipher
-          mkdir -p "${PREFIX}"
-          
-          echo "Building OpenSSL 3.3.2"
-          cd /tmp
-          curl -fsSL https://www.openssl.org/source/openssl-3.3.2.tar.gz | tar xz
-          cd openssl-3.3.2
-          
-          case "${{ matrix.target }}" in
-            x86_64)
-              ./Configure linux-x86_64 --prefix="${PREFIX}" no-shared -fPIC
-              ;;
-            aarch64)
-              CC=aarch64-linux-gnu-gcc ./Configure linux-aarch64 --prefix="${PREFIX}" no-shared -fPIC
-              ;;
-            armv7)
-              CC=arm-linux-gnueabihf-gcc ./Configure linux-armv4 --prefix="${PREFIX}" no-shared -fPIC
-              ;;
-          esac
-          
-          make -j$(nproc)
-          make install_sw
-          
-          # Build SQLCipher
-          echo "Building SQLCipher 4.6.1"
-          cd /tmp
-          curl -fsSL https://github.com/sqlcipher/sqlcipher/archive/refs/tags/v4.6.1.tar.gz | tar xz
-          cd sqlcipher-4.6.1
-          
-          CFLAGS="-I${PREFIX}/include -DSQLITE_HAS_CODEC" \
-          LDFLAGS="-L${PREFIX}/lib" \
-          ./configure \
-            --prefix="${PREFIX}" \
-            --enable-tempstore=yes \
-            --enable-static=yes \
-            --disable-shared \
-            --with-crypto-lib=openssl \
-            --host=${{ matrix.target == 'aarch64' && 'aarch64-linux-gnu' || matrix.target == 'armv7' && 'arm-linux-gnueabihf' || '' }}
-          
-          make -j$(nproc)
-          make install
-          
-          cd ${{ github.workspace }}
-          
-          # Set environment variables
-          export OPENSSL_DIR="${PREFIX}"
-          export OPENSSL_STATIC=1
-          export OPENSSL_LIB_DIR="${PREFIX}/lib"
-          export OPENSSL_INCLUDE_DIR="${PREFIX}/include"
-          export SQLCIPHER_LIB_DIR="${PREFIX}/lib"
-          export SQLCIPHER_INCLUDE_DIR="${PREFIX}/include"
-          export PKG_CONFIG_PATH="${PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH}"
-          
-          # Set target-specific OpenSSL variables
-          case "${{ matrix.target }}" in
-            x86_64)
-              export X86_64_UNKNOWN_LINUX_GNU_OPENSSL_DIR="${PREFIX}"
-              export X86_64_UNKNOWN_LINUX_GNU_OPENSSL_STATIC=1
-              ;;
-            aarch64)
-              export AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_DIR="${PREFIX}"
-              export AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_STATIC=1
-              ;;
-            armv7)
-              export ARMV7_UNKNOWN_LINUX_GNUEABIHF_OPENSSL_DIR="${PREFIX}"
-              export ARMV7_UNKNOWN_LINUX_GNUEABIHF_OPENSSL_STATIC=1
-              ;;
-          esac
-          
-          # Build wheels for each Python version
-          for py in ${{ matrix.interpreter }}; do
-            echo "Building for Python ${py}"
-            maturin build --release --target ${RUST_TARGET} --interpreter ${py}
-          done
+          # For x86_64, just use system libraries
+          if [ "${{ matrix.target }}" = "x86_64" ]; then
+            # Install SQLCipher from source with system OpenSSL
+            cd /tmp
+            curl -fsSL https://github.com/sqlcipher/sqlcipher/archive/refs/tags/v4.6.1.tar.gz | tar xz
+            cd sqlcipher-4.6.1
+            
+            CFLAGS="-DSQLITE_HAS_CODEC" \
+            ./configure \
+              --prefix=/usr/local \
+              --enable-tempstore=yes \
+              --enable-static=yes \
+              --disable-shared \
+              --with-crypto-lib=openssl
+            
+            make -j$(nproc)
+            sudo make install
+            
+            cd ${{ github.workspace }}
+            
+            # Build wheels for x86_64
+            for py in ${{ matrix.interpreter }}; do
+              echo "Building for Python ${py}"
+              OPENSSL_STATIC=1 maturin build --release --interpreter ${py}
+            done
+          else
+            # Cross-compilation for ARM targets
+            case "${{ matrix.target }}" in
+              aarch64)
+                sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross
+                export CC=aarch64-linux-gnu-gcc
+                export CXX=aarch64-linux-gnu-g++
+                export AR=aarch64-linux-gnu-ar
+                export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+                RUST_TARGET="aarch64-unknown-linux-gnu"
+                OPENSSL_TARGET="linux-aarch64"
+                HOST_FLAG="--host=aarch64-linux-gnu"
+                ;;
+              armv7)
+                sudo apt-get install -y gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf libc6-dev-armhf-cross
+                export CC=arm-linux-gnueabihf-gcc
+                export CXX=arm-linux-gnueabihf-g++
+                export AR=arm-linux-gnueabihf-ar
+                export CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER=arm-linux-gnueabihf-gcc
+                RUST_TARGET="armv7-unknown-linux-gnueabihf"
+                OPENSSL_TARGET="linux-armv4"
+                HOST_FLAG="--host=arm-linux-gnueabihf"
+                ;;
+            esac
+            
+            # Build OpenSSL for cross target
+            PREFIX=/tmp/deps-${{ matrix.target }}
+            mkdir -p "${PREFIX}"
+            
+            echo "Building OpenSSL 3.3.2 for ${{ matrix.target }}"
+            cd /tmp
+            curl -fsSL https://www.openssl.org/source/openssl-3.3.2.tar.gz | tar xz
+            cd openssl-3.3.2
+            
+            ./Configure ${OPENSSL_TARGET} \
+              --prefix="${PREFIX}" \
+              --openssldir="${PREFIX}/ssl" \
+              no-shared \
+              no-async \
+              -fPIC
+            
+            make -j$(nproc)
+            make install_sw
+            
+            # Build SQLCipher for cross target
+            echo "Building SQLCipher 4.6.1 for ${{ matrix.target }}"
+            cd /tmp
+            curl -fsSL https://github.com/sqlcipher/sqlcipher/archive/refs/tags/v4.6.1.tar.gz | tar xz
+            cd sqlcipher-4.6.1
+            
+            CPPFLAGS="-I${PREFIX}/include" \
+            LDFLAGS="-L${PREFIX}/lib" \
+            LIBS="-lcrypto -lpthread" \
+            ./configure \
+              --prefix="${PREFIX}" \
+              --enable-tempstore=yes \
+              --enable-static=yes \
+              --disable-shared \
+              --with-crypto-lib=openssl \
+              ${HOST_FLAG}
+            
+            make -j$(nproc)
+            make install
+            
+            cd ${{ github.workspace }}
+            
+            # Export all the environment variables for cross-compilation
+            export OPENSSL_DIR="${PREFIX}"
+            export OPENSSL_STATIC=1
+            export OPENSSL_LIB_DIR="${PREFIX}/lib"
+            export OPENSSL_INCLUDE_DIR="${PREFIX}/include"
+            export SQLCIPHER_LIB_DIR="${PREFIX}/lib"
+            export SQLCIPHER_INCLUDE_DIR="${PREFIX}/include"
+            export PKG_CONFIG_PATH="${PREFIX}/lib/pkgconfig"
+            export PKG_CONFIG_ALLOW_CROSS=1
+            
+            # Build wheels for ARM targets
+            for py in ${{ matrix.interpreter }}; do
+              echo "Building for Python ${py} on ${RUST_TARGET}"
+              
+              # Set target-specific environment variables
+              case "${{ matrix.target }}" in
+                aarch64)
+                  AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_DIR="${PREFIX}" \
+                  AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_STATIC=1 \
+                  AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_LIB_DIR="${PREFIX}/lib" \
+                  AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_INCLUDE_DIR="${PREFIX}/include" \
+                  maturin build --release --target ${RUST_TARGET} --interpreter ${py}
+                  ;;
+                armv7)
+                  ARMV7_UNKNOWN_LINUX_GNUEABIHF_OPENSSL_DIR="${PREFIX}" \
+                  ARMV7_UNKNOWN_LINUX_GNUEABIHF_OPENSSL_STATIC=1 \
+                  ARMV7_UNKNOWN_LINUX_GNUEABIHF_OPENSSL_LIB_DIR="${PREFIX}/lib" \
+                  ARMV7_UNKNOWN_LINUX_GNUEABIHF_OPENSSL_INCLUDE_DIR="${PREFIX}/include" \
+                  maturin build --release --target ${RUST_TARGET} --interpreter ${py}
+                  ;;
+              esac
+            done
+          fi
           
           # Move all wheels to dist directory
           mkdir -p dist
