@@ -190,9 +190,11 @@ jobs:
             cd ${{ github.workspace }}
             
             # Build wheels for x86_64/amd64
+            sdist_flag="--sdist"
             for py in ${{ matrix.interpreter }}; do
               echo "Building for Python ${py}"
-              OPENSSL_STATIC=1 maturin build --release --interpreter ${py}
+              OPENSSL_STATIC=1 maturin build --release --interpreter ${py} ${sdist_flag}
+              sdist_flag=""
             done
           else
             # Cross-compilation for aarch64
@@ -257,6 +259,7 @@ jobs:
             export PKG_CONFIG_ALLOW_CROSS=1
             
             # Build wheels for aarch64
+            sdist_flag="--sdist"
             for py in ${{ matrix.interpreter }}; do
               echo "Building for Python ${py} on ${RUST_TARGET}"
               
@@ -264,13 +267,15 @@ jobs:
               AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_STATIC=1 \
               AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_LIB_DIR="${PREFIX}/lib" \
               AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_INCLUDE_DIR="${PREFIX}/include" \
-              maturin build --release --target ${RUST_TARGET} --interpreter ${py}
+              maturin build --release --target ${RUST_TARGET} --interpreter ${py} ${sdist_flag}
+              sdist_flag=""
             done
           fi
           
           # Move all wheels to dist directory
           mkdir -p dist
           find target -name "*.whl" -exec mv {} dist/ \;
+          find target -name "*.tar.gz" -exec mv {} dist/ \;
 
       # =================== MACOS ===================
       - name: Build macOS wheels
@@ -287,14 +292,17 @@ jobs:
               ;;
           esac
           
+          sdist_flag="--sdist"
           for py in ${{ matrix.interpreter }}; do
             echo "Building for Python ${py}"
-            maturin build --release --target ${RUST_TARGET} --interpreter ${py}
+            maturin build --release --target ${RUST_TARGET} --interpreter ${py} ${sdist_flag}
+            sdist_flag=""
           done
           
           # Move all wheels to dist directory
           mkdir -p dist
           find target -name "*.whl" -exec mv {} dist/ \;
+          find target -name "*.tar.gz" -exec mv {} dist/ \;
 
       # =================== WINDOWS ===================  
       - name: Build Windows wheels
@@ -337,14 +345,16 @@ jobs:
           }
           
           $pythonVersions = "${{ matrix.interpreter }}".Split()
+          $sdistFlag = "--sdist"
           foreach ($py in $pythonVersions) {
             Write-Host "Building for Python $py on $rustTarget"
-            maturin build --release --target $rustTarget --interpreter $py
+            maturin build --release --target $rustTarget --interpreter $py $sdistFlag
+            $sdistFlag = ""
           }
           
           # Move all wheels to dist directory
           New-Item -ItemType Directory -Force -Path dist
-          Get-ChildItem -Path target -Filter *.whl -Recurse | Move-Item -Destination dist
+          Get-ChildItem -Path target -Recurse -Include *.whl,*.tar.gz | Move-Item -Destination dist
 
       - run: ${{ (matrix.os == 'windows' && 'dir') || 'ls -lh' }} dist/
 
@@ -385,12 +395,13 @@ jobs:
           # Create wheelhouse directory
           mkdir -p wheelhouse
           
-          # Collect all wheel files
+          # Collect all artifacts
           find all-artifacts -name "*.whl" -exec cp {} wheelhouse/ \;
-          
-          # Build source distribution (tar.gz)
-          echo "Building source distribution..."
-          python -m build --sdist --outdir wheelhouse/
+          find all-artifacts -name "*.tar.gz" -exec cp {} wheelhouse/ \;
+          if ! ls wheelhouse/*.tar.gz >/dev/null 2>&1; then
+            echo "ERROR: No sdists produced by maturin build." >&2
+            exit 1
+          fi
           
           # Generate SHA256 hashes for all files
           cd wheelhouse
@@ -418,6 +429,21 @@ jobs:
           echo ""
           echo "=================== Checksums ==================="
           cat CHECKSUMS.sha256
+      
+      - name: Prepare release archives bundle
+        run: |
+          set -euo pipefail
+          mkdir -p release-archives
+          find wheelhouse -maxdepth 1 -type f \( -name "*.tar.gz" -o -name "*.tar.gz.sha256" -o -name "CHECKSUMS.sha256" \) -exec cp {} release-archives/ \;
+          echo "Release archives:"
+          ls -lh release-archives || true
+
+      - name: Upload release archives
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-archives
+          path: release-archives/
+          retention-days: 30
       
       - name: Upload wheelhouse
         uses: actions/upload-artifact@v4
