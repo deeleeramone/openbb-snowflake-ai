@@ -120,6 +120,22 @@ jobs:
             Write-Host "Library directory not found!"
           }
 
+          # If sqlcipher.lib is missing but sqlite3.lib exists, create a copy as a fallback
+          if (-not (Test-Path "$installPath\lib\sqlcipher.lib")) {
+            if (Test-Path "$installPath\lib\sqlite3.lib") {
+              Write-Host "sqlcipher.lib missing — creating from sqlite3.lib as fallback"
+              Copy-Item "$installPath\lib\sqlite3.lib" "$installPath\lib\sqlcipher.lib" -Force
+              Write-Host "Created $installPath\lib\sqlcipher.lib"
+            } else {
+              Write-Host "Neither sqlcipher.lib nor sqlite3.lib found in $installPath\lib"
+            }
+          } else {
+            Write-Host "sqlcipher.lib already present"
+          }
+
+          # Export LIB so MSVC link.exe can find vcpkg libs
+          echo "LIB=$installPath\lib" >> $env:GITHUB_ENV
+          
       - run: pip install -U ruff typing_extensions setuptools
 
       - name: Install Rust
@@ -290,7 +306,7 @@ jobs:
           $vcpkgTriplet = "${arch}-windows-static"
           $installPath = "C:\vcpkg\installed\$vcpkgTriplet"
           
-          # Set environment variables for the build (ensure linker finds OpenSSL)
+          # Set environment variables for the build (ensure linker finds OpenSSL and sqlcipher)
           $env:OPENSSL_DIR = $installPath
           $env:OPENSSL_LIB_DIR = "$installPath\lib"
           $env:OPENSSL_INCLUDE_DIR = "$installPath\include"
@@ -299,13 +315,15 @@ jobs:
           $env:SQLITE3_LIB_DIR = "$installPath\lib"
           # ensure rustc/cargo pass the OpenSSL libs to the MSVC linker
           $env:RUSTFLAGS = "-L $installPath\lib -C link-arg=libcrypto.lib -C link-arg=libssl.lib"
-          # also set LIB so link.exe will search the directory
+          # also set LIB so link.exe will search the directory (runtime)
           $env:LIB = "$installPath\lib;$env:LIB"
           $env:OPENSSL_STATIC = "1"
-          
-          # For ARM64, use bundled SQLite
-          if ("${{ matrix.target }}" -eq "aarch64") {
-            $env:LIBSQLITE3_SYS_USE_BUNDLED = "1"
+
+          # Confirm sqlcipher.lib exists (helpful debug)
+          if (Test-Path "$installPath\lib\sqlcipher.lib") {
+            Write-Host "sqlcipher.lib found at $installPath\lib"
+          } else {
+            Write-Host "WARNING: sqlcipher.lib not found at $installPath\lib — link may fail"
           }
           
           # Build wheels for each Python version
