@@ -164,7 +164,7 @@ jobs:
                     export AR=armv7-unknown-linux-gnueabihf-ar
                     export RANLIB=armv7-unknown-linux-gnueabihf-ranlib
                     HOST_ARG="--host=armv7-unknown-linux-gnueabihf"
-                elif command -v armv7-unknown-linux-musleabihf-gcc >/dev>null; then
+                elif command -v armv7-unknown-linux-musleabihf-gcc >/dev/null; then
                     export CC=armv7-unknown-linux-musleabihf-gcc
                     export AR=armv7-unknown-linux-musleabihf-ar
                     export RANLIB=armv7-unknown-linux-musleabihf-ranlib
@@ -173,7 +173,7 @@ jobs:
             fi
             
             # Fallback: if CC is set in env (by cross image) and we haven't set HOST_ARG yet
-            if [ -z "$HOST_ARG" ] && [ -n "$CC" ] && [ "$CC" != "gcc" ]; then
+            if [ -z "$HOST_ARG" ] && [ -n "${CC:-}" ] && [ "${CC:-}" != "gcc" ]; then
                 HOST_TRIPLE="${CC%-gcc}"
                 HOST_ARG="--host=$HOST_TRIPLE"
             fi
