@@ -216,15 +216,11 @@ jobs:
           *.zip binary
           EOF
 
-      - name: Commit wheelhouse into repo branch using Git LFS
+      - name: Commit wheelhouse into repo branch
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          echo "Installing git-lfs..."
-          sudo apt-get update
-          sudo apt-get install -y git-lfs || true
-          git lfs install --local
 
           echo "Configuring git user..."
           git config user.email "actions@github.com"
