@@ -23,13 +23,64 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           ref: main
-      
+
+      - name: Determine build run id
+        id: determine_run
+        run: |
+          # If triggered by workflow_run, use that id
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_run" ]; then
+            echo "RUN_ID=${{ github.event.workflow_run.id }}" >> $GITHUB_ENV
+            echo "Determined RUN_ID from workflow_run: ${{ github.event.workflow_run.id }}"
+            exit 0
+          fi
+
+          # If manual trigger and explicit input run_id provided, use it
+          # (workflow_dispatch inputs can be referenced as github.event.inputs)
+          MANUAL_RUN_ID="${{ github.event.inputs.run_id || '' }}"
+          if [ -n "$MANUAL_RUN_ID" ]; then
+            echo "RUN_ID=$MANUAL_RUN_ID" >> $GITHUB_ENV
+            echo "Determined RUN_ID from workflow_dispatch input: $MANUAL_RUN_ID"
+            exit 0
+          fi
+
+          # Otherwise query the Actions API for the latest successful Build wheels run
+          OWNER_REPO="${GITHUB_REPOSITORY}"
+          OWNER="$(echo "$OWNER_REPO" | cut -d'/' -f1)"
+          REPO="$(echo "$OWNER_REPO" | cut -d'/' -f2)"
+          WORKFLOW_FILE="maturin-build.yml"
+
+          echo "Querying GitHub API for latest successful run of $WORKFLOW_FILE..."
+          resp=$(curl -s -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${OWNER}/${REPO}/actions/workflows/${WORKFLOW_FILE}/runs?status=completed&conclusion=success&per_page=1")
+
+          # Parse run id (requires jq)
+          if command -v jq > /dev/null; then
+            run_id=$(echo "$resp" | jq -r '.workflow_runs[0].id // empty')
+          else
+            # Fallback to python parsing if jq not available
+            run_id=$(python - <<'PY'
+            import sys, json
+            data = json.load(sys.stdin)
+            runs = data.get("workflow_runs") or []
+            print(runs[0].get("id") if runs else "")
+            PY
+            <<<"$resp")
+          fi
+
+          if [ -z "$run_id" ]; then
+            echo "ERROR: Could not find a successful Build wheels run. Provide run_id as workflow_dispatch input or ensure Build wheels ran successfully." >&2
+            exit 1
+          fi
+
+          echo "RUN_ID=$run_id" >> $GITHUB_ENV
+          echo "Determined RUN_ID from API: $run_id"
+
       - name: Download wheelhouse artifacts
         uses: actions/download-artifact@v4
         with:
           name: wheelhouse
           path: wheelhouse-temp
-          run-id: ${{ github.event.workflow_run.id }}
+          run-id: ${{ env.RUN_ID }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
       
       - name: Download release archives
@@ -37,7 +88,7 @@ jobs:
         with:
           name: release-archives
           path: .
-          run-id: ${{ github.event.workflow_run.id }}
+          run-id: ${{ env.RUN_ID }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
       
       - name: Prepare wheelhouse directory
