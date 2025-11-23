@@ -231,37 +231,34 @@ jobs:
           # Verify files are in wheelhouse
           echo "Files in wheelhouse directory:"
           ls -la wheelhouse/
-          file wheelhouse/*.whl | head -5
           
-          echo "Force adding ALL wheelhouse files..."
-          # Use git add with force for the entire directory
-          git add -f wheelhouse/
+          echo "adding wheelhouse files with -f flag..."
+          for file in wheelhouse/*; do
+            if [ -f "$file" ]; then
+              echo "Force adding: $file"
+              git add -f "$file"
+            fi
+          done
           
           COMMIT_MSG="chore: update wheelhouse artifacts for run ${RUN_ID}"
           
-          # Check what's staged - this should show all the wheel files
+          # Check what's staged
           echo "Staged files:"
           git status --short
           
-          # Double check we have staged files
+          # Count staged files
           STAGED_COUNT=$(git diff --cached --name-only | wc -l)
           echo "Number of staged files: $STAGED_COUNT"
           
           if [ "$STAGED_COUNT" -eq 0 ]; then
-            echo "ERROR: No files were staged! Something went wrong."
-            echo "Trying alternative approach..."
-            
-            # Alternative: manually add each file
-            for file in wheelhouse/*; do
-              if [ -f "$file" ]; then
-                echo "Adding $file"
-                git add -f "$file"
-              fi
-            done
-            
-            # Check again
+            echo "ERROR: No files were staged despite force adding!"
+            echo "Checking .gitignore..."
+            cat .gitignore || echo "No .gitignore file"
+            echo ""
+            echo "Trying to stage with git add -A -f wheelhouse/"
+            git add -A -f wheelhouse/
             STAGED_COUNT=$(git diff --cached --name-only | wc -l)
-            echo "After manual add, staged files: $STAGED_COUNT"
+            echo "After -A -f, staged files: $STAGED_COUNT"
           fi
           
           if git diff --cached --quiet; then
