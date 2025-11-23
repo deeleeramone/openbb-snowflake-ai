@@ -115,6 +115,7 @@ jobs:
           docker-options: >-
             -e CI 
             -e TARGET=${{ matrix.target }}
+            -e RUSTFLAGS=-L/usr/lib
             -e CFLAGS_aarch64_unknown_linux_gnu
             -e CFLAGS_aarch64_unknown_linux_musl
             -e CFLAGS_armv7_unknown_linux_gnueabihf
@@ -125,18 +126,35 @@ jobs:
             
             # Install build tools and dependencies using system package managers
             if command -v apk > /dev/null; then
-              apk add pkgconfig perl make gcc musl-dev git openssl-dev tcl
+              # Alpine (musl)
+              # sqlcipher is in the community repository
+              echo "http://dl-cdn.alpinelinux.org/alpine/edge/community" >> /etc/apk/repositories
+              echo "http://dl-cdn.alpinelinux.org/alpine/edge/main" >> /etc/apk/repositories
+              apk update
+              apk add pkgconfig perl make gcc musl-dev git openssl-dev tcl sqlcipher-dev
             elif command -v yum > /dev/null; then
-              yum install -y pkgconfig perl-core make gcc git openssl-devel tcl
+              # CentOS/RHEL (manylinux2014)
+              # sqlcipher might be in EPEL
+              yum install -y epel-release || true
+              yum install -y pkgconfig perl-core make gcc git openssl-devel tcl sqlcipher-devel || {
+                 echo "sqlcipher-devel not found in yum. This platform might fail if sqlcipher is required."
+              }
             elif command -v apt-get > /dev/null; then
-              apt-get update && apt-get install -y pkg-config build-essential git libssl-dev tcl
+              # Debian/Ubuntu
+              apt-get update
+              apt-get install -y pkg-config build-essential git libssl-dev tcl libsqlcipher-dev
             fi
 
-            # Ensure we use vendored openssl for cross-compilation compatibility
-            if command -v cargo > /dev/null; then
-              # We use --lock to avoid updating Cargo.lock if not necessary, 
-              # but we need to ensure the feature is enabled.
-              cargo add openssl --features vendored
+            # We rely on system packages for OpenSSL and SQLCipher.
+            # Do NOT force vendored openssl here as it conflicts with system sqlcipher.
+            
+            # Verify installation
+            if pkg-config --exists sqlcipher; then
+                echo "sqlcipher found via pkg-config"
+            elif pkg-config --exists libsqlcipher; then
+                 echo "libsqlcipher found via pkg-config"
+            else
+                 echo "WARNING: sqlcipher not found via pkg-config."
             fi
 
       - run: ${{ (matrix.os == 'windows' && 'dir') || 'ls -lh' }} dist/
