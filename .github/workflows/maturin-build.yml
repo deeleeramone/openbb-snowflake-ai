@@ -135,6 +135,10 @@ jobs:
             set -e
             set -x
             
+            # Save original working directory
+            ORIGINAL_DIR=$(pwd)
+            echo "Original directory: ${ORIGINAL_DIR}"
+            
             echo "=================== DETECTING ENVIRONMENT ==================="
             echo "TARGET=${TARGET}"
             echo "PWD=$(pwd)"
@@ -300,7 +304,7 @@ jobs:
                 
                 make -j"$(nproc)"
                 make install_sw
-                cd /
+                cd "${ORIGINAL_DIR}"  # Return to original directory
                 rm -rf "${OPENSSL_BUILD_DIR}"
                 
                 # Build SQLCipher for musl
@@ -325,7 +329,7 @@ jobs:
                 
                 make -j"$(nproc)"
                 make install
-                cd /
+                cd "${ORIGINAL_DIR}"  # Return to original directory
                 rm -rf "${SQLCIPHER_BUILD_DIR}"
                 
                 # Set environment
@@ -406,7 +410,7 @@ jobs:
                 
                 make -j"$(nproc)"
                 make install
-                cd /
+                cd "${ORIGINAL_DIR}"  # Return to original directory
                 rm -rf "${SQLCIPHER_BUILD_DIR}"
                 
                 export SQLCIPHER_LIB_DIR="${SQLCIPHER_PREFIX}/lib"
@@ -500,6 +504,9 @@ jobs:
             echo "=================== FINAL CONFIGURATION ==================="
             echo "Container: ${CONTAINER_TYPE}"
             echo "Target: ${TARGET}"
+            echo "Current directory: $(pwd)"
+            echo "Contents of current directory:"
+            ls -la
             echo "OPENSSL_DIR: ${OPENSSL_DIR}"
             echo "OPENSSL_LIB_DIR: ${OPENSSL_LIB_DIR:-default}"
             echo "OPENSSL_INCLUDE_DIR: ${OPENSSL_INCLUDE_DIR:-default}"
@@ -512,6 +519,16 @@ jobs:
               ls "${OPENSSL_DIR}/include/openssl/opensslv.h" 2>/dev/null && echo "✓ OpenSSL headers found" || echo "✗ OpenSSL headers missing"
               ls "${OPENSSL_LIB_DIR:-${OPENSSL_DIR}/lib}/"libssl* 2>/dev/null | head -1 && echo "✓ OpenSSL libs found" || echo "✗ OpenSSL libs missing"
             fi
+            
+            # Ensure we're in the right directory for maturin
+            if [ ! -f "Cargo.toml" ]; then
+              echo "ERROR: Cargo.toml not found in current directory!"
+              echo "Current directory: $(pwd)"
+              echo "Looking for Cargo.toml in parent directories..."
+              find / -name "Cargo.toml" -type f 2>/dev/null | head -10
+              exit 1
+            fi
+            
             echo "==========================================================="
       - run: ${{ (matrix.os == 'windows' && 'dir') || 'ls -lh' }} dist/
 
