@@ -107,21 +107,6 @@ jobs:
           # Workaround for ring crate build failure on armv7
           CFLAGS_armv7_unknown_linux_gnueabihf: "-D__ARM_ARCH=7"
           CFLAGS_armv7_unknown_linux_musleabihf: "-D__ARM_ARCH=7"
-          # FORCE OPENSSL TO VENDOR - THESE MUST BE HERE!!!
-          OPENSSL_STATIC: "1"
-          OPENSSL_DIR: "/usr"
-          OPENSSL_LIB_DIR: "/usr/lib"
-          OPENSSL_INCLUDE_DIR: "/usr/include"
-          # Set for ALL targets
-          X86_64_UNKNOWN_LINUX_GNU_OPENSSL_DIR: "/usr"
-          X86_64_UNKNOWN_LINUX_MUSL_OPENSSL_DIR: "/usr"
-          AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_DIR: "/usr"
-          AARCH64_UNKNOWN_LINUX_MUSL_OPENSSL_DIR: "/usr"
-          ARMV7_UNKNOWN_LINUX_GNUEABIHF_OPENSSL_DIR: "/usr"
-          ARMV7_UNKNOWN_LINUX_MUSLEABIHF_OPENSSL_DIR: "/usr"
-          S390X_UNKNOWN_LINUX_GNU_OPENSSL_DIR: "/usr"
-          PPC64LE_UNKNOWN_LINUX_GNU_OPENSSL_DIR: "/usr"
-          I686_UNKNOWN_LINUX_GNU_OPENSSL_DIR: "/usr"
         with:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
@@ -134,47 +119,80 @@ jobs:
             -e CFLAGS_aarch64_unknown_linux_musl
             -e CFLAGS_armv7_unknown_linux_gnueabihf
             -e CFLAGS_armv7_unknown_linux_musleabihf
-            -e OPENSSL_STATIC
-            -e OPENSSL_DIR
-            -e OPENSSL_LIB_DIR
-            -e OPENSSL_INCLUDE_DIR
-            -e X86_64_UNKNOWN_LINUX_GNU_OPENSSL_DIR
-            -e X86_64_UNKNOWN_LINUX_MUSL_OPENSSL_DIR
-            -e AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_DIR
-            -e AARCH64_UNKNOWN_LINUX_MUSL_OPENSSL_DIR
-            -e ARMV7_UNKNOWN_LINUX_GNUEABIHF_OPENSSL_DIR
-            -e ARMV7_UNKNOWN_LINUX_MUSLEABIHF_OPENSSL_DIR
-            -e S390X_UNKNOWN_LINUX_GNU_OPENSSL_DIR
-            -e PPC64LE_UNKNOWN_LINUX_GNU_OPENSSL_DIR
-            -e I686_UNKNOWN_LINUX_GNU_OPENSSL_DIR
           before-script-linux: |
             set -e
             set -x
             
-            # Install OpenSSL and build tools
+            # Install build dependencies
             if command -v apk > /dev/null; then
               # Alpine (musl)
               echo "http://dl-cdn.alpinelinux.org/alpine/edge/community" >> /etc/apk/repositories
               echo "http://dl-cdn.alpinelinux.org/alpine/edge/main" >> /etc/apk/repositories
               apk update
               apk add pkgconfig perl make gcc musl-dev git tcl sqlcipher-dev openssl-dev openssl-libs-static
+              
+              # For musl cross-compilation, set the correct paths
+              export OPENSSL_DIR=/usr
+              export OPENSSL_STATIC=1
+              export OPENSSL_LIB_DIR=/usr/lib
+              export OPENSSL_INCLUDE_DIR=/usr/include
             elif command -v yum > /dev/null; then
               # CentOS/RHEL (manylinux2014)
               yum install -y epel-release || true
-              yum install -y pkgconfig perl-core make gcc git tcl openssl-devel openssl-static || true
+              yum install -y pkgconfig perl-core make gcc git tcl || true
+              
+              # For cross-compilation targets, install the appropriate OpenSSL
+              if [ "${TARGET}" = "aarch64" ] || [ "${TARGET}" = "aarch64-unknown-linux-gnu" ]; then
+                # Install aarch64 OpenSSL development files
+                yum install -y openssl-devel.aarch64 || true
+                # Set OpenSSL to the cross-compilation directory
+                export AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_DIR=/usr/aarch64-unknown-linux-gnu
+                export OPENSSL_DIR=/usr/aarch64-unknown-linux-gnu
+                export OPENSSL_STATIC=1
+                
+                # Create symlink for opensslconf.h if needed
+                if [ -f /usr/include/openssl/opensslconf-aarch64.h ]; then
+                  mkdir -p /usr/aarch64-unknown-linux-gnu/include/openssl
+                  ln -sf /usr/include/openssl/*.h /usr/aarch64-unknown-linux-gnu/include/openssl/ 2>/dev/null || true
+                  ln -sf /usr/include/openssl/opensslconf-aarch64.h /usr/aarch64-unknown-linux-gnu/include/openssl/opensslconf.h
+                fi
+              elif [ "${TARGET}" = "armv7" ] || [ "${TARGET}" = "armv7-unknown-linux-gnueabihf" ]; then
+                export ARMV7_UNKNOWN_LINUX_GNUEABIHF_OPENSSL_DIR=/usr/armv7-unknown-linux-gnueabihf
+                export OPENSSL_DIR=/usr/armv7-unknown-linux-gnueabihf
+                export OPENSSL_STATIC=1
+              elif [ "${TARGET}" = "x86_64" ] || [ "${TARGET}" = "x86_64-unknown-linux-gnu" ]; then
+                # For native x86_64, just install normally
+                yum install -y openssl-devel openssl-static || true
+                export OPENSSL_DIR=/usr
+                export OPENSSL_STATIC=1
+                export OPENSSL_LIB_DIR=/usr/lib64
+                export OPENSSL_INCLUDE_DIR=/usr/include
+              else
+                # Default: install host OpenSSL
+                yum install -y openssl-devel openssl-static || true
+                export OPENSSL_DIR=/usr
+                export OPENSSL_STATIC=1
+              fi
+              
               # Try to install sqlcipher-devel but don't fail if it's not available
               yum install -y sqlcipher-devel || echo "sqlcipher-devel not found in yum"
             elif command -v apt-get > /dev/null; then
               # Debian/Ubuntu
               apt-get update
               apt-get install -y pkg-config build-essential git tcl libsqlcipher-dev libssl-dev
+              export OPENSSL_DIR=/usr
+              export OPENSSL_STATIC=1
             fi
             
-            # Verify installations
-            echo "OpenSSL headers:"
-            ls -la /usr/include/openssl/ || echo "Not found"
-            echo "OpenSSL libraries:"
-            ls -la /usr/lib/*ssl* /usr/lib64/*ssl* 2>/dev/null || echo "Not found"
+            # Debug: Show what we found
+            echo "TARGET=${TARGET}"
+            echo "OPENSSL_DIR=${OPENSSL_DIR}"
+            if [ -n "${OPENSSL_DIR}" ]; then
+              echo "OpenSSL headers in ${OPENSSL_DIR}:"
+              ls -la ${OPENSSL_DIR}/include/openssl/ 2>/dev/null || echo "Headers not found"
+              echo "OpenSSL libraries in ${OPENSSL_DIR}:"
+              ls -la ${OPENSSL_DIR}/lib*/*ssl* 2>/dev/null || echo "Libraries not found"
+            fi
 
       - run: ${{ (matrix.os == 'windows' && 'dir') || 'ls -lh' }} dist/
 
