@@ -127,6 +127,9 @@ jobs:
             -e CFLAGS_aarch64_unknown_linux_musl
             -e CFLAGS_armv7_unknown_linux_gnueabihf
             -e CFLAGS_armv7_unknown_linux_musleabihf
+            -e OPENSSL_STATIC=1
+            -e OPENSSL_LIB_DIR=/usr/local/lib
+            -e OPENSSL_INCLUDE_DIR=/usr/local/include
           before-script-linux: |
             set -e
             set -x
