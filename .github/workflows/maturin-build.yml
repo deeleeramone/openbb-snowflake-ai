@@ -539,23 +539,15 @@ jobs:
                 }
               } else {
                 Write-Host "  WARNING: dumpbin not found, using Python ctypes to check"
-                python -c @"
-                import ctypes.util
-                import os
-                os.chdir(r'$($pydFile.DirectoryName)')
-                try:
-                    # Try to load the pyd and see what it needs
-                    import ctypes
-                    dll = ctypes.CDLL(r'$($pydFile.FullName)')
-                    print('  Successfully loaded (statically linked?)')
-                except Exception as e:
-                    print(f'  Load error (missing DLLs?): {e}')
-                "@
-                              }
-                            }
-                            Remove-Item -Recurse -Force $tempPre
-                          }
-                          
+                $pythonScript = "import ctypes.util; import os; os.chdir(r'$($pydFile.DirectoryName)'); "
+                $pythonScript += "try: import ctypes; dll = ctypes.CDLL(r'$($pydFile.FullName)'); print('  Successfully loaded (statically linked?)'); "
+                $pythonScript += "except Exception as e: print(f'  Load error (missing DLLs?): {e}')"
+                python -c $pythonScript
+              }
+            }
+            Remove-Item -Recurse -Force $tempPre
+          }
+          
           Write-Host "`n=== Running delvewheel repair ==="
           Get-ChildItem -Path target -Recurse -Filter *.whl | ForEach-Object {
             $originalSize = [math]::Round($_.Length / 1MB, 2)
