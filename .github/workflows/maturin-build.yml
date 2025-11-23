@@ -79,6 +79,16 @@ jobs:
           python-version: "3.13"
           architecture: ${{ matrix.python-architecture || 'x64' }}
 
+      - name: Install OpenSSL development headers (Ubuntu)
+        if: matrix.os == 'linux'
+        run: |
+          if command -v apt-get > /dev/null; then
+            apt-get update
+            apt-get install -y libssl-dev
+          elif command -v yum > /dev/null; then
+            yum install -y openssl-devel openssl-static
+          fi
+
       - name: Install dependencies (macOS)
         if: matrix.os == 'macos'
         run: |
@@ -144,7 +154,7 @@ jobs:
               # For cross-compilation targets, install the appropriate OpenSSL
               if [ "${TARGET}" = "aarch64" ] || [ "${TARGET}" = "aarch64-unknown-linux-gnu" ]; then
                 # Install aarch64 OpenSSL development files
-                yum install -y openssl-devel.aarch64 || true
+                yum install -y openssl-devel.aarch64
                 # Set OpenSSL to the cross-compilation directory
                 export AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_DIR=/usr/aarch64-unknown-linux-gnu
                 export OPENSSL_DIR=/usr/aarch64-unknown-linux-gnu
