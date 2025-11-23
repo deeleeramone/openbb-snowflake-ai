@@ -517,7 +517,11 @@ jobs:
             Write-Host "`nAnalyzing: $($_.Name)"
             $tempPre = Join-Path $env:TEMP "pre_repair_$(Get-Random)"
             New-Item -ItemType Directory -Force -Path $tempPre | Out-Null
-            python -c "import zipfile; zipfile.ZipFile('$($_.FullName)').extractall('$tempPre')"
+            
+            # Use forward slashes for Python or escape backslashes properly
+            $wheelPath = $_.FullName.Replace('\', '/')
+            $extractPath = $tempPre.Replace('\', '/')
+            python -c "import zipfile; zipfile.ZipFile('$wheelPath').extractall('$extractPath')"
             
             # Find the .pyd file
             $pydFile = Get-ChildItem -Path $tempPre -Filter "*.pyd" -Recurse | Select-Object -First 1
@@ -539,8 +543,10 @@ jobs:
                 }
               } else {
                 Write-Host "  WARNING: dumpbin not found, using Python ctypes to check"
-                $pythonScript = "import ctypes.util; import os; os.chdir(r'$($pydFile.DirectoryName)'); "
-                $pythonScript += "try: import ctypes; dll = ctypes.CDLL(r'$($pydFile.FullName)'); print('  Successfully loaded (statically linked?)'); "
+                $pydPath = $pydFile.FullName.Replace('\', '/')
+                $pydDir = $pydFile.DirectoryName.Replace('\', '/')
+                $pythonScript = "import ctypes.util; import os; os.chdir('$pydDir'); "
+                $pythonScript += "try: import ctypes; dll = ctypes.CDLL('$pydPath'); print('  Successfully loaded (statically linked?)'); "
                 $pythonScript += "except Exception as e: print(f'  Load error (missing DLLs?): {e}')"
                 python -c $pythonScript
               }
@@ -574,8 +580,10 @@ jobs:
                 $tempExtract = Join-Path $env:TEMP "wheel_check_$(Get-Random)"
                 New-Item -ItemType Directory -Force -Path $tempExtract | Out-Null
                 
-                # Use Python to extract the wheel
-                python -c "import zipfile; zipfile.ZipFile('$repairedPath').extractall('$tempExtract')"
+                # Use Python to extract the wheel - use forward slashes for paths
+                $repairedPathPy = $repairedPath.Replace('\', '/')
+                $tempExtractPy = $tempExtract.Replace('\', '/')
+                python -c "import zipfile; zipfile.ZipFile('$repairedPathPy').extractall('$tempExtractPy')"
                 
                 # Check for .libs directory
                 $libsDir = Get-ChildItem -Path $tempExtract -Directory -Filter "*.libs" -Recurse | Select-Object -First 1
@@ -596,7 +604,9 @@ jobs:
                 } else {
                   Write-Host "  ERROR: No .libs directory found in repaired wheel!"
                   Write-Host "  Wheel contents:"
-                  Get-ChildItem -Path $tempExtract -Recurse | Select-Object -First 20
+                  Get-ChildItem -Path $tempExtract -Recurse | Select-Object -First 20 | ForEach-Object {
+                    Write-Host "    $($_.FullName.Replace($tempExtract, ''))"
+                  }
                 }
                 
                 Remove-Item -Recurse -Force $tempExtract
@@ -606,8 +616,6 @@ jobs:
               Write-Host "  ERROR: delvewheel repair failed with exit code $LASTEXITCODE"
             }
           }
-          
-          Write-Host "`n=== Wheel repair complete ==="
           
           # Move all wheels to dist directory
           New-Item -ItemType Directory -Force -Path dist
