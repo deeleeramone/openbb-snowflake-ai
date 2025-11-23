@@ -281,6 +281,7 @@ jobs:
         id: create_or_update_pr
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARTIFACTS_URL: ${{ env.RUN_URL }}
         run: |
           set -euo pipefail
           OWNER_REPO="${GITHUB_REPOSITORY}"
@@ -289,7 +290,11 @@ jobs:
           HEAD_BRANCH="build"
           BASE_BRANCH="develop"
           TITLE="🎡 Update Wheelhouse - Build #${RUN_ID}"
-          BODY="This PR updates the wheelhouse metadata for build run ${RUN_ID}.\n\nArtifacts and full wheels are in the 'build' branch (LFS-managed). Action run: ${ARTIFACTS_URL}"
+          BODY="This PR updates the wheelhouse with artifacts from build run ${RUN_ID}.
+
+          The wheelhouse files are now in the 'build' branch.
+          
+          Action run: ${ARTIFACTS_URL}"
 
           echo "Checking for an existing open PR from ${HEAD_BRANCH} to ${BASE_BRANCH}..."
           existing_pr=$(curl -s -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json" \
