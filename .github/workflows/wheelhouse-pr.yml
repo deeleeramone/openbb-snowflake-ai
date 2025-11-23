@@ -187,6 +187,10 @@ jobs:
           echo "Saving wheelhouse to temp location..."
           cp -r wheelhouse /tmp/wheelhouse-save
           
+          # Verify the files are actually there
+          echo "Contents of /tmp/wheelhouse-save:"
+          ls -la /tmp/wheelhouse-save/
+          
           # Clean up wheelhouse from working directory to avoid checkout conflicts
           rm -rf wheelhouse
           
@@ -196,36 +200,80 @@ jobs:
           echo "Switching to build branch..."
           git checkout -B build origin/develop
           
-          # Clean out any existing wheelhouse in the build branch
-          if [ -d "wheelhouse" ]; then
-            git rm -rf wheelhouse/ 2>/dev/null || true
+          # Save existing .gitkeep and .gitattributes if they exist
+          if [ -f "wheelhouse/.gitkeep" ]; then
+            cp wheelhouse/.gitkeep /tmp/.gitkeep-save
+          fi
+          if [ -f "wheelhouse/.gitattributes" ]; then
+            cp wheelhouse/.gitattributes /tmp/.gitattributes-save
           fi
           
-          # Restore our saved wheelhouse
+          # Clean out any existing wheelhouse in the build branch BUT keep git files
+          if [ -d "wheelhouse" ]; then
+            # Remove only wheel and archive files, keep .git* files
+            find wheelhouse -type f \( -name "*.whl" -o -name "*.tar.gz" -o -name "*.sha256" -o -name "CHECKSUMS.sha256" \) -exec git rm {} \; 2>/dev/null || true
+          else
+            mkdir -p wheelhouse
+          fi
+          
+          # Restore saved .gitkeep and .gitattributes if they existed
+          if [ -f "/tmp/.gitkeep-save" ]; then
+            cp /tmp/.gitkeep-save wheelhouse/.gitkeep
+          fi
+          if [ -f "/tmp/.gitattributes-save" ]; then
+            cp /tmp/.gitattributes-save wheelhouse/.gitattributes
+          fi
+          
+          # Copy new wheelhouse files (will overwrite if they exist)
           echo "Restoring wheelhouse files..."
-          cp -r /tmp/wheelhouse-save wheelhouse
+          cp -r /tmp/wheelhouse-save/* wheelhouse/
           
-          # List what we're about to add
-          echo "Files to be added:"
+          # Verify files are in wheelhouse
+          echo "Files in wheelhouse directory:"
           ls -la wheelhouse/
+          file wheelhouse/*.whl | head -5
           
-          echo "Force adding ALL wheelhouse files (including binaries)..."
-          # Add each file type explicitly
-          git add -f wheelhouse/*.whl 2>/dev/null || true
-          git add -f wheelhouse/*.tar.gz 2>/dev/null || true
-          git add -f wheelhouse/*.sha256 2>/dev/null || true
-          git add -f wheelhouse/CHECKSUMS.sha256 2>/dev/null || true
-
+          echo "Force adding ALL wheelhouse files..."
+          # Use git add with force for the entire directory
+          git add -f wheelhouse/
+          
           COMMIT_MSG="chore: update wheelhouse artifacts for run ${RUN_ID}"
           
-          # Check what's staged
+          # Check what's staged - this should show all the wheel files
           echo "Staged files:"
           git status --short
           
+          # Double check we have staged files
+          STAGED_COUNT=$(git diff --cached --name-only | wc -l)
+          echo "Number of staged files: $STAGED_COUNT"
+          
+          if [ "$STAGED_COUNT" -eq 0 ]; then
+            echo "ERROR: No files were staged! Something went wrong."
+            echo "Trying alternative approach..."
+            
+            # Alternative: manually add each file
+            for file in wheelhouse/*; do
+              if [ -f "$file" ]; then
+                echo "Adding $file"
+                git add -f "$file"
+              fi
+            done
+            
+            # Check again
+            STAGED_COUNT=$(git diff --cached --name-only | wc -l)
+            echo "After manual add, staged files: $STAGED_COUNT"
+          fi
+          
           if git diff --cached --quiet; then
-            echo "No changes to commit"
+            echo "ERROR: Still no changes to commit after trying to add files!"
+            exit 1
           else
+            echo "Committing $STAGED_COUNT files..."
             git commit -m "${COMMIT_MSG}"
+            
+            # Show what was committed
+            echo "Committed files:"
+            git show --stat
           fi
 
           echo "Force pushing to build branch..."
