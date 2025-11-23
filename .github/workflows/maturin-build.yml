@@ -15,6 +15,9 @@ jobs:
             target: x86_64
             interpreter: 3.10 3.11 3.12 3.13
           - os: linux
+            target: amd64
+            interpreter: 3.10 3.11 3.12 3.13
+          - os: linux
             target: aarch64
             interpreter: 3.10 3.11 3.12 3.13
           - os: linux
@@ -69,11 +72,32 @@ jobs:
 
       - name: Install dependencies (Windows)
         if: matrix.os == 'windows'
+        shell: pwsh
         run: |
-          vcpkg install openssl:x64-windows sqlcipher:x64-windows
-          echo "OPENSSL_DIR=C:/vcpkg/installed/x64-windows" >> $GITHUB_ENV
-          echo "SQLCIPHER_LIB_DIR=C:/vcpkg/installed/x64-windows/lib" >> $GITHUB_ENV
-          echo "SQLCIPHER_INCLUDE_DIR=C:/vcpkg/installed/x64-windows/include" >> $GITHUB_ENV
+          # Install vcpkg and build dependencies
+          git clone https://github.com/Microsoft/vcpkg.git C:\vcpkg
+          cd C:\vcpkg
+          .\bootstrap-vcpkg.bat
+          .\vcpkg integrate install
+          
+          # Install OpenSSL and SQLCipher
+          .\vcpkg install openssl:x64-windows-static sqlcipher[openssl]:x64-windows-static
+          
+          # Set environment variables
+          echo "OPENSSL_DIR=C:\vcpkg\installed\x64-windows-static" >> $env:GITHUB_ENV
+          echo "OPENSSL_LIB_DIR=C:\vcpkg\installed\x64-windows-static\lib" >> $env:GITHUB_ENV
+          echo "OPENSSL_INCLUDE_DIR=C:\vcpkg\installed\x64-windows-static\include" >> $env:GITHUB_ENV
+          echo "SQLCIPHER_LIB_DIR=C:\vcpkg\installed\x64-windows-static\lib" >> $env:GITHUB_ENV
+          echo "SQLCIPHER_INCLUDE_DIR=C:\vcpkg\installed\x64-windows-static\include" >> $env:GITHUB_ENV
+          echo "RUSTFLAGS=-L C:\vcpkg\installed\x64-windows-static\lib" >> $env:GITHUB_ENV
+          
+          # Verify the libraries exist
+          if (Test-Path "C:\vcpkg\installed\x64-windows-static\lib\sqlcipher.lib") {
+            Write-Host "SQLCipher library found"
+          } else {
+            Write-Host "SQLCipher library not found - checking for alternative names"
+            Get-ChildItem "C:\vcpkg\installed\x64-windows-static\lib" -Filter "*sql*"
+          }
 
       - run: pip install -U ruff typing_extensions
 
@@ -105,8 +129,8 @@ jobs:
             automake \
             libtool
           
-          # For x86_64, just use system libraries
-          if [ "${{ matrix.target }}" = "x86_64" ]; then
+          # For x86_64/amd64, just use system libraries
+          if [ "${{ matrix.target }}" = "x86_64" ] || [ "${{ matrix.target }}" = "amd64" ]; then
             # Install SQLCipher from source with system OpenSSL
             cd /tmp
             curl -fsSL https://github.com/sqlcipher/sqlcipher/archive/refs/tags/v4.6.1.tar.gz | tar xz
@@ -128,7 +152,7 @@ jobs:
             
             cd ${{ github.workspace }}
             
-            # Build wheels for x86_64
+            # Build wheels for x86_64/amd64
             for py in ${{ matrix.interpreter }}; do
               echo "Building for Python ${py}"
               OPENSSL_STATIC=1 maturin build --release --interpreter ${py}
@@ -266,7 +290,15 @@ jobs:
         if: matrix.os == 'windows'
         shell: pwsh
         run: |
-          # Dependencies already installed in earlier step
+          # Set environment variables for the build
+          $env:OPENSSL_DIR = "C:\vcpkg\installed\x64-windows-static"
+          $env:OPENSSL_LIB_DIR = "C:\vcpkg\installed\x64-windows-static\lib"
+          $env:OPENSSL_INCLUDE_DIR = "C:\vcpkg\installed\x64-windows-static\include"
+          $env:SQLCIPHER_LIB_DIR = "C:\vcpkg\installed\x64-windows-static\lib"
+          $env:SQLCIPHER_INCLUDE_DIR = "C:\vcpkg\installed\x64-windows-static\include"
+          $env:RUSTFLAGS = "-L C:\vcpkg\installed\x64-windows-static\lib"
+          $env:OPENSSL_STATIC = "1"
+          
           # Build wheels for each Python version
           switch ("${{ matrix.target }}") {
             "x86_64" {
