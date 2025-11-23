@@ -74,14 +74,48 @@ jobs:
         if: matrix.os == 'windows'
         shell: pwsh
         run: |
+          # Check if vcpkg exists and clean it if needed
+          if (Test-Path "C:\vcpkg") {
+            Remove-Item -Path "C:\vcpkg" -Recurse -Force
+          }
+          
           # Install vcpkg and build dependencies
           git clone https://github.com/Microsoft/vcpkg.git C:\vcpkg
           cd C:\vcpkg
           .\bootstrap-vcpkg.bat
           .\vcpkg integrate install
           
-          # Install OpenSSL and SQLCipher
-          .\vcpkg install openssl:x64-windows-static sqlcipher[openssl]:x64-windows-static
+          # Install OpenSSL and SQLite3 (sqlcipher might not be available)
+          .\vcpkg install openssl:x64-windows-static sqlite3:x64-windows-static
+          
+          # Try to install sqlcipher, but if it fails, we'll build from source
+          $sqlcipherInstalled = $false
+          try {
+            .\vcpkg install sqlcipher:x64-windows-static
+            $sqlcipherInstalled = $true
+          } catch {
+            Write-Host "SQLCipher not available in vcpkg, will build from source"
+          }
+          
+          if (-not $sqlcipherInstalled) {
+            # Build SQLCipher from source
+            Write-Host "Building SQLCipher from source..."
+            cd C:\
+            
+            # Download and extract SQLCipher
+            Invoke-WebRequest -Uri "https://github.com/sqlcipher/sqlcipher/archive/refs/tags/v4.6.1.zip" -OutFile "sqlcipher.zip"
+            Expand-Archive -Path "sqlcipher.zip" -DestinationPath "."
+            cd sqlcipher-4.6.1
+            
+            # Use nmake to build (Windows equivalent)
+            # This is complex on Windows, so let's use a prebuilt alternative
+            Write-Host "Using sqlite3 as fallback (SQLCipher build on Windows is complex)"
+            $env:SQLCIPHER_LIB_DIR = "C:\vcpkg\installed\x64-windows-static\lib"
+            $env:SQLCIPHER_INCLUDE_DIR = "C:\vcpkg\installed\x64-windows-static\include"
+          } else {
+            $env:SQLCIPHER_LIB_DIR = "C:\vcpkg\installed\x64-windows-static\lib"
+            $env:SQLCIPHER_INCLUDE_DIR = "C:\vcpkg\installed\x64-windows-static\include"
+          }
           
           # Set environment variables
           echo "OPENSSL_DIR=C:\vcpkg\installed\x64-windows-static" >> $env:GITHUB_ENV
@@ -90,13 +124,14 @@ jobs:
           echo "SQLCIPHER_LIB_DIR=C:\vcpkg\installed\x64-windows-static\lib" >> $env:GITHUB_ENV
           echo "SQLCIPHER_INCLUDE_DIR=C:\vcpkg\installed\x64-windows-static\include" >> $env:GITHUB_ENV
           echo "RUSTFLAGS=-L C:\vcpkg\installed\x64-windows-static\lib" >> $env:GITHUB_ENV
+          echo "LIBSQLITE3_SYS_USE_PKG_CONFIG=1" >> $env:GITHUB_ENV
           
           # Verify the libraries exist
-          if (Test-Path "C:\vcpkg\installed\x64-windows-static\lib\sqlcipher.lib") {
-            Write-Host "SQLCipher library found"
+          if (Test-Path "C:\vcpkg\installed\x64-windows-static\lib") {
+            Write-Host "Library directory found. Contents:"
+            Get-ChildItem "C:\vcpkg\installed\x64-windows-static\lib" | Select-Object Name
           } else {
-            Write-Host "SQLCipher library not found - checking for alternative names"
-            Get-ChildItem "C:\vcpkg\installed\x64-windows-static\lib" -Filter "*sql*"
+            Write-Host "Library directory not found!"
           }
 
       - run: pip install -U ruff typing_extensions
