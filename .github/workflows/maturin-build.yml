@@ -117,6 +117,8 @@ jobs:
           # Workaround for ring crate build failure on armv7
           CFLAGS_armv7_unknown_linux_gnueabihf: "-D__ARM_ARCH=7"
           CFLAGS_armv7_unknown_linux_musleabihf: "-D__ARM_ARCH=7"
+          # Force OpenSSL static linking for musl
+          OPENSSL_STATIC: "1"
         with:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
@@ -129,6 +131,14 @@ jobs:
             -e CFLAGS_aarch64_unknown_linux_musl
             -e CFLAGS_armv7_unknown_linux_gnueabihf
             -e CFLAGS_armv7_unknown_linux_musleabihf
+            -e OPENSSL_STATIC=1
+            -e OPENSSL_DIR=/usr
+            -e AARCH64_UNKNOWN_LINUX_MUSL_OPENSSL_DIR=/usr
+            -e AARCH64_UNKNOWN_LINUX_MUSL_OPENSSL_STATIC=1
+            -e ARMV7_UNKNOWN_LINUX_MUSLEABIHF_OPENSSL_DIR=/usr
+            -e ARMV7_UNKNOWN_LINUX_MUSLEABIHF_OPENSSL_STATIC=1
+            -e X86_64_UNKNOWN_LINUX_MUSL_OPENSSL_DIR=/usr
+            -e X86_64_UNKNOWN_LINUX_MUSL_OPENSSL_STATIC=1
           before-script-linux: |
             set -e
             set -x
@@ -157,31 +167,43 @@ jobs:
                 sqlcipher-dev \
                 linux-headers
               
-              # Set OpenSSL paths for musl
+              # For musl builds, OpenSSL is in /usr, not in architecture-specific dirs
               export OPENSSL_DIR=/usr
               export OPENSSL_STATIC=1
-              export OPENSSL_LIB_DIR=/usr/lib
-              export OPENSSL_INCLUDE_DIR=/usr/include
               
-              # Set target-specific environment variables for cross-compilation
+              # CRITICAL: Don't set lib/include dirs for musl - let pkg-config handle it
+              # The openssl-sys crate will use pkg-config or OPENSSL_DIR to find the right paths
+              
+              # Set target-specific environment variables
               case "${TARGET}" in
-                aarch64-unknown-linux-musl)
+                aarch64-unknown-linux-musl|aarch64)
                   export AARCH64_UNKNOWN_LINUX_MUSL_OPENSSL_DIR=/usr
                   export AARCH64_UNKNOWN_LINUX_MUSL_OPENSSL_STATIC=1
+                  # DO NOT set OPENSSL_LIB_DIR or OPENSSL_INCLUDE_DIR for musl!
                   ;;
-                armv7-unknown-linux-musleabihf)
+                armv7-unknown-linux-musleabihf|armv7)
                   export ARMV7_UNKNOWN_LINUX_MUSLEABIHF_OPENSSL_DIR=/usr
                   export ARMV7_UNKNOWN_LINUX_MUSLEABIHF_OPENSSL_STATIC=1
                   ;;
-                x86_64-unknown-linux-musl)
+                x86_64-unknown-linux-musl|x86_64)
                   export X86_64_UNKNOWN_LINUX_MUSL_OPENSSL_DIR=/usr
                   export X86_64_UNKNOWN_LINUX_MUSL_OPENSSL_STATIC=1
+                  ;;
+                *)
+                  # Default musl
+                  export OPENSSL_DIR=/usr
+                  export OPENSSL_STATIC=1
                   ;;
               esac
               
               # Set PKG_CONFIG for musl
               export PKG_CONFIG_PATH=/usr/lib/pkgconfig:${PKG_CONFIG_PATH:-}
               export PKG_CONFIG_ALLOW_CROSS=1
+              export PKG_CONFIG_SYSROOT_DIR=/
+              
+              # SQLCipher paths
+              export SQLCIPHER_LIB_DIR=/usr/lib
+              export SQLCIPHER_INCLUDE_DIR=/usr/include
               
             elif command -v yum > /dev/null; then
               # =================== CENTOS/RHEL (MANYLINUX) ===================
@@ -420,30 +442,39 @@ jobs:
             fi
             
             # Common environment setup for all Linux variants
-            export LD_LIBRARY_PATH="${OPENSSL_LIB_DIR}:${SQLCIPHER_LIB_DIR}:${LD_LIBRARY_PATH:-}"
-            export LIBRARY_PATH="${OPENSSL_LIB_DIR}:${SQLCIPHER_LIB_DIR}:${LIBRARY_PATH:-}"
-            export RUSTFLAGS="${RUSTFLAGS:-} -L${OPENSSL_LIB_DIR} -L${SQLCIPHER_LIB_DIR:-/usr/lib}"
+            export LD_LIBRARY_PATH="${OPENSSL_LIB_DIR:-/usr/lib}:${SQLCIPHER_LIB_DIR:-/usr/lib}:${LD_LIBRARY_PATH:-}"
+            export LIBRARY_PATH="${OPENSSL_LIB_DIR:-/usr/lib}:${SQLCIPHER_LIB_DIR:-/usr/lib}:${LIBRARY_PATH:-}"
+            export RUSTFLAGS="${RUSTFLAGS:-} -L${OPENSSL_LIB_DIR:-/usr/lib} -L${SQLCIPHER_LIB_DIR:-/usr/lib}"
             
             # Debug output to verify configuration
             echo "=================== BUILD CONFIGURATION ==================="
             echo "TARGET: ${TARGET}"
             echo "OPENSSL_DIR: ${OPENSSL_DIR}"
-            echo "OPENSSL_LIB_DIR: ${OPENSSL_LIB_DIR}"
-            echo "OPENSSL_INCLUDE_DIR: ${OPENSSL_INCLUDE_DIR}"
-            echo "SQLCIPHER_LIB_DIR: ${SQLCIPHER_LIB_DIR}"
+            echo "OPENSSL_LIB_DIR: ${OPENSSL_LIB_DIR:-not set (will use default)}"
+            echo "OPENSSL_INCLUDE_DIR: ${OPENSSL_INCLUDE_DIR:-not set (will use default)}"
+            echo "OPENSSL_STATIC: ${OPENSSL_STATIC:-not set}"
+            echo "SQLCIPHER_LIB_DIR: ${SQLCIPHER_LIB_DIR:-not set}"
             echo "PKG_CONFIG_PATH: ${PKG_CONFIG_PATH}"
             echo "RUSTFLAGS: ${RUSTFLAGS}"
+            
+            # Check for musl-specific variables
+            echo "AARCH64_UNKNOWN_LINUX_MUSL_OPENSSL_DIR: ${AARCH64_UNKNOWN_LINUX_MUSL_OPENSSL_DIR:-not set}"
+            echo "ARMV7_UNKNOWN_LINUX_MUSLEABIHF_OPENSSL_DIR: ${ARMV7_UNKNOWN_LINUX_MUSLEABIHF_OPENSSL_DIR:-not set}"
+            echo "X86_64_UNKNOWN_LINUX_MUSL_OPENSSL_DIR: ${X86_64_UNKNOWN_LINUX_MUSL_OPENSSL_DIR:-not set}"
             echo "==========================================================="
             
             # Verify OpenSSL installation
-            if [ -n "${OPENSSL_INCLUDE_DIR}" ] && [ -d "${OPENSSL_INCLUDE_DIR}" ]; then
-              echo "OpenSSL headers found:"
-              ls -la "${OPENSSL_INCLUDE_DIR}/openssl/" 2>/dev/null | head -5 || echo "No OpenSSL headers in ${OPENSSL_INCLUDE_DIR}"
-            fi
-            
-            if [ -n "${OPENSSL_LIB_DIR}" ] && [ -d "${OPENSSL_LIB_DIR}" ]; then
-              echo "OpenSSL libraries found:"
-              ls -la "${OPENSSL_LIB_DIR}"/*ssl* 2>/dev/null | head -5 || echo "No OpenSSL libraries in ${OPENSSL_LIB_DIR}"
+            if [ -n "${OPENSSL_DIR}" ]; then
+              echo "Checking OpenSSL in ${OPENSSL_DIR}:"
+              ls -la "${OPENSSL_DIR}/include/openssl/" 2>/dev/null | head -5 || echo "No OpenSSL headers in ${OPENSSL_DIR}/include"
+              ls -la "${OPENSSL_DIR}/lib/"*ssl* 2>/dev/null | head -5 || echo "No OpenSSL libraries in ${OPENSSL_DIR}/lib"
+              
+              # Check pkg-config
+              if command -v pkg-config > /dev/null; then
+                echo "pkg-config openssl info:"
+                pkg-config --cflags openssl || echo "pkg-config can't find openssl"
+                pkg-config --libs openssl || echo "pkg-config can't find openssl libs"
+              fi
             fi
             
             # Final check
