@@ -230,20 +230,15 @@ jobs:
           git config user.email "actions@github.com"
           git config user.name "github-actions[bot]"
 
-          echo "Fetching and checking out build branch..."
+          echo "Setting up remote..."
           git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           
-          # Try to fetch the build branch if it exists
-          if git fetch origin build:refs/remotes/origin/build 2>/dev/null; then
-            echo "Build branch exists, checking it out"
-            git checkout build
-            git reset --hard origin/main  # Start fresh from main
-          else
-            echo "Build branch doesn't exist, creating from main"
-            git fetch origin main --depth=1
-            git checkout -B build origin/main
-          fi
-
+          echo "Fetching latest main branch..."
+          git fetch origin main --depth=1
+          
+          echo "Creating fresh build branch from main..."
+          git checkout -B build origin/main
+          
           echo "Ensure wheelhouse directory exists..."
           if [ ! -d "wheelhouse" ]; then
             echo "ERROR: wheelhouse directory not present" >&2
@@ -278,8 +273,12 @@ jobs:
             git commit -m "${COMMIT_MSG}"
           fi
 
-          echo "Force pushing branch to origin (unconditional)"
-          git push --force origin build:refs/heads/build
+          echo "Force pushing branch to origin (deleting remote first to avoid conflicts)..."
+          # Delete the remote branch first if it exists (ignore errors if it doesn't)
+          git push origin --delete build 2>/dev/null || true
+          
+          # Now push the fresh branch
+          git push origin build:refs/heads/build
           echo "Successfully pushed wheelhouse files to build branch!"
 
       - name: Create or update Pull Request (build → develop)
