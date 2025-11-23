@@ -107,6 +107,54 @@ jobs:
           run-id: ${{ env.RUN_ID }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Ensure wheelhouse artifact present
+        run: |
+          set -euo pipefail
+          # If wheelhouse-temp already exists (download-artifact succeeded), we're good
+          if [ -d "wheelhouse-temp" ]; then
+            echo "Found wheelhouse-temp from artifacts."
+            exit 0
+          fi
+
+          # If wheelhouse.zip exists, try to extract it
+          if [ -f "wheelhouse.zip" ]; then
+            echo "wheelhouse.zip found — extracting..."
+            mkdir -p extracted
+            unzip -q wheelhouse.zip -d extracted || true
+            # Prefer a top-level 'wheelhouse' directory if present
+            if [ -d "extracted/wheelhouse" ]; then
+              mv extracted/wheelhouse wheelhouse-temp
+            else
+              mkdir -p wheelhouse-temp
+              mv extracted/* wheelhouse-temp || true
+            fi
+            rm -rf extracted
+          fi
+
+          # If wheelhouse.tar.gz exists, try to extract it
+          if [ -f "wheelhouse.tar.gz" ]; then
+            echo "wheelhouse.tar.gz found — extracting..."
+            mkdir -p extracted
+            tar -xzf wheelhouse.tar.gz -C extracted || true
+            if [ -d "extracted/wheelhouse" ]; then
+              mv extracted/wheelhouse wheelhouse-temp
+            else
+              mkdir -p wheelhouse-temp
+              mv extracted/* wheelhouse-temp || true
+            fi
+            rm -rf extracted
+          fi
+
+          # Final check
+          if [ -d "wheelhouse-temp" ]; then
+            echo "wheelhouse-temp prepared."
+            ls -la wheelhouse-temp | sed -n '1,200p'
+          else
+            echo "ERROR: wheelhouse artifact not found. Available files in workspace:" >&2
+            ls -la
+            exit 1
+          fi
+          
       - name: Prepare wheelhouse directory
         run: |
           # Remove old wheelhouse if it exists
@@ -207,9 +255,9 @@ jobs:
           git lfs track "*.zip" || true
           git add .gitattributes
 
-          echo "Copy wheelhouse into repo root (overwrite)"
-          rm -rf wheelhouse || true
-          mv wheelhouse wheelhouse || true
+          # wheelhouse is already in the repository workspace root (moved earlier)
+          echo "Using wheelhouse directory present in workspace for commit."
+          
 
           echo "Add files (LFS will handle large files)"
           git add -A wheelhouse
