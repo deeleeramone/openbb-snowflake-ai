@@ -205,51 +205,17 @@ jobs:
                 export SQLCIPHER_LIB_DIR="${SQLCIPHER_PREFIX}/lib"
                 export SQLCIPHER_INCLUDE_DIR="${SQLCIPHER_PREFIX}/include"
               fi
-              export PKG_CONFIG_PATH="${SQLCIPHER_LIB_DIR}/pkgconfig:${PKG_CONFIG_PATH}"
+              export PKG_CONFIG_PATH="${SQLCIPHER_LIB_DIR}/pkgconfig:${PKG_CONFIG_PATH:-}"
               export LD_LIBRARY_PATH="${SQLCIPHER_LIB_DIR}:${LD_LIBRARY_PATH}"
               export LIBRARY_PATH="${SQLCIPHER_LIB_DIR}:${LIBRARY_PATH}"
               export RUSTFLAGS="${RUSTFLAGS} -L${SQLCIPHER_LIB_DIR}"
             elif command -v apt-get > /dev/null; then
-              case "${TARGET}" in
-                aarch64|aarch64-unknown-linux-gnu)
-                  CROSS_ARCH=arm64
-                  CROSS_LIB_DIR=/usr/lib/aarch64-linux-gnu
-                  CROSS_INCLUDE_DIR=/usr/include/aarch64-linux-gnu
-                  ;;
-                armv7|armv7-unknown-linux-gnueabihf)
-                  CROSS_ARCH=armhf
-                  CROSS_LIB_DIR=/usr/lib/arm-linux-gnueabihf
-                  CROSS_INCLUDE_DIR=/usr/include/arm-linux-gnueabihf
-                  ;;
-                ppc64le|powerpc64le-unknown-linux-gnu)
-                  CROSS_ARCH=ppc64el
-                  CROSS_LIB_DIR=/usr/lib/powerpc64le-linux-gnu
-                  CROSS_INCLUDE_DIR=/usr/include/powerpc64le-linux-gnu
-                  ;;
-                s390x|s390x-unknown-linux-gnu)
-                  CROSS_ARCH=s390x
-                  CROSS_LIB_DIR=/usr/lib/s390x-linux-gnu
-                  CROSS_INCLUDE_DIR=/usr/include/s390x-linux-gnu
-                  ;;
-                *)
-                  CROSS_ARCH=""
-                  ;;
-              esac
-
-              if [ -n "${CROSS_ARCH}" ]; then
-                sudo dpkg --add-architecture "${CROSS_ARCH}" || true
-                if ! grep -q "\[arch=amd64\]" /etc/apt/sources.list; then
-                  sudo sed -i 's/^deb \(http[^ ]*\)/deb [arch=amd64] \1/' /etc/apt/sources.list
-                fi
-                printf '%s\n' \
-                  "deb [arch=${CROSS_ARCH}] http://ports.ubuntu.com/ubuntu-ports jammy main restricted universe multiverse" \
-                  "deb [arch=${CROSS_ARCH}] http://ports.ubuntu.com/ubuntu-ports jammy-updates main restricted universe multiverse" \
-                  "deb [arch=${CROSS_ARCH}] http://ports.ubuntu.com/ubuntu-ports jammy-security main restricted universe multiverse" \
-                  "deb [arch=${CROSS_ARCH}] http://ports.ubuntu.com/ubuntu-ports jammy-backports main restricted universe multiverse" \
-                  | sudo tee "/etc/apt/sources.list.d/${CROSS_ARCH}.list" >/dev/null
-              fi
+              export DEBIAN_FRONTEND=noninteractive
+              export TZ=Etc/UTC
+              sudo ln -fs "/usr/share/zoneinfo/${TZ}" /etc/localtime
+              echo "${TZ}" | sudo tee /etc/timezone >/dev/null
               sudo apt-get update
-              sudo apt-get install -y pkg-config build-essential dpkg-dev git tcl curl libsqlcipher-dev libssl-dev
+              sudo apt-get install -y tzdata pkg-config build-essential dpkg-dev git tcl curl libsqlcipher-dev libssl-dev
               if [ -n "${CROSS_ARCH}" ]; then
                 sudo apt-get install -y "libssl-dev:${CROSS_ARCH}" "libsqlcipher-dev:${CROSS_ARCH}"
                 export OPENSSL_LIB_DIR="${CROSS_LIB_DIR}"
@@ -276,7 +242,7 @@ jobs:
                 export SQLCIPHER_INCLUDE_DIR="/usr/include/${HOST_MULTIARCH}"
               fi
               if [ -d "${SQLCIPHER_LIB_DIR}/pkgconfig" ]; then
-                export PKG_CONFIG_PATH="${SQLCIPHER_LIB_DIR}/pkgconfig:${PKG_CONFIG_PATH}"
+                export PKG_CONFIG_PATH="${SQLCIPHER_LIB_DIR}/pkgconfig:${PKG_CONFIG_PATH:-}"
               fi
               export LD_LIBRARY_PATH="${SQLCIPHER_LIB_DIR}:${LD_LIBRARY_PATH}"
               export LIBRARY_PATH="${SQLCIPHER_LIB_DIR}:${LIBRARY_PATH}"
