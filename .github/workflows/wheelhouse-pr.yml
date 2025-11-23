@@ -278,25 +278,25 @@ jobs:
           fi
 
           COMMENT_BODY="$(cat <<'EOF'
-## 📦 Installation Instructions
+          ## 📦 Installation Instructions
 
-This PR includes the wheelhouse files in branch `build`. Large binaries are stored with Git LFS.
+          This PR includes the wheelhouse files in branch `build`. Large binaries are stored with Git LFS.
 
-To get the artifacts:
+          To get the artifacts:
 
-```bash
-# Clone and fetch LFS objects
-git clone --branch build https://github.com/${GITHUB_REPOSITORY}.git
-cd $(basename ${GITHUB_REPOSITORY})
-git lfs pull
-pip install wheelhouse/<appropriate-wheel-file>.whl
-```
+          ```bash
+          # Clone and fetch LFS objects
+          git clone --branch build https://github.com/${GITHUB_REPOSITORY}.git
+          cd $(basename ${GITHUB_REPOSITORY})
+          git lfs pull
+          pip install wheelhouse/<appropriate-wheel-file>.whl
+          ```
 
-Or download artifacts directly from the Actions run:
-${ARTIFACTS_URL}
-EOF
-)"
+          Or download artifacts directly from the Actions run:
+          ${ARTIFACTS_URL}
+          EOF
+          )"
 
-          curl -s -X POST -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json" \
-            -d "$(jq -n --arg body "$COMMENT_BODY" '{body:$body}')" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues/${PR_NUM}/comments"
+                    curl -s -X POST -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json" \
+                      -d "$(jq -n --arg body "$COMMENT_BODY" '{body:$body}')" \
+                      "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues/${PR_NUM}/comments"
