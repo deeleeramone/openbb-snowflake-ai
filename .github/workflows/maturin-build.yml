@@ -34,12 +34,6 @@ jobs:
             manylinux: auto
             target: x86_64
             interpreter: 3.10 3.11 3.12 3.13
-
-            # manylinux pypy and graalpy on major architectures
-          - os: linux
-            manylinux: auto
-            target: x86_64
-            interpreter: 3.10 3.11 3.12 3.13
           - os: linux
             manylinux: auto
             target: aarch64
