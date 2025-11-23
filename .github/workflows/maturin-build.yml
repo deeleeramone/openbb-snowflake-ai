@@ -115,11 +115,11 @@ jobs:
           before-script-linux: |
             # Install build tools and dependencies
             if command -v apk > /dev/null; then
-              apk add pkgconfig perl make gcc musl-dev git openssl-dev
+              apk add pkgconfig perl make gcc musl-dev git openssl-dev tcl
             elif command -v yum > /dev/null; then
-              yum install -y pkgconfig perl-core make gcc git openssl-devel
+              yum install -y pkgconfig perl-core make gcc git openssl-devel tcl
             elif command -v apt-get > /dev/null; then
-              apt-get update && apt-get install -y pkg-config build-essential git libssl-dev
+              apt-get update && apt-get install -y pkg-config build-essential git libssl-dev tcl
             fi
 
             # Force OpenSSL to be vendored (built from source) for the Rust crate
