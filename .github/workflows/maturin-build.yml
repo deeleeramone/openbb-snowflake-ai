@@ -120,6 +120,7 @@ jobs:
             -e CFLAGS_aarch64_unknown_linux_musl
             -e CFLAGS_armv7_unknown_linux_gnueabihf
             -e CFLAGS_armv7_unknown_linux_musleabihf
+            -e PKG_CONFIG_PATH=/usr/lib/pkgconfig:/usr/lib64/pkgconfig:/usr/share/pkgconfig:/usr/local/lib/pkgconfig:/usr/local/lib64/pkgconfig
           before-script-linux: |
             set -e
             set -x
@@ -148,13 +149,22 @@ jobs:
             # We rely on system packages for OpenSSL and SQLCipher.
             # Do NOT force vendored openssl here as it conflicts with system sqlcipher.
             
-            # Verify installation
+            # Verify installation and set environment variables if needed
             if pkg-config --exists sqlcipher; then
                 echo "sqlcipher found via pkg-config"
             elif pkg-config --exists libsqlcipher; then
                  echo "libsqlcipher found via pkg-config"
             else
                  echo "WARNING: sqlcipher not found via pkg-config."
+            fi
+            
+            # Explicitly set OPENSSL_DIR if pkg-config fails to find it, 
+            # though PKG_CONFIG_PATH should handle it.
+            if ! pkg-config --exists openssl; then
+                echo "openssl not found via pkg-config, setting OPENSSL_DIR=/usr"
+                export OPENSSL_DIR=/usr
+                export OPENSSL_LIB_DIR=/usr/lib
+                export OPENSSL_INCLUDE_DIR=/usr/include
             fi
 
       - run: ${{ (matrix.os == 'windows' && 'dir') || 'ls -lh' }} dist/
