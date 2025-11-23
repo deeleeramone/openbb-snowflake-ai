@@ -230,9 +230,19 @@ jobs:
           git config user.email "actions@github.com"
           git config user.name "github-actions[bot]"
 
-          echo "Preparing branch 'build' from origin/main..."
-          git fetch origin main --depth=1
-          git checkout -B build origin/main
+          echo "Fetching and checking out build branch..."
+          git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          
+          # Try to fetch the build branch if it exists
+          if git fetch origin build:refs/remotes/origin/build 2>/dev/null; then
+            echo "Build branch exists, checking it out"
+            git checkout build
+            git reset --hard origin/main  # Start fresh from main
+          else
+            echo "Build branch doesn't exist, creating from main"
+            git fetch origin main --depth=1
+            git checkout -B build origin/main
+          fi
 
           echo "Ensure wheelhouse directory exists..."
           if [ ! -d "wheelhouse" ]; then
@@ -268,16 +278,10 @@ jobs:
             git commit -m "${COMMIT_MSG}"
           fi
 
-          echo "Push branch to origin (try safe --force-with-lease first)"
-          git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          echo "Force pushing branch to origin (unconditional)"
+          git push --force origin build:refs/heads/build
+          echo "Successfully pushed wheelhouse files to build branch!"
 
-          if git push --force-with-lease origin build:refs/heads/build; then
-            echo "Pushed with --force-with-lease"
-          else
-            echo "Warning: --force-with-lease failed (stale remote). Falling back to --force push."
-            git fetch origin build || true
-            git push --force origin build:refs/heads/build
-          fi
       - name: Create or update Pull Request (build → develop)
         id: create_or_update_pr
         env:
@@ -317,63 +321,36 @@ jobs:
           fi
 
       - name: Add PR comment with instructions
-        if: ${{ env.PR_CREATED || env.PR_UPDATED || always() }}
+        if: ${{ env.PR_CREATED || env.PR_UPDATED }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARTIFACTS_URL: ${{ env.RUN_URL }}
         run: |
           set -euo pipefail
-          # prefer PR number from env (created or updated)
+          # Use the PR number from previous step
           PR_NUM="${PR_CREATED:-${PR_UPDATED:-}}"
-
+          
           if [ -z "$PR_NUM" ]; then
-            # fetch PR number robustly (use Python to handle array/object responses)
-            resp=$(curl -s -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${GITHUB_REPOSITORY}/pulls?head=${GITHUB_REPOSITORY%/*}:build&base=develop&state=open")
-            PR_NUM=$(python - <<'PY'
-            import sys, json
-            try:
-                d = json.load(sys.stdin)
-            except Exception:
-                print("")
-                sys.exit(0)
-            if isinstance(d, list):
-                print(d[0].get("number","") if d else "")
-            elif isinstance(d, dict):
-                # API may return single object or paginated structure
-                if "number" in d:
-                    print(d.get("number",""))
-                elif "items" in d and isinstance(d["items"], list) and d["items"]:
-                    print(d["items"][0].get("number",""))
-                else:
-                    print("")
-            else:
-                print("")
-            PY
-            <<<"$resp")
-                      fi
+            echo "No PR number available to comment on."
+            exit 0
+          fi
 
-                      if [ -z "$PR_NUM" ]; then
-                        echo "No PR found to comment on." >&2
-                        exit 0
-                      fi
+          COMMENT_BODY="## 📦 Installation Instructions
 
-          COMMENT_BODY="$(cat <<'EOF'
-          ## 📦 Installation Instructions
-
-          This PR includes the wheelhouse files in branch `build`. Large binaries are stored with Git LFS.
+          This PR includes the wheelhouse files in branch \`build\`. Large binaries are stored with Git LFS.
 
           To get the artifacts:
 
-          ```bash
+          \`\`\`bash
           # Clone and fetch LFS objects
           git clone --branch build https://github.com/${GITHUB_REPOSITORY}.git
           cd $(basename ${GITHUB_REPOSITORY})
           git lfs pull
           pip install wheelhouse/<appropriate-wheel-file>.whl
-          ```
+          \`\`\`
 
           Or download artifacts directly from the Actions run:
-          ${ARTIFACTS_URL}
-          EOF
-          )"
+          ${ARTIFACTS_URL}"
 
           curl -s -X POST -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json" \
             -d "$(jq -n --arg body "$COMMENT_BODY" '{body:$body}')" \
