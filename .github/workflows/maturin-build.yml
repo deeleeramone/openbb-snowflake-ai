@@ -117,8 +117,6 @@ jobs:
           # Workaround for ring crate build failure on armv7
           CFLAGS_armv7_unknown_linux_gnueabihf: "-D__ARM_ARCH=7"
           CFLAGS_armv7_unknown_linux_musleabihf: "-D__ARM_ARCH=7"
-          # Force OpenSSL static linking for musl
-          OPENSSL_STATIC: "1"
         with:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
@@ -351,45 +349,68 @@ jobs:
                   gcc-c++ \
                   make \
                   perl-core \
-                  openssl-devel \
-                  openssl-static \
                   pkgconfig \
                   curl \
-                  tcl
+                  tcl \
+                  autoconf \
+                  automake \
+                  libtool
                 
-                # Set OpenSSL paths
-                export OPENSSL_DIR=/usr
+                # Build OpenSSL 1.1.1 from source to avoid version conflicts
+                echo "Building OpenSSL 1.1.1 from source"
+                OPENSSL_VERSION=1.1.1w
+                OPENSSL_PREFIX=/opt/openssl
+                OPENSSL_BUILD_DIR=$(mktemp -d)
+                
+                curl -fsSL "https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz" | tar -xz -C "${OPENSSL_BUILD_DIR}"
+                cd "${OPENSSL_BUILD_DIR}/openssl-${OPENSSL_VERSION}"
+                
+                ./config \
+                  --prefix="${OPENSSL_PREFIX}" \
+                  --openssldir="${OPENSSL_PREFIX}/ssl" \
+                  no-shared \
+                  -fPIC
+                
+                make -j"$(nproc)"
+                make install_sw
+                cd "${ORIGINAL_DIR}"
+                rm -rf "${OPENSSL_BUILD_DIR}"
+                
+                # Set OpenSSL environment to use our custom build
+                export OPENSSL_DIR="${OPENSSL_PREFIX}"
                 export OPENSSL_STATIC=1
-                if [ -d /usr/lib64 ]; then
-                  export OPENSSL_LIB_DIR=/usr/lib64
-                else
-                  export OPENSSL_LIB_DIR=/usr/lib
-                fi
-                export OPENSSL_INCLUDE_DIR=/usr/include
+                export OPENSSL_LIB_DIR="${OPENSSL_PREFIX}/lib"
+                export OPENSSL_INCLUDE_DIR="${OPENSSL_PREFIX}/include"
                 
                 # Set target-specific vars
                 case "${TARGET}" in
                   x86_64-unknown-linux-gnu|x86_64)
-                    export X86_64_UNKNOWN_LINUX_GNU_OPENSSL_DIR=/usr
+                    export X86_64_UNKNOWN_LINUX_GNU_OPENSSL_DIR="${OPENSSL_PREFIX}"
+                    export X86_64_UNKNOWN_LINUX_GNU_OPENSSL_STATIC=1
                     ;;
                   i686-unknown-linux-gnu|i686)
-                    export I686_UNKNOWN_LINUX_GNU_OPENSSL_DIR=/usr
+                    export I686_UNKNOWN_LINUX_GNU_OPENSSL_DIR="${OPENSSL_PREFIX}"
+                    export I686_UNKNOWN_LINUX_GNU_OPENSSL_STATIC=1
                     ;;
                   aarch64-unknown-linux-gnu|aarch64)
-                    export AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_DIR=/usr
+                    export AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_DIR="${OPENSSL_PREFIX}"
+                    export AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_STATIC=1
                     ;;
                   armv7-unknown-linux-gnueabihf|armv7)
-                    export ARMV7_UNKNOWN_LINUX_GNUEABIHF_OPENSSL_DIR=/usr
+                    export ARMV7_UNKNOWN_LINUX_GNUEABIHF_OPENSSL_DIR="${OPENSSL_PREFIX}"
+                    export ARMV7_UNKNOWN_LINUX_GNUEABIHF_OPENSSL_STATIC=1
                     ;;
                   ppc64le|powerpc64le-unknown-linux-gnu)
-                    export POWERPC64LE_UNKNOWN_LINUX_GNU_OPENSSL_DIR=/usr
+                    export POWERPC64LE_UNKNOWN_LINUX_GNU_OPENSSL_DIR="${OPENSSL_PREFIX}"
+                    export POWERPC64LE_UNKNOWN_LINUX_GNU_OPENSSL_STATIC=1
                     ;;
                   s390x|s390x-unknown-linux-gnu)
-                    export S390X_UNKNOWN_LINUX_GNU_OPENSSL_DIR=/usr
+                    export S390X_UNKNOWN_LINUX_GNU_OPENSSL_DIR="${OPENSSL_PREFIX}"
+                    export S390X_UNKNOWN_LINUX_GNU_OPENSSL_STATIC=1
                     ;;
                 esac
                 
-                # Build SQLCipher
+                # Build SQLCipher using our OpenSSL
                 echo "Building SQLCipher"
                 SQLCIPHER_VERSION=4.5.6
                 SQLCIPHER_PREFIX=/opt/sqlcipher
@@ -398,8 +419,8 @@ jobs:
                 curl -fsSL "https://github.com/sqlcipher/sqlcipher/archive/refs/tags/v${SQLCIPHER_VERSION}.tar.gz" | tar -xz -C "${SQLCIPHER_BUILD_DIR}"
                 cd "${SQLCIPHER_BUILD_DIR}/sqlcipher-${SQLCIPHER_VERSION}"
                 
-                CFLAGS="-I${OPENSSL_INCLUDE_DIR}" \
-                LDFLAGS="-L${OPENSSL_LIB_DIR}" \
+                CFLAGS="-I${OPENSSL_PREFIX}/include" \
+                LDFLAGS="-L${OPENSSL_PREFIX}/lib" \
                 ./configure \
                   --prefix="${SQLCIPHER_PREFIX}" \
                   --enable-tempstore=yes \
@@ -410,12 +431,12 @@ jobs:
                 
                 make -j"$(nproc)"
                 make install
-                cd "${ORIGINAL_DIR}"  # Return to original directory
+                cd "${ORIGINAL_DIR}"
                 rm -rf "${SQLCIPHER_BUILD_DIR}"
                 
                 export SQLCIPHER_LIB_DIR="${SQLCIPHER_PREFIX}/lib"
                 export SQLCIPHER_INCLUDE_DIR="${SQLCIPHER_PREFIX}/include"
-                export PKG_CONFIG_PATH="${SQLCIPHER_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+                export PKG_CONFIG_PATH="${OPENSSL_PREFIX}/lib/pkgconfig:${SQLCIPHER_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
                 ;;
                 
               debian|*)
@@ -499,6 +520,9 @@ jobs:
             export LIBRARY_PATH="${OPENSSL_LIB_DIR:-/usr/lib}:${SQLCIPHER_LIB_DIR:-/usr/lib}:${LIBRARY_PATH:-}"
             export RUSTFLAGS="${RUSTFLAGS:-} -L${OPENSSL_LIB_DIR:-/usr/lib} -L${SQLCIPHER_LIB_DIR:-/usr/lib}"
             export PKG_CONFIG_ALLOW_CROSS=1
+            
+            # For all Linux builds, ensure static linking of OpenSSL
+            export OPENSSL_STATIC=1
             
             # Final debug output
             echo "=================== FINAL CONFIGURATION ==================="
