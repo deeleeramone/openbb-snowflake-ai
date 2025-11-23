@@ -163,11 +163,14 @@ jobs:
           # Move the new wheelhouse into place
           mv wheelhouse-temp wheelhouse
           
-          # Remove ALL non-wheel and non-sha256 files (like broken requirements files)
-          find wheelhouse -type f ! \( -name "*.whl" -o -name "*.sha256" -o -name "*.tar.gz" -o -name "CHECKSUMS.sha256" \) -delete
+          # Clean up any junk files - keep only wheels, tar.gz, and checksums
+          find wheelhouse -type f ! \( -name "*.whl" -o -name "*.tar.gz" -o -name "*.sha256" -o -name "CHECKSUMS.sha256" \) -delete 2>/dev/null || true
           
-          # Remove any files >100MB to avoid GitHub push limits
-          find wheelhouse -type f -size +100M -delete
+          # Remove files over 100MB (GitHub's limit)
+          find wheelhouse -type f -size +100M -exec rm {} \;
+          
+          echo "Wheelhouse contents:"
+          ls -lah wheelhouse/
 
       - name: Commit wheelhouse into repo branch
         env:
@@ -175,42 +178,47 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "Configuring git user..."
+          echo "Configuring git..."
           git config user.email "actions@github.com"
           git config user.name "github-actions[bot]"
-
-          echo "Setting up remote..."
           git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           
-          echo "Fetching all branches..."
+          # Save wheelhouse contents to temp location before switching branches
+          echo "Saving wheelhouse to temp location..."
+          cp -r wheelhouse /tmp/wheelhouse-save
+          
+          # Clean up wheelhouse from working directory to avoid checkout conflicts
+          rm -rf wheelhouse
+          
+          echo "Fetching branches..."
           git fetch origin
           
-          echo "Creating fresh build branch from develop..."
+          echo "Switching to build branch..."
           git checkout -B build origin/develop
-          e
-          # Remove any existing wheelhouse to avoid conflicts
-          git rm -rf wheelhouse/ 2>/dev/null || true
           
-          echo "Ensure wheelhouse directory exists..."
-          if [ ! -d "wheelhouse" ]; then
-            echo "ERROR: wheelhouse directory not present" >&2
-            ls -la
-            exit 1
+          # Clean out any existing wheelhouse in the build branch
+          if [ -d "wheelhouse" ]; then
+            git rm -rf wheelhouse/ 2>/dev/null || true
           fi
-
-          echo "Add wheelhouse files"
+          
+          # Restore our saved wheelhouse
+          echo "Restoring wheelhouse files..."
+          cp -r /tmp/wheelhouse-save wheelhouse
+          
+          echo "Adding wheelhouse files..."
           git add wheelhouse/
 
           COMMIT_MSG="chore: update wheelhouse artifacts for run ${RUN_ID}"
+          
           if git diff --cached --quiet; then
-            echo "No changes to commit (wheelhouse unchanged)"
+            echo "No changes to commit"
           else
             git commit -m "${COMMIT_MSG}"
           fi
 
-          echo "Force pushing branch to origin..."
+          echo "Force pushing to build branch..."
           git push --force origin build
-          echo "Successfully pushed wheelhouse files to build branch!"
+          echo "Successfully pushed wheelhouse files!"
 
       - name: Create or update Pull Request (build → develop)
         id: create_or_update_pr
@@ -274,3 +282,38 @@ jobs:
 
           This PR includes the wheelhouse files built by Maturin.
           Wheels include Python versions '>=3.10,<3.14' for Linux, macOS, and Windows.
+
+          <details>
+          <summary>View wheelhouse contents</summary>
+
+          \`\`\`plaintext
+          $(ls -1 wheelhouse/ | head -n 50 | tr '\n' '\n')
+          \`\`\`
+
+          </details>
+
+          The full wheelhouse is available in the 'wheelhouse' directory.
+
+          <details>
+          <summary>Release archives</summary>
+
+          The following release archives are available for each version:
+
+          - \`*.whl\`: Built wheels
+          - \`*.tar.gz\`: Source archives
+          - \`CHECKSUMS.sha256\`: Checksums for all files
+
+          </details>
+
+          <br>
+
+          ⚠️ **Note**: If this PR is not merged within 30 days, the artifacts will be deleted.
+
+          <!--
+          The artifacts from the CI run are available here: $ARTIFACTS_URL
+          -->"
+
+          echo "Posting comment on PR #$PR_NUM..."
+          curl -s -X POST -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" -H "Accept: application/vnd.github+json" \
+            -d "{\"body\":\"$COMMENT_BODY\"}" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues/${PR_NUM}/comments"
