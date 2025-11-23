@@ -107,9 +107,21 @@ jobs:
           # Workaround for ring crate build failure on armv7
           CFLAGS_armv7_unknown_linux_gnueabihf: "-D__ARM_ARCH=7"
           CFLAGS_armv7_unknown_linux_musleabihf: "-D__ARM_ARCH=7"
-          # Force OpenSSL to vendor/build from source - THIS ACTUALLY WORKS
+          # FORCE OPENSSL TO VENDOR - THESE MUST BE HERE!!!
           OPENSSL_STATIC: "1"
-          OPENSSL_SRC_PERL: "/usr/bin/perl"
+          OPENSSL_DIR: "/usr"
+          OPENSSL_LIB_DIR: "/usr/lib"
+          OPENSSL_INCLUDE_DIR: "/usr/include"
+          # Set for ALL targets
+          X86_64_UNKNOWN_LINUX_GNU_OPENSSL_DIR: "/usr"
+          X86_64_UNKNOWN_LINUX_MUSL_OPENSSL_DIR: "/usr"
+          AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_DIR: "/usr"
+          AARCH64_UNKNOWN_LINUX_MUSL_OPENSSL_DIR: "/usr"
+          ARMV7_UNKNOWN_LINUX_GNUEABIHF_OPENSSL_DIR: "/usr"
+          ARMV7_UNKNOWN_LINUX_MUSLEABIHF_OPENSSL_DIR: "/usr"
+          S390X_UNKNOWN_LINUX_GNU_OPENSSL_DIR: "/usr"
+          PPC64LE_UNKNOWN_LINUX_GNU_OPENSSL_DIR: "/usr"
+          I686_UNKNOWN_LINUX_GNU_OPENSSL_DIR: "/usr"
         with:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
@@ -122,39 +134,34 @@ jobs:
             -e CFLAGS_aarch64_unknown_linux_musl
             -e CFLAGS_armv7_unknown_linux_gnueabihf
             -e CFLAGS_armv7_unknown_linux_musleabihf
-            -e OPENSSL_STATIC=1
-            -e OPENSSL_SRC_PERL=/usr/bin/perl
           before-script-linux: |
             set -e
             set -x
             
-            # Install build tools using system package managers
+            # Install OpenSSL and build tools
             if command -v apk > /dev/null; then
               # Alpine (musl)
               echo "http://dl-cdn.alpinelinux.org/alpine/edge/community" >> /etc/apk/repositories
               echo "http://dl-cdn.alpinelinux.org/alpine/edge/main" >> /etc/apk/repositories
               apk update
-              apk add pkgconfig perl make gcc musl-dev git tcl sqlcipher-dev
+              apk add pkgconfig perl make gcc musl-dev git tcl sqlcipher-dev openssl-dev openssl-libs-static
             elif command -v yum > /dev/null; then
               # CentOS/RHEL (manylinux2014)
               yum install -y epel-release || true
-              yum install -y pkgconfig perl-core make gcc git tcl || true
+              yum install -y pkgconfig perl-core make gcc git tcl openssl-devel openssl-static || true
               # Try to install sqlcipher-devel but don't fail if it's not available
               yum install -y sqlcipher-devel || echo "sqlcipher-devel not found in yum"
             elif command -v apt-get > /dev/null; then
               # Debian/Ubuntu
               apt-get update
-              apt-get install -y pkg-config build-essential git tcl libsqlcipher-dev
+              apt-get install -y pkg-config build-essential git tcl libsqlcipher-dev libssl-dev
             fi
             
-            # Verify sqlcipher installation
-            if pkg-config --exists sqlcipher; then
-                echo "sqlcipher found via pkg-config"
-            elif pkg-config --exists libsqlcipher; then
-                 echo "libsqlcipher found via pkg-config"
-            else
-                 echo "WARNING: sqlcipher not found via pkg-config."
-            fi
+            # Verify installations
+            echo "OpenSSL headers:"
+            ls -la /usr/include/openssl/ || echo "Not found"
+            echo "OpenSSL libraries:"
+            ls -la /usr/lib/*ssl* /usr/lib64/*ssl* 2>/dev/null || echo "Not found"
 
       - run: ${{ (matrix.os == 'windows' && 'dir') || 'ls -lh' }} dist/
 
