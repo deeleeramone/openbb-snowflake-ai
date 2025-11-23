@@ -370,24 +370,7 @@ jobs:
             sdist_flag=""
           done
           
-          # Restore static libraries
-          find "$OPENSSL_PREFIX/lib" -name "*.a.bak" | while read -r backup; do
-            original="${backup%.bak}"
-            sudo mv "$backup" "$original"
-            echo "Restored $original"
-          done
-          find "$SQLCIPHER_PREFIX/lib" -name "*.a.bak" 2>/dev/null | while read -r backup; do
-            original="${backup%.bak}"
-            sudo mv "$backup" "$original"
-            echo "Restored $original"
-          done
-          if [ -d "/usr/local/lib" ]; then
-            find /usr/local/lib -name "*.a.bak" 2>/dev/null | while read -r backup; do
-              original="${backup%.bak}"
-              sudo mv "$backup" "$original" 2>/dev/null || true
-              echo "Restored system $original"
-            done
-          fi
+          # DO NOT RESTORE STATIC LIBRARIES YET - we need them hidden for delocate to work
           
           # Verify dynamic linking before delocating
           echo "Checking for dynamic dependencies in built wheels..."
@@ -416,6 +399,25 @@ jobs:
           
           # Move delocated wheels back to target/wheels for consistency
           find "${BUNDLE_DIR}" -name "*.whl" -exec mv {} target/wheels/ \;
+          
+          # NOW restore static libraries after delocate is done
+          find "$OPENSSL_PREFIX/lib" -name "*.a.bak" | while read -r backup; do
+            original="${backup%.bak}"
+            sudo mv "$backup" "$original"
+            echo "Restored $original"
+          done
+          find "$SQLCIPHER_PREFIX/lib" -name "*.a.bak" 2>/dev/null | while read -r backup; do
+            original="${backup%.bak}"
+            sudo mv "$backup" "$original"
+            echo "Restored $original"
+          done
+          if [ -d "/usr/local/lib" ]; then
+            find /usr/local/lib -name "*.a.bak" 2>/dev/null | while read -r backup; do
+              original="${backup%.bak}"
+              sudo mv "$backup" "$original" 2>/dev/null || true
+              echo "Restored system $original"
+            done
+          fi
           
           # Move all wheels to dist directory
           mkdir -p dist
