@@ -152,10 +152,10 @@ jobs:
                 ./Configure linux-x86_64 --prefix="${PREFIX}" no-shared -fPIC
                 ;;
               aarch64)
-                ./Configure linux-aarch64 --prefix="${PREFIX}" no-shared -fPIC --cross-compile-prefix=aarch64-linux-gnu-
+                CC=aarch64-linux-gnu-gcc ./Configure linux-aarch64 --prefix="${PREFIX}" no-shared -fPIC
                 ;;
               armv7)
-                ./Configure linux-armv4 --prefix="${PREFIX}" no-shared -fPIC --cross-compile-prefix=arm-linux-gnueabihf-
+                CC=arm-linux-gnueabihf-gcc ./Configure linux-armv4 --prefix="${PREFIX}" no-shared -fPIC
                 ;;
             esac
             
