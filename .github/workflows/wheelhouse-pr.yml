@@ -48,6 +48,12 @@ jobs:
           # Move the new wheelhouse into place
           mv wheelhouse-temp wheelhouse
           
+          # Remove large binaries to avoid exceeding GitHub push limits
+          # Delete any wheel/tar/zip files >100MB (GitHub limit)
+          find wheelhouse -type f \( -name '*.whl' -o -name '*.tar.gz' -o -name '*.zip' \) -size +100M -print -delete || true
+          # Also remove top-level archives if present
+          rm -f wheelhouse.tar.gz wheelhouse.zip || true
+          
           # Create a README for the wheelhouse
           cat > wheelhouse/README.md << 'EOF'
           # Wheelhouse
@@ -94,7 +100,7 @@ jobs:
           *.tar.gz binary
           *.zip binary
           EOF
-      
+
       - name: Create Pull Request
         id: create-pr
         uses: peter-evans/create-pull-request@v5
@@ -148,6 +154,13 @@ jobs:
             wheelhouse
             automated
             build
+          # Only add these smaller metadata files to the commit (no binary wheels or archives)
+          add-paths: |
+            wheelhouse/README.md
+            wheelhouse/CHECKSUMS.sha256
+            wheelhouse/*.sha256
+            wheelhouse/*.txt
+            wheelhouse/.gitattributes
       
       - name: Add PR comment with instructions
         if: ${{ steps.create-pr.outputs.pull-request-number }}
