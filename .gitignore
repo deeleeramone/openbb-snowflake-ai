@@ -10,6 +10,7 @@ __pycache__/
 # Distribution / packaging
 .Python
 *.DS_Store/
+wheelhouse/
 build/
 develop-eggs/
 dist/

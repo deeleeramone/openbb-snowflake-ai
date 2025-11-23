@@ -5,6 +5,11 @@ on:
     workflows: ["Build wheels"]
     types:
       - completed
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: '(optional) Build wheels workflow run id to download artifacts from'
+        required: false
 
 permissions:
   contents: write
@@ -14,7 +19,8 @@ permissions:
 jobs:
   create-wheelhouse-pr:
     name: Create PR with wheelhouse
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    # Allow this job to run when triggered by a successful workflow_run OR when manually dispatched
+    if: ${{ (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success') || (github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
     
     steps:
@@ -22,23 +28,133 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           ref: main
-      
+
+      - name: Determine build run id
+        id: determine_run
+        run: |
+          # If triggered by workflow_run, use that id
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_run" ]; then
+            echo "RUN_ID=${{ github.event.workflow_run.id }}" >> $GITHUB_ENV
+            echo "Determined RUN_ID from workflow_run: ${{ github.event.workflow_run.id }}"
+            exit 0
+          fi
+
+          # If manual trigger and explicit input run_id provided, use it
+          # (workflow_dispatch inputs can be referenced as github.event.inputs)
+          MANUAL_RUN_ID="${{ github.event.inputs.run_id || '' }}"
+          if [ -n "$MANUAL_RUN_ID" ]; then
+            echo "RUN_ID=$MANUAL_RUN_ID" >> $GITHUB_ENV
+            echo "Determined RUN_ID from workflow_dispatch input: $MANUAL_RUN_ID"
+            exit 0
+          fi
+
+          # Otherwise query the Actions API for the latest successful Build wheels run
+          OWNER_REPO="${GITHUB_REPOSITORY}"
+          OWNER="$(echo "$OWNER_REPO" | cut -d'/' -f1)"
+          REPO="$(echo "$OWNER_REPO" | cut -d'/' -f2)"
+          WORKFLOW_FILE="maturin-build.yml"
+
+          echo "Querying GitHub API for latest successful run of $WORKFLOW_FILE..."
+          resp=$(curl -s -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${OWNER}/${REPO}/actions/workflows/${WORKFLOW_FILE}/runs?status=completed&conclusion=success&per_page=1")
+
+          # Parse run id (requires jq)
+          if command -v jq > /dev/null; then
+            run_id=$(echo "$resp" | jq -r '.workflow_runs[0].id // empty')
+          else
+            # Fallback to python parsing if jq not available
+            run_id=$(python - <<'PY'
+            import sys, json
+            data = json.load(sys.stdin)
+            runs = data.get("workflow_runs") or []
+            print(runs[0].get("id") if runs else "")
+            PY
+            <<<"$resp")
+          fi
+
+          if [ -z "$run_id" ]; then
+            echo "ERROR: Could not find a successful Build wheels run. Provide run_id as workflow_dispatch input or ensure Build wheels ran successfully." >&2
+            exit 1
+          fi
+
+          echo "RUN_ID=$run_id" >> $GITHUB_ENV
+          echo "Determined RUN_ID from API: $run_id"
+
+      - name: Set run URL
+        run: |
+          # If triggered by workflow_run we can use the provided html_url, otherwise construct a run URL from RUN_ID
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_run" ]; then
+            echo "RUN_URL=${{ github.event.workflow_run.html_url }}" >> $GITHUB_ENV
+            echo "Determined RUN_URL from workflow_event: ${{ github.event.workflow_run.html_url }}"
+          else
+            echo "RUN_URL=https://github.com/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}" >> $GITHUB_ENV
+            echo "Constructed RUN_URL: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}"
+          fi
+
       - name: Download wheelhouse artifacts
         uses: actions/download-artifact@v4
         with:
           name: wheelhouse
           path: wheelhouse-temp
-          run-id: ${{ github.event.workflow_run.id }}
+          run-id: ${{ env.RUN_ID }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
-      
+
       - name: Download release archives
         uses: actions/download-artifact@v4
         with:
           name: release-archives
           path: .
-          run-id: ${{ github.event.workflow_run.id }}
+          run-id: ${{ env.RUN_ID }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
-      
+
+      - name: Ensure wheelhouse artifact present
+        run: |
+          set -euo pipefail
+          # If wheelhouse-temp already exists (download-artifact succeeded), we're good
+          if [ -d "wheelhouse-temp" ]; then
+            echo "Found wheelhouse-temp from artifacts."
+            exit 0
+          fi
+
+          # If wheelhouse.zip exists, try to extract it
+          if [ -f "wheelhouse.zip" ]; then
+            echo "wheelhouse.zip found — extracting..."
+            mkdir -p extracted
+            unzip -q wheelhouse.zip -d extracted || true
+            # Prefer a top-level 'wheelhouse' directory if present
+            if [ -d "extracted/wheelhouse" ]; then
+              mv extracted/wheelhouse wheelhouse-temp
+            else
+              mkdir -p wheelhouse-temp
+              mv extracted/* wheelhouse-temp || true
+            fi
+            rm -rf extracted
+          fi
+
+          # If wheelhouse.tar.gz exists, try to extract it
+          if [ -f "wheelhouse.tar.gz" ]; then
+            echo "wheelhouse.tar.gz found — extracting..."
+            mkdir -p extracted
+            tar -xzf wheelhouse.tar.gz -C extracted || true
+            if [ -d "extracted/wheelhouse" ]; then
+              mv extracted/wheelhouse wheelhouse-temp
+            else
+              mkdir -p wheelhouse-temp
+              mv extracted/* wheelhouse-temp || true
+            fi
+            rm -rf extracted
+          fi
+
+          # Final check
+          if [ -d "wheelhouse-temp" ]; then
+            echo "wheelhouse-temp prepared."
+            ls -la wheelhouse-temp | sed -n '1,200p'
+          else
+            echo "ERROR: wheelhouse artifact not found. Available files in workspace:" >&2
+            ls -la
+            exit 1
+          fi
+          
       - name: Prepare wheelhouse directory
         run: |
           # Remove old wheelhouse if it exists
@@ -47,131 +163,193 @@ jobs:
           # Move the new wheelhouse into place
           mv wheelhouse-temp wheelhouse
           
-          # Create a README for the wheelhouse
-          cat > wheelhouse/README.md << 'EOF'
-          # Wheelhouse
-
-          This directory contains pre-built wheel packages for all supported platforms.
-
-          ## Installation
-
-          To install a wheel for your platform, use:
-
-          ```bash
-          pip install wheelhouse/<wheel-file-for-your-platform>.whl
-          ```
-
-          ## Platform-specific Requirements
-
-          - **Linux AMD64**: See `requirements-linux-amd64.txt`
-          - **Linux ARM64**: See `requirements-linux-aarch64.txt`
-          - **macOS x86_64**: See `requirements-macos-x86_64.txt`
-          - **macOS ARM64**: See `requirements-macos-arm64.txt`
-          - **Windows AMD64**: See `requirements-windows-amd64.txt`
-          - **Windows ARM64**: See `requirements-windows-arm64.txt`
-
-          ## Verification
-
-          All files include SHA256 checksums. To verify:
-
-          ```bash
-          sha256sum -c wheelhouse/<file>.sha256
-          ```
-
-          Or check against the master list in `CHECKSUMS.sha256`.
-
-          ## Build Information
-
-          - Build Date: $(date -u)
-          - Workflow Run: ${{ github.event.workflow_run.id }}
-          - Commit: ${{ github.event.workflow_run.head_sha }}
-          EOF
+          # Clean up any junk files - keep only wheels, tar.gz, and checksums
+          find wheelhouse -type f ! \( -name "*.whl" -o -name "*.tar.gz" -o -name "*.sha256" -o -name "CHECKSUMS.sha256" \) -delete 2>/dev/null || true
           
-          # Add .gitattributes to mark wheels as binary
-          cat > wheelhouse/.gitattributes << 'EOF'
-          *.whl binary
-          *.tar.gz binary
-          *.zip binary
-          EOF
-      
-      - name: Create Pull Request
-        id: create-pr
-        uses: peter-evans/create-pull-request@v5
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          commit-message: "chore: update wheelhouse with latest builds"
-          title: "🎡 Update Wheelhouse - Build #${{ github.event.workflow_run.id }}"
-          body: |
-            ## 🎡 Wheelhouse Update
-            
-            This PR updates the wheelhouse with the latest built wheels from workflow run #${{ github.event.workflow_run.id }}.
-            
-            ### 📦 Included Artifacts
-            
-            #### In `wheelhouse/` directory:
-            - Individual `.whl` files for all platforms
-            - Source distribution (`.tar.gz`)
-            - Individual `.sha256` files for each wheel
-            - `CHECKSUMS.sha256` master checksum file
-            - Platform-specific `requirements-*.txt` files
-            - `README.md` with instructions
-            
-            #### At repository root:
-            - `wheelhouse.zip` - Complete archive of the wheelhouse directory
-            - `wheelhouse.tar.gz` - Complete archive of the wheelhouse directory
-            - Checksum files for both archives
-            
-            ### 🔍 Changes
-            
-            - Updated wheels to commit: ${{ github.event.workflow_run.head_sha }}
-            - Build date: ${{ github.event.workflow_run.created_at }}
-            
-            ### ✅ Verification
-            
-            All files include SHA256 checksums for verification. Check `wheelhouse/CHECKSUMS.sha256` for the complete list.
-            
-            ### 📋 Platform Support
-            
-            - Linux: AMD64, ARM64
-            - macOS: x86_64, ARM64
-            - Windows: AMD64, ARM64
-            - Python versions: 3.10, 3.11, 3.12, 3.13
-            
-            ---
-            
-            *This PR was automatically generated by the wheelhouse workflow.*
-          branch: build                         # use fixed "build" branch as the PR source
-          base: develop                         # target the PR at the develop branch
-          delete-branch: false                  # keep the build branch persistent
-          labels: |
-            wheelhouse
-            automated
-            build
-      
+          # Remove files over 100MB (GitHub's limit)
+          find wheelhouse -type f -size +100M -exec rm {} \;
+          
+          echo "Wheelhouse contents:"
+          ls -lah wheelhouse/
+
+      - name: Commit wheelhouse into repo branch
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          echo "Configuring git..."
+          git config user.email "actions@github.com"
+          git config user.name "github-actions[bot]"
+          git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          
+          # Save wheelhouse contents to temp location before switching branches
+          echo "Saving wheelhouse to temp location..."
+          cp -r wheelhouse /tmp/wheelhouse-save
+          
+          # Verify the files are actually there and are real wheel files
+          echo "Contents of /tmp/wheelhouse-save (showing file sizes):"
+          ls -lh /tmp/wheelhouse-save/*.whl 2>/dev/null | head -10
+          
+          # Clean up wheelhouse from working directory to avoid checkout conflicts
+          rm -rf wheelhouse
+          
+          echo "Fetching branches..."
+          git fetch origin
+          
+          echo "Switching to build branch..."
+          git checkout -B build origin/develop
+          
+          # Remove OLD wheel and sha files ONLY (keep .gitignore and .gitkeep)
+          echo "Removing old wheel and sha files from git..."
+          git rm -f wheelhouse/*.whl 2>/dev/null || true
+          git rm -f wheelhouse/*.whl.sha256 2>/dev/null || true
+          git rm -f wheelhouse/*.tar.gz 2>/dev/null || true
+          git rm -f wheelhouse/*.tar.gz.sha256 2>/dev/null || true
+          git rm -f wheelhouse/CHECKSUMS.sha256 2>/dev/null || true
+          
+          # Copy the NEW wheel files
+          echo "Copying NEW wheelhouse files..."
+          cp /tmp/wheelhouse-save/*.whl wheelhouse/ 2>/dev/null || true
+          cp /tmp/wheelhouse-save/*.sha256 wheelhouse/ 2>/dev/null || true
+          cp /tmp/wheelhouse-save/*.tar.gz wheelhouse/ 2>/dev/null || true
+          cp /tmp/wheelhouse-save/CHECKSUMS.sha256 wheelhouse/ 2>/dev/null || true
+          
+          # Verify the files are actual wheel files (should be MB in size, not bytes)
+          echo "Verifying wheelhouse contents are real files:"
+          ls -lh wheelhouse/*.whl 2>/dev/null | head -10
+          
+          echo "Force adding NEW wheelhouse files..."
+          # Add all NEW wheel/sha files
+          git add -f wheelhouse/*.sha256
+          git add -f wheelhouse/*.whl
+          git add -f wheelhouse/CHECKSUMS.sha256
+          
+          COMMIT_MSG="chore: update wheelhouse artifacts for run ${RUN_ID}"
+          
+          # Check what's staged
+          echo "Checking staged files..."
+          STAGED_COUNT=$(git diff --cached --name-only | wc -l)
+          echo "Number of staged files: $STAGED_COUNT"
+          
+          if [ "$STAGED_COUNT" -gt 0 ]; then
+            echo "Staged files:"
+            git diff --cached --name-only
+            echo ""
+            echo "File size changes:"
+            git diff --cached --stat
+          fi
+          
+          if [ "$STAGED_COUNT" -eq 0 ]; then
+            echo "ERROR: No files were staged! Something is wrong."
+            exit 1
+          fi
+          
+          echo "Committing $STAGED_COUNT files..."
+          git commit -m "${COMMIT_MSG}"
+          
+          # Show what was committed
+          echo "Committed changes:"
+          git show --stat
+          
+          echo "Force pushing to build branch..."
+          git push --force origin build
+          echo "Successfully pushed REAL wheelhouse files!"
+
+      - name: Create or update Pull Request (build → develop)
+        id: create_or_update_pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARTIFACTS_URL: ${{ env.RUN_URL }}
+        run: |
+          set -euo pipefail
+          OWNER_REPO="${GITHUB_REPOSITORY}"
+          OWNER="$(echo "$OWNER_REPO" | cut -d'/' -f1)"
+          REPO="$(echo "$OWNER_REPO" | cut -d'/' -f2)"
+          HEAD_BRANCH="build"
+          BASE_BRANCH="develop"
+          TITLE="🎡 Update Wheelhouse - Build #${RUN_ID}"
+          BODY="This PR updates the wheelhouse with artifacts from build run ${RUN_ID}.
+
+          The wheelhouse files are now in the 'build' branch.
+          
+          Action run: ${ARTIFACTS_URL}"
+
+          echo "Checking for an existing open PR from ${HEAD_BRANCH} to ${BASE_BRANCH}..."
+          existing_pr=$(curl -s -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${OWNER}/${REPO}/pulls?head=${OWNER}:${HEAD_BRANCH}&base=${BASE_BRANCH}&state=open" | jq -r '.[0].number // empty')
+
+          if [ -n "$existing_pr" ]; then
+            echo "Found existing PR #$existing_pr — updating title/body"
+            curl -s -X PATCH -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json" \
+              -d "$(jq -n --arg t "$TITLE" --arg b "$BODY" '{title:$t, body:$b}')" \
+              "https://api.github.com/repos/${OWNER}/${REPO}/pulls/${existing_pr}"
+            echo "PR_UPDATED=${existing_pr}" >> $GITHUB_ENV
+          else
+            echo "No existing PR — creating a new PR from ${HEAD_BRANCH} to ${BASE_BRANCH}"
+            pr_resp=$(curl -s -X POST -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json" \
+              -d "$(jq -n --arg head "$HEAD_BRANCH" --arg base "$BASE_BRANCH" --arg title "$TITLE" --arg body "$BODY" '{head:$head, base:$base, title:$title, body:$body}')" \
+              "https://api.github.com/repos/${OWNER}/${REPO}/pulls")
+            pr_number=$(echo "$pr_resp" | jq -r '.number // empty')
+            if [ -z "$pr_number" ]; then
+              echo "ERROR: failed to create PR" >&2
+              echo "Response: $pr_resp"
+              exit 1
+            fi
+            echo "PR_CREATED=${pr_number}" >> $GITHUB_ENV
+          fi
+
       - name: Add PR comment with instructions
-        if: ${{ steps.create-pr.outputs.pull-request-number }}
-        uses: peter-evans/create-or-update-comment@v3
-        with:
-          issue-number: ${{ steps.create-pr.outputs.pull-request-number }}
-          body: |
-            ## 📦 Installation Instructions
-            
-            After merging this PR, users can install wheels directly from the repository:
-            
-            ```bash
-            # Clone the repository
-            git clone https://github.com/${{ github.repository }}.git
-            cd $(basename ${{ github.repository }})
-            
-            # Install the appropriate wheel for your platform
-            pip install wheelhouse/<appropriate-wheel-file>.whl
-            ```
-            
-            Or download the complete wheelhouse archive:
-            
-            ```bash
-            # Download and extract the wheelhouse
-            curl -L -o wheelhouse.zip https://github.com/${{ github.repository }}/raw/main/wheelhouse.zip
-            unzip wheelhouse.zip
-            pip install wheelhouse/<appropriate-wheel-file>.whl
-            ```
+        if: ${{ env.PR_CREATED || env.PR_UPDATED }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARTIFACTS_URL: ${{ env.RUN_URL }}
+        run: |
+          set -euo pipefail
+          # Use the PR number from previous step
+          PR_NUM="${PR_CREATED:-${PR_UPDATED:-}}"
+          
+          if [ -z "$PR_NUM" ]; then
+            echo "No PR number available to comment on."
+            exit 0
+          fi
+
+          COMMENT_BODY="## 📦 Wheelhouse
+
+          This PR includes the wheelhouse files built by Maturin.
+          Wheels include Python versions '>=3.10,<3.14' for Linux, macOS, and Windows.
+
+          <details>
+          <summary>View wheelhouse contents</summary>
+
+          \`\`\`plaintext
+          $(ls -1 wheelhouse/ | head -n 50 | tr '\n' '\n')
+          \`\`\`
+
+          </details>
+
+          The full wheelhouse is available in the 'wheelhouse' directory.
+
+          <details>
+          <summary>Release archives</summary>
+
+          The following release archives are available for each version:
+
+          - \`*.whl\`: Built wheels
+          - \`*.tar.gz\`: Source archives
+          - \`CHECKSUMS.sha256\`: Checksums for all files
+
+          </details>
+
+          <br>
+
+          ⚠️ **Note**: If this PR is not merged within 30 days, the artifacts will be deleted.
+
+          <!--
+          The artifacts from the CI run are available here: $ARTIFACTS_URL
+          -->"
+
+          echo "Posting comment on PR #$PR_NUM..."
+          curl -s -X POST -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" -H "Accept: application/vnd.github+json" \
+            -d "{\"body\":\"$COMMENT_BODY\"}" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues/${PR_NUM}/comments"
