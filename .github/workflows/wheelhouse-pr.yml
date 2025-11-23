@@ -216,15 +216,11 @@ jobs:
           *.zip binary
           EOF
 
-      - name: Commit wheelhouse into repo branch using Git LFS
+      - name: Commit wheelhouse into repo branch
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          echo "Installing git-lfs..."
-          sudo apt-get update
-          sudo apt-get install -y git-lfs || true
-          git lfs install --local
 
           echo "Configuring git user..."
           git config user.email "actions@github.com"
@@ -241,26 +237,8 @@ jobs:
             exit 1
           fi
 
-          echo "Create .gitattributes for LFS tracking and add it"
-          cat > .gitattributes <<'EOF'
-          *.whl filter=lfs diff=lfs merge=lfs -text
-          *.tar.gz filter=lfs diff=lfs merge=lfs -text
-          *.zip filter=lfs diff=lfs merge=lfs -text
-          EOF
-          git add .gitattributes
-
-          echo "Track file patterns with git-lfs (local)"
-          git lfs track "*.whl" || true
-          git lfs track "*.tar.gz" || true
-          git lfs track "*.zip" || true
-          git add .gitattributes
-
-          # wheelhouse is already in the repository workspace root (moved earlier)
-          echo "Using wheelhouse directory present in workspace for commit."
-          
-
-          echo "Add files (LFS will handle large files)"
-          git add -A wheelhouse
+          echo "Add wheelhouse files directly (no LFS)"
+          git add wheelhouse/
 
           COMMIT_MSG="chore: add/update wheelhouse artifacts for run ${RUN_ID}"
           if git diff --cached --quiet; then
