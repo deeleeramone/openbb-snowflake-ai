@@ -152,7 +152,7 @@ jobs:
           # Export LIB so MSVC link.exe can find vcpkg libs
           echo "LIB=$installPath\lib" >> $env:GITHUB_ENV
           
-      - run: pip install -U ruff typing_extensions setuptools
+      - run: pip install -U ruff typing_extensions setuptools delocate delvewheel
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -315,6 +315,14 @@ jobs:
             sdist_flag=""
           done
           
+          # Bundle dependent dylibs so end users do not need Homebrew-installed libraries.
+          BUNDLE_DIR="target/delocated-wheelhouse"
+          mkdir -p "${BUNDLE_DIR}"
+          find target -name "*.whl" -print0 | while IFS= read -r -d '' wheel; do
+            delocate-wheel -v -w "${BUNDLE_DIR}" "$wheel"
+            rm "$wheel"
+          done
+          
           # Move all wheels to dist directory
           mkdir -p dist
           find target -name "*.whl" -exec mv {} dist/ \;
@@ -370,6 +378,14 @@ jobs:
               $emitSdist = $false
             }
             maturin build @args
+          }
+          
+          # Bundle dependent DLLs so end users do not need vcpkg-installed libraries.
+          $bundleDir = Join-Path $PWD "target\delvewheel-wheelhouse"
+          New-Item -ItemType Directory -Force -Path $bundleDir | Out-Null
+          Get-ChildItem -Path target -Recurse -Filter *.whl | ForEach-Object {
+            python -m delvewheel repair --add-path "$installPath\bin" -w $bundleDir $_.FullName
+            Remove-Item $_.FullName
           }
           
           # Move all wheels to dist directory
