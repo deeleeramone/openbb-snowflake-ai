@@ -208,6 +208,57 @@ jobs:
           # Move all wheels to dist directory
           mkdir -p dist
           find target -name "*.whl" -exec mv {} dist/ \;
+
+      # =================== MACOS ===================
+      - name: Build macOS wheels
+        if: matrix.os == 'macos'
+        run: |
+          # Dependencies already installed in earlier step
+          # Build wheels for each Python version
+          case "${{ matrix.target }}" in
+            x86_64)
+              RUST_TARGET="x86_64-apple-darwin"
+              ;;
+            aarch64)
+              RUST_TARGET="aarch64-apple-darwin"
+              ;;
+          esac
+          
+          for py in ${{ matrix.interpreter }}; do
+            echo "Building for Python ${py}"
+            maturin build --release --target ${RUST_TARGET} --interpreter ${py}
+          done
+          
+          # Move all wheels to dist directory
+          mkdir -p dist
+          find target -name "*.whl" -exec mv {} dist/ \;
+
+      # =================== WINDOWS ===================  
+      - name: Build Windows wheels
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          # Dependencies already installed in earlier step
+          # Build wheels for each Python version
+          switch ("${{ matrix.target }}") {
+            "x86_64" {
+              $rustTarget = "x86_64-pc-windows-msvc"
+            }
+            "aarch64" {
+              $rustTarget = "aarch64-pc-windows-msvc"
+            }
+          }
+          
+          $pythonVersions = "${{ matrix.interpreter }}".Split()
+          foreach ($py in $pythonVersions) {
+            Write-Host "Building for Python $py"
+            maturin build --release --target $rustTarget --interpreter $py
+          }
+          
+          # Move all wheels to dist directory
+          New-Item -ItemType Directory -Force -Path dist
+          Get-ChildItem -Path target -Filter *.whl -Recurse | Move-Item -Destination dist
+
       - run: ${{ (matrix.os == 'windows' && 'dir') || 'ls -lh' }} dist/
 
       - uses: actions/upload-artifact@v4
