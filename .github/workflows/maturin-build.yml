@@ -133,177 +133,321 @@ jobs:
             set -e
             set -x
             
-            # Install build dependencies
+            # Detect the libc type and set up OpenSSL accordingly
             if command -v apk > /dev/null; then
-              # Alpine (musl)
+              # =================== ALPINE/MUSL LINUX ===================
+              echo "Detected Alpine/musl environment"
+              
+              # Add edge repositories for latest packages
               echo "http://dl-cdn.alpinelinux.org/alpine/edge/community" >> /etc/apk/repositories
               echo "http://dl-cdn.alpinelinux.org/alpine/edge/main" >> /etc/apk/repositories
               apk update
-              apk add pkgconfig perl make gcc musl-dev git tcl sqlcipher-dev openssl-dev openssl-libs-static
               
-              # For musl cross-compilation, set the correct paths
+              # Install ALL necessary build dependencies
+              apk add --no-cache \
+                pkgconfig \
+                perl \
+                make \
+                gcc \
+                musl-dev \
+                git \
+                tcl \
+                openssl-dev \
+                openssl-libs-static \
+                sqlcipher-dev \
+                linux-headers
+              
+              # Set OpenSSL paths for musl
               export OPENSSL_DIR=/usr
               export OPENSSL_STATIC=1
               export OPENSSL_LIB_DIR=/usr/lib
               export OPENSSL_INCLUDE_DIR=/usr/include
+              
+              # Set target-specific environment variables for cross-compilation
+              case "${TARGET}" in
+                aarch64-unknown-linux-musl)
+                  export AARCH64_UNKNOWN_LINUX_MUSL_OPENSSL_DIR=/usr
+                  export AARCH64_UNKNOWN_LINUX_MUSL_OPENSSL_STATIC=1
+                  ;;
+                armv7-unknown-linux-musleabihf)
+                  export ARMV7_UNKNOWN_LINUX_MUSLEABIHF_OPENSSL_DIR=/usr
+                  export ARMV7_UNKNOWN_LINUX_MUSLEABIHF_OPENSSL_STATIC=1
+                  ;;
+                x86_64-unknown-linux-musl)
+                  export X86_64_UNKNOWN_LINUX_MUSL_OPENSSL_DIR=/usr
+                  export X86_64_UNKNOWN_LINUX_MUSL_OPENSSL_STATIC=1
+                  ;;
+              esac
+              
+              # Set PKG_CONFIG for musl
+              export PKG_CONFIG_PATH=/usr/lib/pkgconfig:${PKG_CONFIG_PATH:-}
+              export PKG_CONFIG_ALLOW_CROSS=1
+              
             elif command -v yum > /dev/null; then
-              # CentOS/RHEL (manylinux2014)
+              # =================== CENTOS/RHEL (MANYLINUX) ===================
+              echo "Detected CentOS/RHEL environment"
+              
+              # Install EPEL for additional packages
               yum install -y epel-release || true
-              yum install -y pkgconfig perl-core make gcc git tcl curl autoconf automake libtool || true
               
-              # For cross-compilation targets, install the appropriate OpenSSL
-              if [ "${TARGET}" = "aarch64" ] || [ "${TARGET}" = "aarch64-unknown-linux-gnu" ]; then
-                # Install aarch64 OpenSSL development files
-                yum install -y openssl-devel.aarch64
-                # Set OpenSSL to the cross-compilation directory
-                export AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_DIR=/usr/aarch64-unknown-linux-gnu
-                export OPENSSL_DIR=/usr/aarch64-unknown-linux-gnu
-                export OPENSSL_STATIC=1
-                
-                # Create symlink for opensslconf.h if needed
-                if [ -f /usr/include/openssl/opensslconf-aarch64.h ]; then
-                  mkdir -p /usr/aarch64-unknown-linux-gnu/include/openssl
-                  ln -sf /usr/include/openssl/*.h /usr/aarch64-unknown-linux-gnu/include/openssl/ 2>/dev/null || true
-                  ln -sf /usr/include/openssl/opensslconf-aarch64.h /usr/aarch64-unknown-linux-gnu/include/openssl/opensslconf.h
-                fi
-              elif [ "${TARGET}" = "armv7" ] || [ "${TARGET}" = "armv7-unknown-linux-gnueabihf" ]; then
-                export ARMV7_UNKNOWN_LINUX_GNUEABIHF_OPENSSL_DIR=/usr/armv7-unknown-linux-gnueabihf
-                export OPENSSL_DIR=/usr/armv7-unknown-linux-gnueabihf
-                export OPENSSL_STATIC=1
-              elif [ "${TARGET}" = "x86_64" ] || [ "${TARGET}" = "x86_64-unknown-linux-gnu" ]; then
-                # For native x86_64, just install normally
-                yum install -y openssl-devel openssl-static || true
-                export OPENSSL_DIR=/usr
-                export OPENSSL_STATIC=1
-                export OPENSSL_LIB_DIR=/usr/lib64
-                export OPENSSL_INCLUDE_DIR=/usr/include
-              else
-                # Default: install host OpenSSL
-                yum install -y openssl-devel openssl-static || true
-                export OPENSSL_DIR=/usr
-                export OPENSSL_STATIC=1
-              fi
+              # Install base build tools
+              yum install -y \
+                pkgconfig \
+                perl-core \
+                make \
+                gcc \
+                gcc-c++ \
+                git \
+                tcl \
+                curl \
+                autoconf \
+                automake \
+                libtool \
+                openssl-devel \
+                openssl-static || true
               
-              # Try to install sqlcipher-devel but don't fail if it's not available
-              yum install -y sqlcipher-devel || echo "sqlcipher-devel not found in yum"
-              if pkg-config --exists sqlcipher; then
-                export SQLCIPHER_LIB_DIR=/usr/lib64
-                export SQLCIPHER_INCLUDE_DIR=/usr/include
-              else
-                SQLCIPHER_VERSION=4.5.6
-                SQLCIPHER_PREFIX=/opt/sqlcipher-${TARGET:-host}
-                SQLCIPHER_BUILD_DIR=$(mktemp -d)
-                curl -fsSL "https://github.com/sqlcipher/sqlcipher/archive/refs/tags/v${SQLCIPHER_VERSION}.tar.gz" | tar -xz -C "${SQLCIPHER_BUILD_DIR}"
-                ORIG_DIR=$(pwd)
-                cd "${SQLCIPHER_BUILD_DIR}/sqlcipher-${SQLCIPHER_VERSION}"
-                ./configure --prefix="${SQLCIPHER_PREFIX}" --enable-tempstore=yes --disable-tcl --with-crypto-lib=openssl
-                make -j"$(nproc)"
-                make install
-                cd "${ORIG_DIR}"
-                rm -rf "${SQLCIPHER_BUILD_DIR}"
-                export PKG_CONFIG_PATH="${SQLCIPHER_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH}"
-                export SQLCIPHER_LIB_DIR="${SQLCIPHER_PREFIX}/lib"
-                export SQLCIPHER_INCLUDE_DIR="${SQLCIPHER_PREFIX}/include"
-              fi
-              export PKG_CONFIG_PATH="${SQLCIPHER_LIB_DIR}/pkgconfig:${PKG_CONFIG_PATH:-}"
-              export LD_LIBRARY_PATH="${SQLCIPHER_LIB_DIR}:${LD_LIBRARY_PATH:-}"
-              export LIBRARY_PATH="${SQLCIPHER_LIB_DIR}:${LIBRARY_PATH:-}"
-              export RUSTFLAGS="${RUSTFLAGS:-} -L${SQLCIPHER_LIB_DIR}"
+              # Handle cross-compilation targets
+              case "${TARGET}" in
+                aarch64|aarch64-unknown-linux-gnu)
+                  # Try to install cross-compilation tools
+                  yum install -y gcc-aarch64-linux-gnu || true
+                  export AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_DIR=/usr
+                  export OPENSSL_DIR=/usr
+                  export OPENSSL_STATIC=1
+                  export OPENSSL_LIB_DIR=/usr/lib64
+                  export OPENSSL_INCLUDE_DIR=/usr/include
+                  ;;
+                armv7|armv7-unknown-linux-gnueabihf)
+                  yum install -y gcc-arm-linux-gnu || true
+                  export ARMV7_UNKNOWN_LINUX_GNUEABIHF_OPENSSL_DIR=/usr
+                  export OPENSSL_DIR=/usr
+                  export OPENSSL_STATIC=1
+                  export OPENSSL_LIB_DIR=/usr/lib64
+                  export OPENSSL_INCLUDE_DIR=/usr/include
+                  ;;
+                ppc64le|powerpc64le-unknown-linux-gnu)
+                  export POWERPC64LE_UNKNOWN_LINUX_GNU_OPENSSL_DIR=/usr
+                  export OPENSSL_DIR=/usr
+                  export OPENSSL_STATIC=1
+                  export OPENSSL_LIB_DIR=/usr/lib64
+                  export OPENSSL_INCLUDE_DIR=/usr/include
+                  ;;
+                s390x|s390x-unknown-linux-gnu)
+                  export S390X_UNKNOWN_LINUX_GNU_OPENSSL_DIR=/usr
+                  export OPENSSL_DIR=/usr
+                  export OPENSSL_STATIC=1
+                  export OPENSSL_LIB_DIR=/usr/lib64
+                  export OPENSSL_INCLUDE_DIR=/usr/include
+                  ;;
+                *)
+                  # Default x86_64 or i686
+                  export OPENSSL_DIR=/usr
+                  export OPENSSL_STATIC=1
+                  if [ -d /usr/lib64 ]; then
+                    export OPENSSL_LIB_DIR=/usr/lib64
+                  else
+                    export OPENSSL_LIB_DIR=/usr/lib
+                  fi
+                  export OPENSSL_INCLUDE_DIR=/usr/include
+                  ;;
+              esac
+              
+              # Build SQLCipher from source as it's not in standard repos
+              SQLCIPHER_VERSION=4.5.6
+              SQLCIPHER_PREFIX=/opt/sqlcipher
+              SQLCIPHER_BUILD_DIR=$(mktemp -d)
+              
+              curl -fsSL "https://github.com/sqlcipher/sqlcipher/archive/refs/tags/v${SQLCIPHER_VERSION}.tar.gz" | tar -xz -C "${SQLCIPHER_BUILD_DIR}"
+              cd "${SQLCIPHER_BUILD_DIR}/sqlcipher-${SQLCIPHER_VERSION}"
+              
+              CFLAGS="-I${OPENSSL_INCLUDE_DIR}" LDFLAGS="-L${OPENSSL_LIB_DIR}" \
+              ./configure \
+                --prefix="${SQLCIPHER_PREFIX}" \
+                --enable-tempstore=yes \
+                --disable-tcl \
+                --with-crypto-lib=openssl \
+                --enable-static=yes \
+                --enable-shared=no
+              
+              make -j"$(nproc)"
+              make install
+              cd /
+              rm -rf "${SQLCIPHER_BUILD_DIR}"
+              
+              export SQLCIPHER_LIB_DIR="${SQLCIPHER_PREFIX}/lib"
+              export SQLCIPHER_INCLUDE_DIR="${SQLCIPHER_PREFIX}/include"
+              export PKG_CONFIG_PATH="${SQLCIPHER_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+              
             elif command -v apt-get > /dev/null; then
+              # =================== DEBIAN/UBUNTU ===================
+              echo "Detected Debian/Ubuntu environment"
+              
+              # Set up timezone to avoid interactive prompts
+              export DEBIAN_FRONTEND=noninteractive
+              export TZ=Etc/UTC
+              sudo ln -fs "/usr/share/zoneinfo/${TZ}" /etc/localtime
+              echo "${TZ}" | sudo tee /etc/timezone >/dev/null
+              
+              # Determine cross-compilation settings
               case "${TARGET}" in
                 aarch64|aarch64-unknown-linux-gnu)
                   CROSS_ARCH=arm64
                   CROSS_LIB_DIR=/usr/lib/aarch64-linux-gnu
                   CROSS_INCLUDE_DIR=/usr/include/aarch64-linux-gnu
+                  TARGET_TRIPLE=aarch64-linux-gnu
                   ;;
                 armv7|armv7-unknown-linux-gnueabihf)
                   CROSS_ARCH=armhf
                   CROSS_LIB_DIR=/usr/lib/arm-linux-gnueabihf
                   CROSS_INCLUDE_DIR=/usr/include/arm-linux-gnueabihf
+                  TARGET_TRIPLE=arm-linux-gnueabihf
                   ;;
                 ppc64le|powerpc64le-unknown-linux-gnu)
                   CROSS_ARCH=ppc64el
                   CROSS_LIB_DIR=/usr/lib/powerpc64le-linux-gnu
                   CROSS_INCLUDE_DIR=/usr/include/powerpc64le-linux-gnu
+                  TARGET_TRIPLE=powerpc64le-linux-gnu
                   ;;
                 s390x|s390x-unknown-linux-gnu)
                   CROSS_ARCH=s390x
                   CROSS_LIB_DIR=/usr/lib/s390x-linux-gnu
                   CROSS_INCLUDE_DIR=/usr/include/s390x-linux-gnu
+                  TARGET_TRIPLE=s390x-linux-gnu
+                  ;;
+                i686|i686-unknown-linux-gnu)
+                  CROSS_ARCH=i386
+                  CROSS_LIB_DIR=/usr/lib/i386-linux-gnu
+                  CROSS_INCLUDE_DIR=/usr/include/i386-linux-gnu
+                  TARGET_TRIPLE=i386-linux-gnu
                   ;;
                 *)
+                  # x86_64 or default
                   CROSS_ARCH=""
-                  CROSS_LIB_DIR=""
-                  CROSS_INCLUDE_DIR=""
+                  CROSS_LIB_DIR=/usr/lib/x86_64-linux-gnu
+                  CROSS_INCLUDE_DIR=/usr/include/x86_64-linux-gnu
+                  TARGET_TRIPLE=x86_64-linux-gnu
                   ;;
               esac
-
-              if [ -n "${CROSS_ARCH}" ]; then
+              
+              # Add architecture and configure apt for cross-compilation if needed
+              if [ -n "${CROSS_ARCH}" ] && [ "${CROSS_ARCH}" != "$(dpkg --print-architecture)" ]; then
                 sudo dpkg --add-architecture "${CROSS_ARCH}"
-                # Handle Ubuntu ports for cross compilation
-                if . /etc/os-release && [ "$ID" = "ubuntu" ]; then
-                   HOST_ARCH=$(dpkg --print-architecture)
-                   # Restrict main repos to host arch to avoid 404 on foreign arch
-                   sudo sed -i "s/^deb \([^\[]\)/deb [arch=${HOST_ARCH}] \1/g" /etc/apt/sources.list
-
-                   # Add ports repos for target arch
-                   CODENAME=${VERSION_CODENAME:-jammy}
-                   echo "deb [arch=${CROSS_ARCH}] http://ports.ubuntu.com/ubuntu-ports ${CODENAME} main restricted universe multiverse" | sudo tee /etc/apt/sources.list.d/ports.list
-                   echo "deb [arch=${CROSS_ARCH}] http://ports.ubuntu.com/ubuntu-ports ${CODENAME}-updates main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list.d/ports.list
-                   echo "deb [arch=${CROSS_ARCH}] http://ports.ubuntu.com/ubuntu-ports ${CODENAME}-security main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list.d/ports.list
+                
+                # Fix apt sources for cross-compilation
+                if [ -f /etc/os-release ]; then
+                  . /etc/os-release
+                  HOST_ARCH=$(dpkg --print-architecture)
+                  
+                  # Backup original sources
+                  sudo cp /etc/apt/sources.list /etc/apt/sources.list.backup
+                  
+                  # Add architecture restrictions to prevent 404s
+                  sudo sed -i "s/^deb \([^\[]\)/deb [arch=${HOST_ARCH}] \1/g" /etc/apt/sources.list
+                  
+                  # Add ports repository for cross architectures
+                  if [ "${ID}" = "ubuntu" ]; then
+                    CODENAME=${VERSION_CODENAME:-jammy}
+                    echo "deb [arch=${CROSS_ARCH}] http://ports.ubuntu.com/ubuntu-ports ${CODENAME} main restricted universe multiverse" | sudo tee /etc/apt/sources.list.d/ports.list
+                    echo "deb [arch=${CROSS_ARCH}] http://ports.ubuntu.com/ubuntu-ports ${CODENAME}-updates main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list.d/ports.list
+                    echo "deb [arch=${CROSS_ARCH}] http://ports.ubuntu.com/ubuntu-ports ${CODENAME}-security main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list.d/ports.list
+                  fi
                 fi
               fi
-
-              export DEBIAN_FRONTEND=noninteractive
-              export TZ=Etc/UTC
-              sudo ln -fs "/usr/share/zoneinfo/${TZ}" /etc/localtime
-              echo "${TZ}" | sudo tee /etc/timezone >/dev/null
+              
+              # Update package lists
               sudo apt-get update
-              sudo apt-get install -y tzdata pkg-config build-essential dpkg-dev git tcl curl libsqlcipher-dev libssl-dev
-              if [ -n "${CROSS_ARCH}" ]; then
-                sudo apt-get install -y "libssl-dev:${CROSS_ARCH}" "libsqlcipher-dev:${CROSS_ARCH}"
-                export OPENSSL_LIB_DIR="${CROSS_LIB_DIR}"
-                export OPENSSL_INCLUDE_DIR="${CROSS_INCLUDE_DIR}"
-                export SQLCIPHER_LIB_DIR="${CROSS_LIB_DIR}"
-                export SQLCIPHER_INCLUDE_DIR="${CROSS_INCLUDE_DIR}"
-                case "${TARGET}" in
-                  aarch64|aarch64-unknown-linux-gnu)
-                    export AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_DIR=/usr
-                    export AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_LIB_DIR="${CROSS_LIB_DIR}"
-                    export AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_INCLUDE_DIR="${CROSS_INCLUDE_DIR}"
-                    ;;
-                  armv7|armv7-unknown-linux-gnueabihf)
-                    export ARMV7_UNKNOWN_LINUX_GNUEABIHF_OPENSSL_DIR=/usr
-                    export ARMV7_UNKNOWN_LINUX_GNUEABIHF_OPENSSL_LIB_DIR="${CROSS_LIB_DIR}"
-                    export ARMV7_UNKNOWN_LINUX_GNUEABIHF_OPENSSL_INCLUDE_DIR="${CROSS_INCLUDE_DIR}"
-                    ;;
-                esac
-              else
-                HOST_MULTIARCH="$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || echo x86_64-linux-gnu)"
-                export OPENSSL_LIB_DIR="/usr/lib/${HOST_MULTIARCH}"
-                export OPENSSL_INCLUDE_DIR="/usr/include/${HOST_MULTIARCH}"
-                export SQLCIPHER_LIB_DIR="/usr/lib/${HOST_MULTIARCH}"
-                export SQLCIPHER_INCLUDE_DIR="/usr/include/${HOST_MULTIARCH}"
+              
+              # Install base build dependencies
+              sudo apt-get install -y \
+                tzdata \
+                pkg-config \
+                build-essential \
+                dpkg-dev \
+                git \
+                tcl \
+                curl \
+                libssl-dev \
+                libsqlcipher-dev
+              
+              # Install cross-compilation dependencies if needed
+              if [ -n "${CROSS_ARCH}" ] && [ "${CROSS_ARCH}" != "$(dpkg --print-architecture)" ]; then
+                sudo apt-get install -y \
+                  "libssl-dev:${CROSS_ARCH}" \
+                  "libsqlcipher-dev:${CROSS_ARCH}" \
+                  crossbuild-essential-"${CROSS_ARCH}" || true
               fi
-              if [ -d "${SQLCIPHER_LIB_DIR}/pkgconfig" ]; then
-                export PKG_CONFIG_PATH="${SQLCIPHER_LIB_DIR}/pkgconfig:${PKG_CONFIG_PATH:-}"
-              fi
-              export LD_LIBRARY_PATH="${SQLCIPHER_LIB_DIR}:${LD_LIBRARY_PATH:-}"
-              export LIBRARY_PATH="${SQLCIPHER_LIB_DIR}:${LIBRARY_PATH:-}"
-              export RUSTFLAGS="${RUSTFLAGS:-} -L${SQLCIPHER_LIB_DIR}"
+              
+              # Set OpenSSL environment variables
               export OPENSSL_DIR=/usr
               export OPENSSL_STATIC=1
+              export OPENSSL_LIB_DIR="${CROSS_LIB_DIR}"
+              export OPENSSL_INCLUDE_DIR="${CROSS_INCLUDE_DIR}"
+              export SQLCIPHER_LIB_DIR="${CROSS_LIB_DIR}"
+              export SQLCIPHER_INCLUDE_DIR="${CROSS_INCLUDE_DIR}"
+              
+              # Set target-specific variables
+              case "${TARGET}" in
+                aarch64|aarch64-unknown-linux-gnu)
+                  export AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_DIR=/usr
+                  export AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_LIB_DIR="${CROSS_LIB_DIR}"
+                  export AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_INCLUDE_DIR="${CROSS_INCLUDE_DIR}"
+                  ;;
+                armv7|armv7-unknown-linux-gnueabihf)
+                  export ARMV7_UNKNOWN_LINUX_GNUEABIHF_OPENSSL_DIR=/usr
+                  export ARMV7_UNKNOWN_LINUX_GNUEABIHF_OPENSSL_LIB_DIR="${CROSS_LIB_DIR}"
+                  export ARMV7_UNKNOWN_LINUX_GNUEABIHF_OPENSSL_INCLUDE_DIR="${CROSS_INCLUDE_DIR}"
+                  ;;
+                ppc64le|powerpc64le-unknown-linux-gnu)
+                  export POWERPC64LE_UNKNOWN_LINUX_GNU_OPENSSL_DIR=/usr
+                  export POWERPC64LE_UNKNOWN_LINUX_GNU_OPENSSL_LIB_DIR="${CROSS_LIB_DIR}"
+                  export POWERPC64LE_UNKNOWN_LINUX_GNU_OPENSSL_INCLUDE_DIR="${CROSS_INCLUDE_DIR}"
+                  ;;
+                s390x|s390x-unknown-linux-gnu)
+                  export S390X_UNKNOWN_LINUX_GNU_OPENSSL_DIR=/usr
+                  export S390X_UNKNOWN_LINUX_GNU_OPENSSL_LIB_DIR="${CROSS_LIB_DIR}"
+                  export S390X_UNKNOWN_LINUX_GNU_OPENSSL_INCLUDE_DIR="${CROSS_INCLUDE_DIR}"
+                  ;;
+                i686|i686-unknown-linux-gnu)
+                  export I686_UNKNOWN_LINUX_GNU_OPENSSL_DIR=/usr
+                  export I686_UNKNOWN_LINUX_GNU_OPENSSL_LIB_DIR="${CROSS_LIB_DIR}"
+                  export I686_UNKNOWN_LINUX_GNU_OPENSSL_INCLUDE_DIR="${CROSS_INCLUDE_DIR}"
+                  ;;
+              esac
+              
+              # Set PKG_CONFIG_PATH
+              export PKG_CONFIG_PATH="${CROSS_LIB_DIR}/pkgconfig:${PKG_CONFIG_PATH:-}"
+              export PKG_CONFIG_ALLOW_CROSS=1
             fi
             
-            # Debug: Show what we found
-            echo "TARGET=${TARGET}"
-            echo "OPENSSL_DIR=${OPENSSL_DIR}"
-            if [ -n "${OPENSSL_DIR}" ]; then
-              echo "OpenSSL headers in ${OPENSSL_DIR}:"
-              ls -la ${OPENSSL_DIR}/include/openssl/ 2>/dev/null || echo "Headers not found"
-              echo "OpenSSL libraries in ${OPENSSL_DIR}:"
-              ls -la ${OPENSSL_DIR}/lib*/*ssl* 2>/dev/null || echo "Libraries not found"
+            # Common environment setup for all Linux variants
+            export LD_LIBRARY_PATH="${OPENSSL_LIB_DIR}:${SQLCIPHER_LIB_DIR}:${LD_LIBRARY_PATH:-}"
+            export LIBRARY_PATH="${OPENSSL_LIB_DIR}:${SQLCIPHER_LIB_DIR}:${LIBRARY_PATH:-}"
+            export RUSTFLAGS="${RUSTFLAGS:-} -L${OPENSSL_LIB_DIR} -L${SQLCIPHER_LIB_DIR:-/usr/lib}"
+            
+            # Debug output to verify configuration
+            echo "=================== BUILD CONFIGURATION ==================="
+            echo "TARGET: ${TARGET}"
+            echo "OPENSSL_DIR: ${OPENSSL_DIR}"
+            echo "OPENSSL_LIB_DIR: ${OPENSSL_LIB_DIR}"
+            echo "OPENSSL_INCLUDE_DIR: ${OPENSSL_INCLUDE_DIR}"
+            echo "SQLCIPHER_LIB_DIR: ${SQLCIPHER_LIB_DIR}"
+            echo "PKG_CONFIG_PATH: ${PKG_CONFIG_PATH}"
+            echo "RUSTFLAGS: ${RUSTFLAGS}"
+            echo "==========================================================="
+            
+            # Verify OpenSSL installation
+            if [ -n "${OPENSSL_INCLUDE_DIR}" ] && [ -d "${OPENSSL_INCLUDE_DIR}" ]; then
+              echo "OpenSSL headers found:"
+              ls -la "${OPENSSL_INCLUDE_DIR}/openssl/" 2>/dev/null | head -5 || echo "No OpenSSL headers in ${OPENSSL_INCLUDE_DIR}"
             fi
+            
+            if [ -n "${OPENSSL_LIB_DIR}" ] && [ -d "${OPENSSL_LIB_DIR}" ]; then
+              echo "OpenSSL libraries found:"
+              ls -la "${OPENSSL_LIB_DIR}"/*ssl* 2>/dev/null | head -5 || echo "No OpenSSL libraries in ${OPENSSL_LIB_DIR}"
+            fi
+            
+            # Final check
+            echo "Build environment configured successfully!"
 
       - run: ${{ (matrix.os == 'windows' && 'dir') || 'ls -lh' }} dist/
 
