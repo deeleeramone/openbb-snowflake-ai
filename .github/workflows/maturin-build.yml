@@ -43,6 +43,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Remove committed artifacts (POSIX)
+        if: runner.os != 'Windows'
+        run: |
+          rm -rf wheelhouse dist release-archives || true
+
+      - name: Remove committed artifacts (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $paths = @("wheelhouse","dist","release-archives")
+          foreach ($p in $paths) {
+            if (Test-Path $p) {
+              Remove-Item -Recurse -Force $p
+            }
+          }
+
       - name: set up python
         uses: actions/setup-python@v5
         with:
@@ -375,6 +391,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
+      - name: Remove committed artifacts (POSIX)
+        if: runner.os != 'Windows'
+        run: |
+          rm -rf wheelhouse dist release-archives || true
+
+      - name: Remove committed artifacts (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $paths = @("wheelhouse","dist","release-archives")
+          foreach ($p in $paths) {
+            if (Test-Path $p) {
+              Remove-Item -Recurse -Force $p
+            }
+          }
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
