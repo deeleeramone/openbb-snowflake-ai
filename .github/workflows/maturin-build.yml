@@ -83,8 +83,8 @@ jobs:
         if: matrix.os == 'linux'
         run: |
           if command -v apt-get > /dev/null; then
-            apt-get update
-            apt-get install -y libssl-dev
+            sudo apt-get update
+            sudo apt-get install -y libssl-dev
           elif command -v yum > /dev/null; then
             yum install -y openssl-devel openssl-static
           fi
@@ -188,8 +188,8 @@ jobs:
               yum install -y sqlcipher-devel || echo "sqlcipher-devel not found in yum"
             elif command -v apt-get > /dev/null; then
               # Debian/Ubuntu
-              apt-get update
-              apt-get install -y pkg-config build-essential git tcl libsqlcipher-dev libssl-dev
+              sudo apt-get update
+              sudo apt-get install -y pkg-config build-essential git tcl libsqlcipher-dev libssl-dev
               export OPENSSL_DIR=/usr
               export OPENSSL_STATIC=1
             fi
