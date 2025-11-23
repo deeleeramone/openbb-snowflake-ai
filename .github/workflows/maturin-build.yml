@@ -149,7 +149,7 @@ jobs:
             elif command -v yum > /dev/null; then
               # CentOS/RHEL (manylinux2014)
               yum install -y epel-release || true
-              yum install -y pkgconfig perl-core make gcc git tcl || true
+              yum install -y pkgconfig perl-core make gcc git tcl curl autoconf automake libtool || true
               
               # For cross-compilation targets, install the appropriate OpenSSL
               if [ "${TARGET}" = "aarch64" ] || [ "${TARGET}" = "aarch64-unknown-linux-gnu" ]; then
@@ -186,6 +186,26 @@ jobs:
               
               # Try to install sqlcipher-devel but don't fail if it's not available
               yum install -y sqlcipher-devel || echo "sqlcipher-devel not found in yum"
+              if pkg-config --exists sqlcipher; then
+                export SQLCIPHER_LIB_DIR=/usr/lib64
+                export SQLCIPHER_INCLUDE_DIR=/usr/include
+              else
+                SQLCIPHER_VERSION=4.5.6
+                SQLCIPHER_PREFIX=/opt/sqlcipher-${TARGET:-host}
+                SQLCIPHER_BUILD_DIR=$(mktemp -d)
+                curl -fsSL "https://github.com/sqlcipher/sqlcipher/archive/refs/tags/v${SQLCIPHER_VERSION}.tar.gz" | tar -xz -C "${SQLCIPHER_BUILD_DIR}"
+                ORIG_DIR=$(pwd)
+                cd "${SQLCIPHER_BUILD_DIR}/sqlcipher-${SQLCIPHER_VERSION}"
+                ./configure --prefix="${SQLCIPHER_PREFIX}" --enable-tempstore=yes --disable-tcl --with-crypto-lib=openssl
+                make -j"$(nproc)"
+                make install
+                cd "${ORIG_DIR}"
+                rm -rf "${SQLCIPHER_BUILD_DIR}"
+                export PKG_CONFIG_PATH="${SQLCIPHER_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH}"
+                export SQLCIPHER_LIB_DIR="${SQLCIPHER_PREFIX}/lib"
+                export SQLCIPHER_INCLUDE_DIR="${SQLCIPHER_PREFIX}/include"
+              fi
+              export LD_LIBRARY_PATH="${SQLCIPHER_LIB_DIR}:${LD_LIBRARY_PATH}"
             elif command -v apt-get > /dev/null; then
               case "${TARGET}" in
                 aarch64|aarch64-unknown-linux-gnu)
@@ -215,15 +235,21 @@ jobs:
 
               if [ -n "${CROSS_ARCH}" ]; then
                 sudo dpkg --add-architecture "${CROSS_ARCH}" || true
+                sudo tee "/etc/apt/sources.list.d/${CROSS_ARCH}.list" >/dev/null <<EOF
+                deb [arch=${CROSS_ARCH}] http://ports.ubuntu.com/ubuntu-ports jammy main restricted universe multiverse
+                deb [arch=${CROSS_ARCH}] http://ports.ubuntu.com/ubuntu-ports jammy-updates main restricted universe multiverse
+                deb [arch=${CROSS_ARCH}] http://ports.ubuntu.com/ubuntu-ports jammy-security main restricted universe multiverse
+                deb [arch=${CROSS_ARCH}] http://ports.ubuntu.com/ubuntu-ports jammy-backports main restricted universe multiverse
+                EOF
               fi
-
               sudo apt-get update
-              sudo apt-get install -y pkg-config build-essential dpkg-dev git tcl libsqlcipher-dev libssl-dev
-
+              sudo apt-get install -y pkg-config build-essential dpkg-dev git tcl curl libsqlcipher-dev libssl-dev
               if [ -n "${CROSS_ARCH}" ]; then
-                sudo apt-get install -y "libssl-dev:${CROSS_ARCH}"
+                sudo apt-get install -y "libssl-dev:${CROSS_ARCH}" "libsqlcipher-dev:${CROSS_ARCH}"
                 export OPENSSL_LIB_DIR="${CROSS_LIB_DIR}"
                 export OPENSSL_INCLUDE_DIR="${CROSS_INCLUDE_DIR}"
+                export SQLCIPHER_LIB_DIR="${CROSS_LIB_DIR}"
+                export SQLCIPHER_INCLUDE_DIR="${CROSS_INCLUDE_DIR}"
                 case "${TARGET}" in
                   aarch64|aarch64-unknown-linux-gnu)
                     export AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_DIR=/usr
@@ -240,8 +266,13 @@ jobs:
                 HOST_MULTIARCH="$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || echo x86_64-linux-gnu)"
                 export OPENSSL_LIB_DIR="/usr/lib/${HOST_MULTIARCH}"
                 export OPENSSL_INCLUDE_DIR="/usr/include/${HOST_MULTIARCH}"
+                export SQLCIPHER_LIB_DIR="/usr/lib/${HOST_MULTIARCH}"
+                export SQLCIPHER_INCLUDE_DIR="/usr/include/${HOST_MULTIARCH}"
               fi
-
+              if [ -d "${SQLCIPHER_LIB_DIR}/pkgconfig" ]; then
+                export PKG_CONFIG_PATH="${SQLCIPHER_LIB_DIR}/pkgconfig:${PKG_CONFIG_PATH}"
+              fi
+              export LD_LIBRARY_PATH="${SQLCIPHER_LIB_DIR}:${LD_LIBRARY_PATH}"
               export OPENSSL_DIR=/usr
               export OPENSSL_STATIC=1
             fi
