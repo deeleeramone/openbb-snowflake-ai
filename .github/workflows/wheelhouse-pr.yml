@@ -257,7 +257,6 @@ jobs:
 
           # wheelhouse is already in the repository workspace root (moved earlier)
           echo "Using wheelhouse directory present in workspace for commit."
-          
 
           echo "Add files (LFS will handle large files)"
           git add -A wheelhouse
@@ -269,9 +268,16 @@ jobs:
             git commit -m "${COMMIT_MSG}"
           fi
 
-          echo "Push branch to origin"
+          echo "Push branch to origin (try safe --force-with-lease first)"
           git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          git push --force-with-lease origin build:refs/heads/build
+
+          if git push --force-with-lease origin build:refs/heads/build; then
+            echo "Pushed with --force-with-lease"
+          else
+            echo "Warning: --force-with-lease failed (stale remote). Falling back to --force push."
+            git fetch origin build || true
+            git push --force origin build:refs/heads/build
+          fi
       - name: Create or update Pull Request (build → develop)
         id: create_or_update_pr
         env:
@@ -313,13 +319,17 @@ jobs:
       - name: Add PR comment with instructions
         if: ${{ env.PR_CREATED || env.PR_UPDATED || always() }}
         run: |
+          set -euo pipefail
           # prefer PR number from env (created or updated)
           PR_NUM="${PR_CREATED:-${PR_UPDATED:-}}"
+
           if [ -z "$PR_NUM" ]; then
-            # fetch PR number if needed
-            PR_NUM=$(curl -s -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${GITHUB_REPOSITORY}/pulls?head=${GITHUB_REPOSITORY%/*}:build&base=develop&state=open" | jq -r '.[0].number // empty')
+            # fetch PR number robustly (handle array/object responses)
+            resp=$(curl -s -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/pulls?head=${GITHUB_REPOSITORY%/*}:build&base=develop&state=open")
+            PR_NUM=$(echo "$resp" | jq -r 'if type=="array" then (.[0]?.number // "") else (.number // "") end')
           fi
+
           if [ -z "$PR_NUM" ]; then
             echo "No PR found to comment on." >&2
             exit 0
@@ -345,6 +355,6 @@ jobs:
           EOF
           )"
 
-                    curl -s -X POST -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json" \
-                      -d "$(jq -n --arg body "$COMMENT_BODY" '{body:$body}')" \
-                      "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues/${PR_NUM}/comments"
+          curl -s -X POST -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json" \
+            -d "$(jq -n --arg body "$COMMENT_BODY" '{body:$body}')" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues/${PR_NUM}/comments"
