@@ -10,6 +10,7 @@ permissions:
 jobs:
   build:
     name: build on ${{ matrix.os }} (${{ matrix.target }} - ${{ matrix.interpreter || 'all' }})
+    runs-on: ${{ (matrix.os == 'macos' && matrix.target == 'x86_64' && 'macos-15-intel') || (matrix.os == 'macos' && matrix.target == 'aarch64' && 'macos-latest') || (matrix.os == 'windows' && matrix.target == 'aarch64' && 'windows-11-arm') || format('{0}-latest', (matrix.os == 'linux' && 'ubuntu') || matrix.os) }}
     strategy:
       fail-fast: false
       matrix:
@@ -26,11 +27,9 @@ jobs:
           - os: macos
             target: x86_64
             interpreter: 3.10 3.11 3.12 3.13
-            runs-on: macos-13  # Use Intel runner for x86_64
           - os: macos
             target: aarch64
             interpreter: 3.10 3.11 3.12 3.13
-            runs-on: macos-latest  # Use ARM64 runner for aarch64
 
           # Windows builds
           - os: windows
@@ -38,10 +37,8 @@ jobs:
             interpreter: 3.10 3.11 3.12 3.13 
           - os: windows
             target: aarch64
-            runs-on: windows-11-arm
             interpreter: 3.11 3.12 3.13
 
-    runs-on: ${{ matrix.runs-on || format('{0}-latest', (matrix.os == 'linux' && 'ubuntu') || matrix.os) }}
     steps:
       - uses: actions/checkout@v4
 
@@ -97,8 +94,8 @@ jobs:
         run: |
           # Determine architecture
           $arch = if ("${{ matrix.target }}" -eq "aarch64") { "arm64" } else { "x64" }
-          # Use dynamic libraries so delvewheel can bundle them
-          $vcpkgTriplet = "${arch}-windows"
+          # Use DYNAMIC libraries - vcpkg defaults to static, we need to specify dynamic
+          $vcpkgTriplet = "${arch}-windows-dynamic"
           
           # Check if vcpkg exists and clean it if needed
           if (Test-Path "C:\vcpkg") {
@@ -111,8 +108,8 @@ jobs:
           .\bootstrap-vcpkg.bat
           .\vcpkg integrate install
           
-          # Install OpenSSL and SQLite3 for the correct architecture
-          Write-Host "Installing packages for $vcpkgTriplet"
+          # Install OpenSSL and SQLite3 as DYNAMIC libraries
+          Write-Host "Installing DYNAMIC packages for $vcpkgTriplet"
           .\vcpkg install "openssl:$vcpkgTriplet" "sqlite3:$vcpkgTriplet"
           
           # Set environment variables for the correct architecture
@@ -124,19 +121,28 @@ jobs:
           echo "SQLCIPHER_LIB_DIR=$installPath\lib" >> $env:GITHUB_ENV
           echo "SQLCIPHER_INCLUDE_DIR=$installPath\include" >> $env:GITHUB_ENV
           echo "SQLITE3_LIB_DIR=$installPath\lib" >> $env:GITHUB_ENV
-          # For dynamic linking, remove the explicit .lib references and static flag
+          # Force dynamic linking
           echo "RUSTFLAGS=-L $installPath\lib" >> $env:GITHUB_ENV
-          # Don't set OPENSSL_STATIC
+          # Explicitly tell OpenSSL to NOT use static linking
+          echo "OPENSSL_STATIC=0" >> $env:GITHUB_ENV
           
           # For ARM64, we need to use the bundled SQLite since cross-compilation is complex
           if ("${{ matrix.target }}" -eq "aarch64") {
             echo "LIBSQLITE3_SYS_USE_BUNDLED=1" >> $env:GITHUB_ENV
             Write-Host "Using bundled SQLite for ARM64"
           } else {
-            echo "LIBSQLITE3_SYS_USE_PKG_CONFIG=1" >> $env:GITHUB_ENV
+            echo "LIBSQLITE3_SYS_USE_PKG_CONFIG=0" >> $env:GITHUB_ENV
           }
           
-          # Verify the libraries exist
+          # Verify the libraries AND DLLs exist
+          Write-Host "=== Checking bin directory for DLLs ==="
+          if (Test-Path "$installPath\bin") {
+            Write-Host "Bin directory found. DLL Contents:"
+            Get-ChildItem "$installPath\bin\*.dll" | Select-Object Name
+          } else {
+            Write-Host "WARNING: Bin directory not found - no DLLs to bundle!"
+          }
+          
           if (Test-Path "$installPath\lib") {
             Write-Host "Library directory found. Contents:"
             Get-ChildItem "$installPath\lib" | Select-Object Name
@@ -157,9 +163,9 @@ jobs:
             Write-Host "sqlcipher.lib already present"
           }
 
-          # Export LIB so MSVC link.exe can find vcpkg libs
+          # Export LIB and PATH so MSVC link.exe can find vcpkg libs and DLLs
           echo "LIB=$installPath\lib" >> $env:GITHUB_ENV
-          
+          echo "PATH=$installPath\bin;$env:PATH" >> $env:GITHUB_ENV
       - run: pip install -U ruff typing_extensions setuptools delocate delvewheel
 
       - name: Install Rust
@@ -433,22 +439,23 @@ jobs:
         run: |
           # Determine architecture paths
           $arch = if ("${{ matrix.target }}" -eq "aarch64") { "arm64" } else { "x64" }
-          # Use dynamic libraries
-          $vcpkgTriplet = "${arch}-windows"
+          # Use DYNAMIC libraries
+          $vcpkgTriplet = "${arch}-windows-dynamic"
           $installPath = "C:\vcpkg\installed\$vcpkgTriplet"
           
-          # Set environment variables for the build (ensure linker finds OpenSSL and sqlcipher)
+          # Set environment variables for the build
           $env:OPENSSL_DIR = $installPath
           $env:OPENSSL_LIB_DIR = "$installPath\lib"
           $env:OPENSSL_INCLUDE_DIR = "$installPath\include"
           $env:SQLCIPHER_LIB_DIR = "$installPath\lib"
           $env:SQLCIPHER_INCLUDE_DIR = "$installPath\include"
           $env:SQLITE3_LIB_DIR = "$installPath\lib"
-          # For dynamic linking
+          # Force dynamic linking
           $env:RUSTFLAGS = "-L $installPath\lib"
-          # also set LIB so link.exe will search the directory
           $env:LIB = "$installPath\lib;$env:LIB"
-          # Don't set OPENSSL_STATIC
+          $env:PATH = "$installPath\bin;$env:PATH"
+          # Explicitly disable static linking
+          $env:OPENSSL_STATIC = "0"
           
           # Confirm sqlcipher.lib exists (helpful debug)
           if (Test-Path "$installPath\lib\sqlcipher.lib") {
@@ -479,12 +486,25 @@ jobs:
             maturin build @args
           }
           
-          # Bundle dependent DLLs so end users do not need vcpkg-installed libraries.
+          # Bundle dependent DLLs so end users do not need vcpkg-installed libraries
+          Write-Host "=== Starting delvewheel repair to bundle DLLs ==="
           $bundleDir = Join-Path $PWD "target\delvewheel-wheelhouse"
           New-Item -ItemType Directory -Force -Path $bundleDir | Out-Null
+          
+          # Debug: Show what DLLs are available to bundle
+          Write-Host "DLLs available in $installPath\bin:"
+          Get-ChildItem "$installPath\bin\*.dll" | ForEach-Object { Write-Host "  - $($_.Name)" }
+          
           Get-ChildItem -Path target -Recurse -Filter *.whl | ForEach-Object {
+            Write-Host "Repairing wheel: $($_.Name)"
+            # Use --add-path to tell delvewheel where to find the DLLs
             python -m delvewheel repair --add-path "$installPath\bin" -w $bundleDir $_.FullName
-            Remove-Item $_.FullName
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host "Successfully repaired: $($_.Name)"
+              Remove-Item $_.FullName
+            } else {
+              Write-Host "WARNING: Failed to repair: $($_.Name)"
+            }
           }
           
           # Move all wheels to dist directory
