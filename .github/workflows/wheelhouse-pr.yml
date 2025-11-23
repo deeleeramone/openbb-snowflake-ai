@@ -233,8 +233,8 @@ jobs:
           echo "Setting up remote..."
           git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           
-          echo "Fetching latest main branch..."
-          git fetch origin main --depth=1
+          echo "Fetching all branches..."
+          git fetch origin
           
           echo "Creating fresh build branch from main..."
           git checkout -B build origin/main
@@ -273,12 +273,8 @@ jobs:
             git commit -m "${COMMIT_MSG}"
           fi
 
-          echo "Force pushing branch to origin (deleting remote first to avoid conflicts)..."
-          # Delete the remote branch first if it exists (ignore errors if it doesn't)
-          git push origin --delete build 2>/dev/null || true
-          
-          # Now push the fresh branch
-          git push origin build:refs/heads/build
+          echo "Force pushing branch to origin..."
+          git push --force origin build
           echo "Successfully pushed wheelhouse files to build branch!"
 
       - name: Create or update Pull Request (build → develop)
