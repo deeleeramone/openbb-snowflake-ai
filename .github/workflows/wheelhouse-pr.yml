@@ -187,9 +187,9 @@ jobs:
           echo "Saving wheelhouse to temp location..."
           cp -r wheelhouse /tmp/wheelhouse-save
           
-          # Verify the files are actually there
-          echo "Contents of /tmp/wheelhouse-save:"
-          ls -la /tmp/wheelhouse-save/ | head -20
+          # Verify the files are actually there and are real wheel files
+          echo "Contents of /tmp/wheelhouse-save (showing file sizes):"
+          ls -lh /tmp/wheelhouse-save/*.whl 2>/dev/null | head -10
           
           # Clean up wheelhouse from working directory to avoid checkout conflicts
           rm -rf wheelhouse
@@ -200,26 +200,31 @@ jobs:
           echo "Switching to build branch..."
           git checkout -B build origin/develop
           
-          # Remove ALL existing wheelhouse content with git rm
-          if [ -d "wheelhouse" ]; then
-            echo "Removing existing wheelhouse directory from git..."
-            git rm -rf wheelhouse/ || true
-          fi
+          # Remove OLD wheel and sha files ONLY (keep .gitignore and .gitkeep)
+          echo "Removing old wheel and sha files from git..."
+          git rm -f wheelhouse/*.whl 2>/dev/null || true
+          git rm -f wheelhouse/*.whl.sha256 2>/dev/null || true
+          git rm -f wheelhouse/*.tar.gz 2>/dev/null || true
+          git rm -f wheelhouse/*.tar.gz.sha256 2>/dev/null || true
+          git rm -f wheelhouse/CHECKSUMS.sha256 2>/dev/null || true
           
-          # Create fresh wheelhouse directory
-          mkdir -p wheelhouse
+          # Copy the NEW wheel files
+          echo "Copying NEW wheelhouse files..."
+          cp /tmp/wheelhouse-save/*.whl wheelhouse/ 2>/dev/null || true
+          cp /tmp/wheelhouse-save/*.sha256 wheelhouse/ 2>/dev/null || true
+          cp /tmp/wheelhouse-save/*.tar.gz wheelhouse/ 2>/dev/null || true
+          cp /tmp/wheelhouse-save/CHECKSUMS.sha256 wheelhouse/ 2>/dev/null || true
           
-          # Copy new wheelhouse files
-          echo "Copying new wheelhouse files..."
-          cp -r /tmp/wheelhouse-save/* wheelhouse/
+          # Verify the files are actual wheel files (should be MB in size, not bytes)
+          echo "Verifying wheelhouse contents are real files:"
+          ls -lh wheelhouse/*.whl 2>/dev/null | head -10
           
-          # Verify files are in wheelhouse
-          echo "Files in wheelhouse directory:"
-          ls -la wheelhouse/ | head -20
-          
-          echo "Force adding wheelhouse directory and all its contents..."
-          # Force add the entire directory, bypassing .gitignore
-          git add -f wheelhouse/
+          echo "Force adding NEW wheelhouse files..."
+          # Add all NEW wheel/sha files
+          git add -f wheelhouse/*.whl
+          git add -f wheelhouse/*.sha256
+          git add -f wheelhouse/*.tar.gz
+          git add -f wheelhouse/CHECKSUMS.sha256
           
           COMMIT_MSG="chore: update wheelhouse artifacts for run ${RUN_ID}"
           
@@ -230,40 +235,27 @@ jobs:
           
           if [ "$STAGED_COUNT" -gt 0 ]; then
             echo "Staged files:"
-            git diff --cached --name-only | head -20
+            git diff --cached --name-only
+            echo ""
+            echo "File size changes:"
+            git diff --cached --stat
           fi
           
           if [ "$STAGED_COUNT" -eq 0 ]; then
-            echo "WARNING: No changes detected. Files might be identical to what's already in the branch."
-            echo "Checking if files exist in working directory..."
-            ls -la wheelhouse/*.whl 2>/dev/null | head -5 || echo "No .whl files found"
-            
-            echo "Checking git status..."
-            git status
-            
-            # Force a change by updating CHECKSUMS file with timestamp
-            echo "# Updated: $(date -u)" >> wheelhouse/CHECKSUMS.sha256
-            git add -f wheelhouse/CHECKSUMS.sha256
-            
-            STAGED_COUNT=$(git diff --cached --name-only | wc -l)
-            echo "After updating CHECKSUMS, staged files: $STAGED_COUNT"
+            echo "ERROR: No files were staged! Something is wrong."
+            exit 1
           fi
           
-          if git diff --cached --quiet; then
-            echo "No changes to commit - files are identical to what's already in the branch"
-            echo "Skipping commit and push"
-          else
-            echo "Committing $STAGED_COUNT files..."
-            git commit -m "${COMMIT_MSG}"
-            
-            # Show what was committed
-            echo "Committed files:"
-            git show --stat --name-only | head -50
-            
-            echo "Force pushing to build branch..."
-            git push --force origin build
-            echo "Successfully pushed wheelhouse files!"
-          fi
+          echo "Committing $STAGED_COUNT files..."
+          git commit -m "${COMMIT_MSG}"
+          
+          # Show what was committed
+          echo "Committed changes:"
+          git show --stat
+          
+          echo "Force pushing to build branch..."
+          git push --force origin build
+          echo "Successfully pushed REAL wheelhouse files!"
 
       - name: Create or update Pull Request (build → develop)
         id: create_or_update_pr
