@@ -221,10 +221,7 @@ jobs:
           
           echo "Force adding NEW wheelhouse files..."
           # Add all NEW wheel/sha files
-          git add -f wheelhouse/*.whl
-          git add -f wheelhouse/*.sha256
-          git add -f wheelhouse/*.tar.gz
-          git add -f wheelhouse/CHECKSUMS.sha256
+          git add -f wheelhouse/*
           
           COMMIT_MSG="chore: update wheelhouse artifacts for run ${RUN_ID}"
           
