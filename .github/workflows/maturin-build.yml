@@ -143,18 +143,39 @@ jobs:
             fi
 
             # Build SQLCipher from source
-            # Detect cross-compiler based on TARGET env var
+            # Detect cross-compiler based on TARGET env var or existing CC
             HOST_ARG=""
-            if [[ "$TARGET" == "aarch64-unknown-linux-musl" ]]; then
-               if command -v aarch64-unknown-linux-musl-gcc > /dev/null; then
-                 export CC=aarch64-unknown-linux-musl-gcc
-                 HOST_ARG="--host=aarch64-unknown-linux-musl"
-               fi
-            elif [[ "$TARGET" == "armv7-unknown-linux-musleabihf" ]]; then
-               if command -v armv7-unknown-linux-musleabihf-gcc > /dev/null; then
-                 export CC=armv7-unknown-linux-musleabihf-gcc
-                 HOST_ARG="--host=arm-unknown-linux-musleabihf"
-               fi
+            
+            if [[ "$TARGET" == *"aarch64"* ]]; then
+                if command -v aarch64-unknown-linux-gnu-gcc >/dev/null; then
+                    export CC=aarch64-unknown-linux-gnu-gcc
+                    export AR=aarch64-unknown-linux-gnu-ar
+                    export RANLIB=aarch64-unknown-linux-gnu-ranlib
+                    HOST_ARG="--host=aarch64-unknown-linux-gnu"
+                elif command -v aarch64-unknown-linux-musl-gcc >/dev/null; then
+                    export CC=aarch64-unknown-linux-musl-gcc
+                    export AR=aarch64-unknown-linux-musl-ar
+                    export RANLIB=aarch64-unknown-linux-musl-ranlib
+                    HOST_ARG="--host=aarch64-unknown-linux-musl"
+                fi
+            elif [[ "$TARGET" == *"armv7"* ]]; then
+                if command -v armv7-unknown-linux-gnueabihf-gcc >/dev/null; then
+                    export CC=armv7-unknown-linux-gnueabihf-gcc
+                    export AR=armv7-unknown-linux-gnueabihf-ar
+                    export RANLIB=armv7-unknown-linux-gnueabihf-ranlib
+                    HOST_ARG="--host=armv7-unknown-linux-gnueabihf"
+                elif command -v armv7-unknown-linux-musleabihf-gcc >/dev>null; then
+                    export CC=armv7-unknown-linux-musleabihf-gcc
+                    export AR=armv7-unknown-linux-musleabihf-ar
+                    export RANLIB=armv7-unknown-linux-musleabihf-ranlib
+                    HOST_ARG="--host=armv7-unknown-linux-musleabihf"
+                fi
+            fi
+            
+            # Fallback: if CC is set in env (by cross image) and we haven't set HOST_ARG yet
+            if [ -z "$HOST_ARG" ] && [ -n "$CC" ] && [ "$CC" != "gcc" ]; then
+                HOST_TRIPLE="${CC%-gcc}"
+                HOST_ARG="--host=$HOST_TRIPLE"
             fi
             
             curl -L https://github.com/sqlcipher/sqlcipher/archive/v4.6.0.tar.gz -o sqlcipher.tar.gz
