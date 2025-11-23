@@ -124,6 +124,33 @@ jobs:
             -e OPENSSL_DIR=/usr
             -e OPENSSL_LIB_DIR=/usr/lib
             -e OPENSSL_INCLUDE_DIR=/usr/include
+            -e AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_DIR=/usr
+            -e AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_LIB_DIR=/usr/lib
+            -e AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_INCLUDE_DIR=/usr/include
+            -e AARCH64_UNKNOWN_LINUX_MUSL_OPENSSL_DIR=/usr
+            -e AARCH64_UNKNOWN_LINUX_MUSL_OPENSSL_LIB_DIR=/usr/lib
+            -e AARCH64_UNKNOWN_LINUX_MUSL_OPENSSL_INCLUDE_DIR=/usr/include
+            -e ARMV7_UNKNOWN_LINUX_GNUEABIHF_OPENSSL_DIR=/usr
+            -e ARMV7_UNKNOWN_LINUX_GNUEABIHF_OPENSSL_LIB_DIR=/usr/lib
+            -e ARMV7_UNKNOWN_LINUX_GNUEABIHF_OPENSSL_INCLUDE_DIR=/usr/include
+            -e ARMV7_UNKNOWN_LINUX_MUSLEABIHF_OPENSSL_DIR=/usr
+            -e ARMV7_UNKNOWN_LINUX_MUSLEABIHF_OPENSSL_LIB_DIR=/usr/lib
+            -e ARMV7_UNKNOWN_LINUX_MUSLEABIHF_OPENSSL_INCLUDE_DIR=/usr/include
+            -e S390X_UNKNOWN_LINUX_GNU_OPENSSL_DIR=/usr
+            -e S390X_UNKNOWN_LINUX_GNU_OPENSSL_LIB_DIR=/usr/lib
+            -e S390X_UNKNOWN_LINUX_GNU_OPENSSL_INCLUDE_DIR=/usr/include
+            -e PPC64LE_UNKNOWN_LINUX_GNU_OPENSSL_DIR=/usr
+            -e PPC64LE_UNKNOWN_LINUX_GNU_OPENSSL_LIB_DIR=/usr/lib
+            -e PPC64LE_UNKNOWN_LINUX_GNU_OPENSSL_INCLUDE_DIR=/usr/include
+            -e I686_UNKNOWN_LINUX_GNU_OPENSSL_DIR=/usr
+            -e I686_UNKNOWN_LINUX_GNU_OPENSSL_LIB_DIR=/usr/lib
+            -e I686_UNKNOWN_LINUX_GNU_OPENSSL_INCLUDE_DIR=/usr/include
+            -e X86_64_UNKNOWN_LINUX_GNU_OPENSSL_DIR=/usr
+            -e X86_64_UNKNOWN_LINUX_GNU_OPENSSL_LIB_DIR=/usr/lib
+            -e X86_64_UNKNOWN_LINUX_GNU_OPENSSL_INCLUDE_DIR=/usr/include
+            -e X86_64_UNKNOWN_LINUX_MUSL_OPENSSL_DIR=/usr
+            -e X86_64_UNKNOWN_LINUX_MUSL_OPENSSL_LIB_DIR=/usr/lib
+            -e X86_64_UNKNOWN_LINUX_MUSL_OPENSSL_INCLUDE_DIR=/usr/include
           before-script-linux: |
             set -e
             set -x
