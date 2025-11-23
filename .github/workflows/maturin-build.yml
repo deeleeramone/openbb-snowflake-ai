@@ -3,6 +3,10 @@ name: Build wheels
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+  actions: write
+
 jobs:
   build:
     name: build on ${{ matrix.os }} (${{ matrix.target }} - ${{ matrix.interpreter || 'all' }})
@@ -10,21 +14,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux builds - simplified, no manylinux
-          - os: linux
-            target: x86_64
-            interpreter: 3.10 3.11 3.12 3.13
+          # Linux builds - modern architectures only
           - os: linux
             target: amd64
             interpreter: 3.10 3.11 3.12 3.13
           - os: linux
             target: aarch64
             interpreter: 3.10 3.11 3.12 3.13
-          - os: linux
-            target: armv7
-            interpreter: 3.10 3.11 3.12 3.13
 
-          # macOS builds - UNCHANGED
+          # macOS builds
           - os: macos
             target: x86_64
             interpreter: 3.10 3.11 3.12 3.13
@@ -32,7 +30,7 @@ jobs:
             target: aarch64
             interpreter: 3.10 3.11 3.12 3.13
 
-          # Windows builds - UNCHANGED
+          # Windows builds
           - os: windows
             target: x86_64
             interpreter: 3.10 3.11 3.12 3.13 
@@ -140,7 +138,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
-          targets: ${{ matrix.os == 'linux' && (matrix.target == 'aarch64' && 'aarch64-unknown-linux-gnu' || matrix.target == 'armv7' && 'armv7-unknown-linux-gnueabihf' || 'x86_64-unknown-linux-gnu') || matrix.os == 'macos' && (matrix.target == 'x86_64' && 'x86_64-apple-darwin' || 'aarch64-apple-darwin') || matrix.os == 'windows' && (matrix.target == 'aarch64' && 'aarch64-pc-windows-msvc' || 'x86_64-pc-windows-msvc') }}
+          targets: ${{ matrix.os == 'linux' && (matrix.target == 'aarch64' && 'aarch64-unknown-linux-gnu' || 'x86_64-unknown-linux-gnu') || matrix.os == 'macos' && (matrix.target == 'x86_64' && 'x86_64-apple-darwin' || 'aarch64-apple-darwin') || matrix.os == 'windows' && (matrix.target == 'aarch64' && 'aarch64-pc-windows-msvc' || 'x86_64-pc-windows-msvc') }}
 
       - name: Install maturin
         run: pip install maturin
@@ -193,29 +191,15 @@ jobs:
               OPENSSL_STATIC=1 maturin build --release --interpreter ${py}
             done
           else
-            # Cross-compilation for ARM targets
-            case "${{ matrix.target }}" in
-              aarch64)
-                sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross
-                export CC=aarch64-linux-gnu-gcc
-                export CXX=aarch64-linux-gnu-g++
-                export AR=aarch64-linux-gnu-ar
-                export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
-                RUST_TARGET="aarch64-unknown-linux-gnu"
-                OPENSSL_TARGET="linux-aarch64"
-                HOST_FLAG="--host=aarch64-linux-gnu"
-                ;;
-              armv7)
-                sudo apt-get install -y gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf libc6-dev-armhf-cross
-                export CC=arm-linux-gnueabihf-gcc
-                export CXX=arm-linux-gnueabihf-g++
-                export AR=arm-linux-gnueabihf-ar
-                export CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER=arm-linux-gnueabihf-gcc
-                RUST_TARGET="armv7-unknown-linux-gnueabihf"
-                OPENSSL_TARGET="linux-armv4"
-                HOST_FLAG="--host=arm-linux-gnueabihf"
-                ;;
-            esac
+            # Cross-compilation for aarch64
+            sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross
+            export CC=aarch64-linux-gnu-gcc
+            export CXX=aarch64-linux-gnu-g++
+            export AR=aarch64-linux-gnu-ar
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+            RUST_TARGET="aarch64-unknown-linux-gnu"
+            OPENSSL_TARGET="linux-aarch64"
+            HOST_FLAG="--host=aarch64-linux-gnu"
             
             # Build OpenSSL for cross target
             PREFIX=/tmp/deps-${{ matrix.target }}
@@ -268,27 +252,15 @@ jobs:
             export PKG_CONFIG_PATH="${PREFIX}/lib/pkgconfig"
             export PKG_CONFIG_ALLOW_CROSS=1
             
-            # Build wheels for ARM targets
+            # Build wheels for aarch64
             for py in ${{ matrix.interpreter }}; do
               echo "Building for Python ${py} on ${RUST_TARGET}"
               
-              # Set target-specific environment variables
-              case "${{ matrix.target }}" in
-                aarch64)
-                  AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_DIR="${PREFIX}" \
-                  AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_STATIC=1 \
-                  AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_LIB_DIR="${PREFIX}/lib" \
-                  AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_INCLUDE_DIR="${PREFIX}/include" \
-                  maturin build --release --target ${RUST_TARGET} --interpreter ${py}
-                  ;;
-                armv7)
-                  ARMV7_UNKNOWN_LINUX_GNUEABIHF_OPENSSL_DIR="${PREFIX}" \
-                  ARMV7_UNKNOWN_LINUX_GNUEABIHF_OPENSSL_STATIC=1 \
-                  ARMV7_UNKNOWN_LINUX_GNUEABIHF_OPENSSL_LIB_DIR="${PREFIX}/lib" \
-                  ARMV7_UNKNOWN_LINUX_GNUEABIHF_OPENSSL_INCLUDE_DIR="${PREFIX}/include" \
-                  maturin build --release --target ${RUST_TARGET} --interpreter ${py}
-                  ;;
-              esac
+              AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_DIR="${PREFIX}" \
+              AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_STATIC=1 \
+              AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_LIB_DIR="${PREFIX}/lib" \
+              AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_INCLUDE_DIR="${PREFIX}/include" \
+              maturin build --release --target ${RUST_TARGET} --interpreter ${py}
             done
           fi
           
