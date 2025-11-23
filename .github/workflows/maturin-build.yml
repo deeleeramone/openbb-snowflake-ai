@@ -210,6 +210,33 @@ jobs:
               export LIBRARY_PATH="${SQLCIPHER_LIB_DIR}:${LIBRARY_PATH}"
               export RUSTFLAGS="${RUSTFLAGS} -L${SQLCIPHER_LIB_DIR}"
             elif command -v apt-get > /dev/null; then
+              case "${TARGET}" in
+                aarch64|aarch64-unknown-linux-gnu)
+                  CROSS_ARCH=arm64
+                  CROSS_LIB_DIR=/usr/lib/aarch64-linux-gnu
+                  CROSS_INCLUDE_DIR=/usr/include/aarch64-linux-gnu
+                  ;;
+                armv7|armv7-unknown-linux-gnueabihf)
+                  CROSS_ARCH=armhf
+                  CROSS_LIB_DIR=/usr/lib/arm-linux-gnueabihf
+                  CROSS_INCLUDE_DIR=/usr/include/arm-linux-gnueabihf
+                  ;;
+                ppc64le|powerpc64le-unknown-linux-gnu)
+                  CROSS_ARCH=ppc64el
+                  CROSS_LIB_DIR=/usr/lib/powerpc64le-linux-gnu
+                  CROSS_INCLUDE_DIR=/usr/include/powerpc64le-linux-gnu
+                  ;;
+                s390x|s390x-unknown-linux-gnu)
+                  CROSS_ARCH=s390x
+                  CROSS_LIB_DIR=/usr/lib/s390x-linux-gnu
+                  CROSS_INCLUDE_DIR=/usr/include/s390x-linux-gnu
+                  ;;
+                *)
+                  CROSS_ARCH=""
+                  CROSS_LIB_DIR=""
+                  CROSS_INCLUDE_DIR=""
+                  ;;
+              esac
               export DEBIAN_FRONTEND=noninteractive
               export TZ=Etc/UTC
               sudo ln -fs "/usr/share/zoneinfo/${TZ}" /etc/localtime
