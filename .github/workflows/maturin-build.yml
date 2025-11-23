@@ -5,51 +5,23 @@ on:
 
 jobs:
   build:
-    name: build on ${{ matrix.os }} (${{ matrix.target }} - ${{ matrix.interpreter || 'all' }}${{ matrix.os == 'linux' && format(' - {0}', matrix.manylinux == 'auto' && 'manylinux' || matrix.manylinux) || '' }})
+    name: build on ${{ matrix.os }} (${{ matrix.target }} - ${{ matrix.interpreter || 'all' }})
     strategy:
       fail-fast: false
       matrix:
-        os: [linux, macos, windows]
-        target: [undefined]
-        manylinux: [auto]
         include:
-          # manylinux for various platforms
-          # x86_64 and aarch64 are PGO optimized below
+          # Linux builds - simplified, no manylinux
           - os: linux
-            manylinux: auto
-            target: i686
-          - os: linux
-            manylinux: auto
-            target: armv7
-            interpreter: 3.10 3.11 3.12 3.13 
-          - os: linux
-            manylinux: auto
-            target: ppc64le
-            interpreter: 3.10 3.11 3.12 3.13 
-          - os: linux
-            manylinux: auto
-            target: s390x
-            interpreter: 3.10 3.11 3.12 3.13 
-          - os: linux
-            manylinux: auto
             target: x86_64
             interpreter: 3.10 3.11 3.12 3.13
           - os: linux
-            manylinux: auto
             target: aarch64
             interpreter: 3.10 3.11 3.12 3.13
-
-          # musllinux
           - os: linux
-            manylinux: musllinux_1_1
-            target: x86_64
-          - os: linux
-            manylinux: musllinux_1_1
-            target: aarch64
-          - os: linux
-            manylinux: musllinux_1_1
             target: armv7
+            interpreter: 3.10 3.11 3.12 3.13
 
+          # macOS builds - UNCHANGED
           - os: macos
             target: x86_64
             interpreter: 3.10 3.11 3.12 3.13
@@ -57,6 +29,7 @@ jobs:
             target: aarch64
             interpreter: 3.10 3.11 3.12 3.13
 
+          # Windows builds - UNCHANGED
           - os: windows
             target: x86_64
             interpreter: 3.10 3.11 3.12 3.13 
@@ -64,10 +37,6 @@ jobs:
             target: aarch64
             runs-on: windows-11-arm
             interpreter: 3.11 3.12 3.13
-
-        exclude:
-          # was just a dummy variable to set a default value for target
-          - target: undefined
 
     runs-on: ${{ matrix.runs-on || format('{0}-latest', (matrix.os == 'linux' && 'ubuntu') || matrix.os) }}
     steps:
@@ -113,493 +82,173 @@ jobs:
         env:
           # Workaround for ring crate build failure on aarch64
           CFLAGS_aarch64_unknown_linux_gnu: "-D__ARM_ARCH=8"
-          CFLAGS_aarch64_unknown_linux_musl: "-D__ARM_ARCH=8"
           # Workaround for ring crate build failure on armv7
           CFLAGS_armv7_unknown_linux_gnueabihf: "-D__ARM_ARCH=7"
-          CFLAGS_armv7_unknown_linux_musleabihf: "-D__ARM_ARCH=7"
         with:
           target: ${{ matrix.target }}
-          manylinux: ${{ matrix.manylinux }}
           args: --release --out dist --interpreter ${{ matrix.interpreter || '3.10 3.11 3.12 3.13' }}
           rust-toolchain: stable
           docker-options: >-
             -e CI 
             -e TARGET=${{ matrix.target }}
             -e CFLAGS_aarch64_unknown_linux_gnu
-            -e CFLAGS_aarch64_unknown_linux_musl
             -e CFLAGS_armv7_unknown_linux_gnueabihf
-            -e CFLAGS_armv7_unknown_linux_musleabihf
           before-script-linux: |
             set -e
             set -x
             
             # Save original working directory
             ORIGINAL_DIR=$(pwd)
-            echo "Original directory: ${ORIGINAL_DIR}"
-            
-            echo "=================== DETECTING ENVIRONMENT ==================="
+            echo "=================== BUILD SETUP ==================="
             echo "TARGET=${TARGET}"
             echo "PWD=$(pwd)"
-            echo "USER=$(whoami)"
             
-            # Detect container type by checking for package managers and files
-            if [ -f /.dockerenv ]; then
-              echo "Running in Docker container"
+            # Install base build tools
+            if command -v apt-get > /dev/null; then
+              apt-get update
+              apt-get install -y build-essential pkg-config curl ca-certificates tcl autoconf automake libtool
+            elif command -v apk > /dev/null; then
+              apk update
+              apk add --no-cache build-base pkgconfig curl ca-certificates tcl autoconf automake libtool perl make
+            elif command -v yum > /dev/null; then
+              yum install -y gcc gcc-c++ make perl-core pkgconfig curl tcl autoconf automake libtool
             fi
             
-            # Check what package managers are available
-            HAS_APK=0
-            HAS_YUM=0
-            HAS_APT=0
-            HAS_DNF=0
+            # Set installation prefix
+            PREFIX=/opt/deps
+            mkdir -p "${PREFIX}"
             
-            command -v apk > /dev/null && HAS_APK=1 || true
-            command -v yum > /dev/null && HAS_YUM=1 || true
-            command -v apt-get > /dev/null && HAS_APT=1 || true
-            command -v dnf > /dev/null && HAS_DNF=1 || true
+            # Build OpenSSL
+            echo "=================== BUILDING OPENSSL ==================="
+            OPENSSL_VERSION=3.3.2
+            OPENSSL_BUILD_DIR=$(mktemp -d)
             
-            echo "Package managers: apk=$HAS_APK yum=$HAS_YUM apt=$HAS_APT dnf=$HAS_DNF"
+            curl -fsSL "https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz" | tar -xz -C "${OPENSSL_BUILD_DIR}"
+            cd "${OPENSSL_BUILD_DIR}/openssl-${OPENSSL_VERSION}"
             
-            # Check for musl
-            IS_MUSL=0
-            if ldd --version 2>&1 | grep -q musl; then
-              IS_MUSL=1
-              echo "Detected musl libc"
-            elif [ -f /lib/ld-musl-*.so.1 ] || [ -f /usr/local/musl/lib/libc.so ]; then
-              IS_MUSL=1
-              echo "Detected musl installation"
-            fi
-            
-            # Detect if target is musl
-            IS_MUSL_TARGET=0
+            # Configure OpenSSL based on target
             case "${TARGET}" in
-              *musl*)
-                IS_MUSL_TARGET=1
-                echo "Building for musl target: ${TARGET}"
+              x86_64)
+                OPENSSL_TARGET=linux-x86_64
+                ;;
+              aarch64)
+                OPENSSL_TARGET=linux-aarch64
+                ;;
+              armv7)
+                OPENSSL_TARGET=linux-armv4
+                ;;
+              *)
+                OPENSSL_TARGET=linux-x86_64
                 ;;
             esac
             
-            # Determine container type
-            CONTAINER_TYPE="unknown"
-            if [ "$HAS_APK" = "1" ]; then
-              CONTAINER_TYPE="alpine"
-            elif [ "$HAS_YUM" = "1" ] || [ "$HAS_DNF" = "1" ]; then
-              if [ -f /etc/centos-release ] || [ -f /etc/redhat-release ]; then
-                CONTAINER_TYPE="manylinux"
-              fi
-            elif [ "$HAS_APT" = "1" ]; then
-              if [ "$IS_MUSL_TARGET" = "1" ] && [ -d /usr/local/musl ]; then
-                CONTAINER_TYPE="rust-musl-cross"
-              else
-                CONTAINER_TYPE="debian"
-              fi
-            fi
+            ./Configure \
+              "${OPENSSL_TARGET}" \
+              --prefix="${PREFIX}" \
+              --openssldir="${PREFIX}/ssl" \
+              no-shared \
+              no-async \
+              -fPIC
             
-            echo "Container type: ${CONTAINER_TYPE}"
-            echo "==========================================================="
+            make -j"$(nproc)"
+            make install_sw
+            cd "${ORIGINAL_DIR}"
+            rm -rf "${OPENSSL_BUILD_DIR}"
             
-            # Handle each container type
-            case "${CONTAINER_TYPE}" in
-              alpine)
-                # =================== PURE ALPINE (NATIVE MUSL) ===================
-                echo "Setting up Alpine Linux environment"
-                
-                # Update repositories
-                echo "http://dl-cdn.alpinelinux.org/alpine/edge/main" >> /etc/apk/repositories
-                echo "http://dl-cdn.alpinelinux.org/alpine/edge/community" >> /etc/apk/repositories
-                apk update
-                
-                # Install dependencies
-                apk add --no-cache \
-                  build-base \
-                  musl-dev \
-                  openssl-dev \
-                  openssl-libs-static \
-                  pkgconfig \
-                  perl \
-                  make \
-                  git \
-                  curl \
-                  sqlcipher-dev \
-                  tcl
-                
-                # For Alpine, everything is in /usr
-                export OPENSSL_DIR=/usr
-                export OPENSSL_STATIC=1
-                export PKG_CONFIG_PATH=/usr/lib/pkgconfig
-                export PKG_CONFIG_ALLOW_CROSS=1
-                
-                # Set target-specific vars
-                case "${TARGET}" in
-                  x86_64-unknown-linux-musl|x86_64)
-                    export X86_64_UNKNOWN_LINUX_MUSL_OPENSSL_DIR=/usr
-                    ;;
-                  aarch64-unknown-linux-musl|aarch64)
-                    export AARCH64_UNKNOWN_LINUX_MUSL_OPENSSL_DIR=/usr
-                    ;;
-                  armv7-unknown-linux-musleabihf|armv7)
-                    export ARMV7_UNKNOWN_LINUX_MUSLEABIHF_OPENSSL_DIR=/usr
-                    ;;
-                esac
-                ;;
-                
-              rust-musl-cross)
-                # =================== RUST-MUSL-CROSS CONTAINER ===================
-                echo "Setting up rust-musl-cross environment for ${TARGET}"
-                
-                # Install build dependencies
-                apt-get update
-                apt-get install -y --no-install-recommends \
-                  build-essential \
-                  pkg-config \
-                  libssl-dev \
-                  curl \
-                  ca-certificates \
-                  tcl
-                
-                # The musl sysroot is at /usr/local/musl
-                MUSL_PREFIX=/usr/local/musl
-                
-                # Build OpenSSL for musl
-                echo "Building OpenSSL for musl at ${MUSL_PREFIX}"
-                
-                OPENSSL_VERSION=1.1.1w
-                OPENSSL_BUILD_DIR=$(mktemp -d)
-                
-                curl -fsSL "https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz" | tar -xz -C "${OPENSSL_BUILD_DIR}"
-                cd "${OPENSSL_BUILD_DIR}/openssl-${OPENSSL_VERSION}"
-                
-                # Configure based on target
-                case "${TARGET}" in
-                  x86_64-unknown-linux-musl|x86_64)
-                    OPENSSL_TARGET=linux-x86_64
-                    MUSL_CC=x86_64-linux-musl-gcc
-                    export X86_64_UNKNOWN_LINUX_MUSL_OPENSSL_DIR="${MUSL_PREFIX}"
-                    ;;
-                  aarch64-unknown-linux-musl|aarch64)
-                    OPENSSL_TARGET=linux-aarch64
-                    MUSL_CC=aarch64-linux-musl-gcc
-                    export AARCH64_UNKNOWN_LINUX_MUSL_OPENSSL_DIR="${MUSL_PREFIX}"
-                    ;;
-                  armv7-unknown-linux-musleabihf|armv7)
-                    OPENSSL_TARGET=linux-armv4
-                    MUSL_CC=arm-linux-musleabihf-gcc
-                    export ARMV7_UNKNOWN_LINUX_MUSLEABIHF_OPENSSL_DIR="${MUSL_PREFIX}"
-                    ;;
-                  *)
-                    echo "Unknown musl target: ${TARGET}"
-                    exit 1
-                    ;;
-                esac
-                
-                CC="${MUSL_CC}" \
-                ./Configure \
-                  "${OPENSSL_TARGET}" \
-                  --prefix="${MUSL_PREFIX}" \
-                  no-shared \
-                  no-async \
-                  -fPIC
-                
-                make -j"$(nproc)"
-                make install_sw
-                cd "${ORIGINAL_DIR}"  # Return to original directory
-                rm -rf "${OPENSSL_BUILD_DIR}"
-                
-                # Build SQLCipher for musl
-                echo "Building SQLCipher for musl"
-                SQLCIPHER_VERSION=4.5.6
-                SQLCIPHER_BUILD_DIR=$(mktemp -d)
-                
-                curl -fsSL "https://github.com/sqlcipher/sqlcipher/archive/refs/tags/v${SQLCIPHER_VERSION}.tar.gz" | tar -xz -C "${SQLCIPHER_BUILD_DIR}"
-                cd "${SQLCIPHER_BUILD_DIR}/sqlcipher-${SQLCIPHER_VERSION}"
-                
-                CC="${MUSL_CC}" \
-                CFLAGS="-I${MUSL_PREFIX}/include -DSQLITE_HAS_CODEC" \
-                LDFLAGS="-L${MUSL_PREFIX}/lib -static" \
-                LIBS="${MUSL_PREFIX}/lib/libcrypto.a -ldl -lpthread" \
-                ./configure \
-                  --prefix="${MUSL_PREFIX}" \
-                  --host="${TARGET%-unknown-linux-musl}" \
-                  --enable-tempstore=yes \
-                  --disable-tcl \
-                  --with-crypto-lib=openssl \
-                  --enable-static=yes \
-                  --disable-shared
-                
-                make -j"$(nproc)"
-                make install
-                cd "${ORIGINAL_DIR}"
-                rm -rf "${SQLCIPHER_BUILD_DIR}"
-                
-                # Set environment
-                export OPENSSL_DIR="${MUSL_PREFIX}"
-                export OPENSSL_STATIC=1
-                export SQLCIPHER_LIB_DIR="${MUSL_PREFIX}/lib"
-                export SQLCIPHER_INCLUDE_DIR="${MUSL_PREFIX}/include"
-                export PKG_CONFIG_PATH="${MUSL_PREFIX}/lib/pkgconfig"
-                ;;
-                
-              manylinux)
-                # =================== MANYLINUX (CENTOS/RHEL) ===================
-                echo "Setting up manylinux environment for ${TARGET}"
-                
-                # Install dependencies
-                yum install -y epel-release || true
-                yum install -y \
-                  gcc \
-                  gcc-c++ \
-                  make \
-                  perl-core \
-                  pkgconfig \
-                  curl \
-                  tcl \
-                  autoconf \
-                  automake \
-                  libtool
-                
-                # Build OpenSSL 1.1.1 from source to avoid version conflicts
-                echo "Building OpenSSL 1.1.1 from source"
-                OPENSSL_VERSION=1.1.1w
-                OPENSSL_PREFIX=/opt/openssl
-                OPENSSL_BUILD_DIR=$(mktemp -d)
-                
-                curl -fsSL "https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz" | tar -xz -C "${OPENSSL_BUILD_DIR}"
-                cd "${OPENSSL_BUILD_DIR}/openssl-${OPENSSL_VERSION}"
-                
-                ./config \
-                  --prefix="${OPENSSL_PREFIX}" \
-                  --openssldir="${OPENSSL_PREFIX}/ssl" \
-                  no-shared \
-                  -fPIC
-                
-                make -j"$(nproc)"
-                make install_sw
-                cd "${ORIGINAL_DIR}"
-                rm -rf "${OPENSSL_BUILD_DIR}"
-                
-                # Set OpenSSL environment to use our custom build
-                export OPENSSL_DIR="${OPENSSL_PREFIX}"
-                export OPENSSL_STATIC=1
-                export OPENSSL_LIB_DIR="${OPENSSL_PREFIX}/lib"
-                export OPENSSL_INCLUDE_DIR="${OPENSSL_PREFIX}/include"
-                
-                # Set target-specific vars
-                case "${TARGET}" in
-                  x86_64-unknown-linux-gnu|x86_64)
-                    export X86_64_UNKNOWN_LINUX_GNU_OPENSSL_DIR="${OPENSSL_PREFIX}"
-                    export X86_64_UNKNOWN_LINUX_GNU_OPENSSL_STATIC=1
-                    ;;
-                  i686-unknown-linux-gnu|i686)
-                    export I686_UNKNOWN_LINUX_GNU_OPENSSL_DIR="${OPENSSL_PREFIX}"
-                    export I686_UNKNOWN_LINUX_GNU_OPENSSL_STATIC=1
-                    ;;
-                  aarch64-unknown-linux-gnu|aarch64)
-                    export AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_DIR="${OPENSSL_PREFIX}"
-                    export AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_STATIC=1
-                    ;;
-                  armv7-unknown-linux-gnueabihf|armv7)
-                    export ARMV7_UNKNOWN_LINUX_GNUEABIHF_OPENSSL_DIR="${OPENSSL_PREFIX}"
-                    export ARMV7_UNKNOWN_LINUX_GNUEABIHF_OPENSSL_STATIC=1
-                    ;;
-                  ppc64le|powerpc64le-unknown-linux-gnu)
-                    export POWERPC64LE_UNKNOWN_LINUX_GNU_OPENSSL_DIR="${OPENSSL_PREFIX}"
-                    export POWERPC64LE_UNKNOWN_LINUX_GNU_OPENSSL_STATIC=1
-                    ;;
-                  s390x|s390x-unknown-linux-gnu)
-                    export S390X_UNKNOWN_LINUX_GNU_OPENSSL_DIR="${OPENSSL_PREFIX}"
-                    export S390X_UNKNOWN_LINUX_GNU_OPENSSL_STATIC=1
-                    ;;
-                esac
-                
-                # Build SQLCipher using our OpenSSL
-                echo "Building SQLCipher"
-                SQLCIPHER_VERSION=4.5.6
-                SQLCIPHER_PREFIX=/opt/sqlcipher
-                SQLCIPHER_BUILD_DIR=$(mktemp -d)
-                
-                curl -fsSL "https://github.com/sqlcipher/sqlcipher/archive/refs/tags/v${SQLCIPHER_VERSION}.tar.gz" | tar -xz -C "${SQLCIPHER_BUILD_DIR}"
-                cd "${SQLCIPHER_BUILD_DIR}/sqlcipher-${SQLCIPHER_VERSION}"
-                
-                # Force static linking with OpenSSL
-                CFLAGS="-I${OPENSSL_PREFIX}/include -DSQLITE_HAS_CODEC" \
-                LDFLAGS="-L${OPENSSL_PREFIX}/lib -lcrypto -ldl -lpthread" \
-                LIBS="-L${OPENSSL_PREFIX}/lib -lcrypto -ldl -lpthread" \
-                ./configure \
-                  --prefix="${SQLCIPHER_PREFIX}" \
-                  --enable-tempstore=yes \
-                  --disable-tcl \
-                  --disable-shared \
-                  --enable-static \
-                  --with-crypto-lib=openssl \
-                  --enable-fts5 \
-                  CPPFLAGS="-I${OPENSSL_PREFIX}/include" \
-                  LIBS="-L${OPENSSL_PREFIX}/lib ${OPENSSL_PREFIX}/lib/libcrypto.a -ldl -lpthread"
-                
-                make -j"$(nproc)"
-                make install
-                cd "${ORIGINAL_DIR}"
-                rm -rf "${SQLCIPHER_BUILD_DIR}"
-                
-                export SQLCIPHER_LIB_DIR="${SQLCIPHER_PREFIX}/lib"
-                export SQLCIPHER_INCLUDE_DIR="${SQLCIPHER_PREFIX}/include"
-                export PKG_CONFIG_PATH="${OPENSSL_PREFIX}/lib/pkgconfig:${SQLCIPHER_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
-                ;;
-                
-              debian|*)
-                # =================== DEBIAN/UBUNTU ===================
-                echo "Setting up Debian/Ubuntu environment for ${TARGET}"
-                
-                export DEBIAN_FRONTEND=noninteractive
-                
-                # Check if this is actually a musl cross-compilation
-                if [ "$IS_MUSL_TARGET" = "1" ] && [ -d /usr/local/musl ]; then
-                  echo "Detected musl cross-compilation in Debian container"
-                  # Use the musl paths we built earlier
-                  MUSL_PREFIX=/usr/local/musl
-                  export OPENSSL_DIR="${MUSL_PREFIX}"
-                  export OPENSSL_STATIC=1
-                  export OPENSSL_LIB_DIR="${MUSL_PREFIX}/lib"
-                  export OPENSSL_INCLUDE_DIR="${MUSL_PREFIX}/include"
-                  export SQLCIPHER_LIB_DIR="${MUSL_PREFIX}/lib"
-                  export SQLCIPHER_INCLUDE_DIR="${MUSL_PREFIX}/include"
-                  export PKG_CONFIG_PATH="${MUSL_PREFIX}/lib/pkgconfig"
-                  
-                  # Set target-specific vars for musl
-                  case "${TARGET}" in
-                    x86_64-unknown-linux-musl|x86_64)
-                      export X86_64_UNKNOWN_LINUX_MUSL_OPENSSL_DIR="${MUSL_PREFIX}"
-                      export X86_64_UNKNOWN_LINUX_MUSL_OPENSSL_STATIC=1
-                      export X86_64_UNKNOWN_LINUX_MUSL_OPENSSL_LIB_DIR="${MUSL_PREFIX}/lib"
-                      export X86_64_UNKNOWN_LINUX_MUSL_OPENSSL_INCLUDE_DIR="${MUSL_PREFIX}/include"
-                      ;;
-                    aarch64-unknown-linux-musl|aarch64)
-                      export AARCH64_UNKNOWN_LINUX_MUSL_OPENSSL_DIR="${MUSL_PREFIX}"
-                      export AARCH64_UNKNOWN_LINUX_MUSL_OPENSSL_STATIC=1
-                      export AARCH64_UNKNOWN_LINUX_MUSL_OPENSSL_LIB_DIR="${MUSL_PREFIX}/lib"
-                      export AARCH64_UNKNOWN_LINUX_MUSL_OPENSSL_INCLUDE_DIR="${MUSL_PREFIX}/include"
-                      ;;
-                    armv7-unknown-linux-musleabihf|armv7)
-                      export ARMV7_UNKNOWN_LINUX_MUSLEABIHF_OPENSSL_DIR="${MUSL_PREFIX}"
-                      export ARMV7_UNKNOWN_LINUX_MUSLEABIHF_OPENSSL_STATIC=1
-                      export ARMV7_UNKNOWN_LINUX_MUSLEABIHF_OPENSSL_LIB_DIR="${MUSL_PREFIX}/lib"
-                      export ARMV7_UNKNOWN_LINUX_MUSLEABIHF_OPENSSL_INCLUDE_DIR="${MUSL_PREFIX}/include"
-                      ;;
-                  esac
-                else
-                  # Regular Debian/Ubuntu for glibc targets
-                  # Determine architecture
-                  case "${TARGET}" in
-                    x86_64*|"")
-                      ARCH_LIB=/usr/lib/x86_64-linux-gnu
-                      ARCH_INCLUDE=/usr/include/x86_64-linux-gnu
-                      ;;
-                    i686*)
-                      ARCH_LIB=/usr/lib/i386-linux-gnu
-                      ARCH_INCLUDE=/usr/include/i386-linux-gnu
-                      ;;
-                    aarch64*)
-                      ARCH_LIB=/usr/lib/aarch64-linux-gnu
-                      ARCH_INCLUDE=/usr/include/aarch64-linux-gnu
-                      ;;
-                    armv7*)
-                      ARCH_LIB=/usr/lib/arm-linux-gnueabihf
-                      ARCH_INCLUDE=/usr/include/arm-linux-gnueabihf
-                      ;;
-                    ppc64le*|powerpc64le*)
-                      ARCH_LIB=/usr/lib/powerpc64le-linux-gnu
-                      ARCH_INCLUDE=/usr/include/powerpc64le-linux-gnu
-                      ;;
-                    s390x*)
-                      ARCH_LIB=/usr/lib/s390x-linux-gnu
-                      ARCH_INCLUDE=/usr/include/s390x-linux-gnu
-                      ;;
-                    *)
-                      ARCH_LIB=/usr/lib
-                      ARCH_INCLUDE=/usr/include
-                      ;;
-                  esac
-                  
-                  # Install dependencies
-                  apt-get update || sudo apt-get update
-                  apt-get install -y libssl-dev libsqlcipher-dev pkg-config build-essential curl tcl || \
-                    sudo apt-get install -y libssl-dev libsqlcipher-dev pkg-config build-essential curl tcl
-                  
-                  # Set environment for glibc
-                  export OPENSSL_DIR=/usr
-                  export OPENSSL_STATIC=1
-                  export OPENSSL_LIB_DIR="${ARCH_LIB}"
-                  export OPENSSL_INCLUDE_DIR="${ARCH_INCLUDE}"
-                  export SQLCIPHER_LIB_DIR="${ARCH_LIB}"
-                  export SQLCIPHER_INCLUDE_DIR="${ARCH_INCLUDE}"
-                  export PKG_CONFIG_PATH="${ARCH_LIB}/pkgconfig"
-                  
-                  # Set target-specific vars for glibc
-                  case "${TARGET}" in
-                    x86_64-unknown-linux-gnu|x86_64)
-                      export X86_64_UNKNOWN_LINUX_GNU_OPENSSL_DIR=/usr
-                      ;;
-                    i686-unknown-linux-gnu|i686)
-                      export I686_UNKNOWN_LINUX_GNU_OPENSSL_DIR=/usr
-                      ;;
-                    aarch64-unknown-linux-gnu|aarch64)
-                      export AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_DIR=/usr
-                      ;;
-                    armv7-unknown-linux-gnueabihf|armv7)
-                      export ARMV7_UNKNOWN_LINUX_GNUEABIHF_OPENSSL_DIR=/usr
-                      ;;
-                    ppc64le|powerpc64le-unknown-linux-gnu)
-                      export POWERPC64LE_UNKNOWN_LINUX_GNU_OPENSSL_DIR=/usr
-                      ;;
-                    s390x|s390x-unknown-linux-gnu)
-                      export S390X_UNKNOWN_LINUX_GNU_OPENSSL_DIR=/usr
-                      ;;
-                  esac
-                fi
-                ;;
-            esac
+            # Build SQLCipher
+            echo "=================== BUILDING SQLCIPHER ==================="
+            SQLCIPHER_VERSION=4.5.6
+            SQLCIPHER_BUILD_DIR=$(mktemp -d)
             
-            # Common setup for all
-            export LD_LIBRARY_PATH="${OPENSSL_LIB_DIR:-/usr/lib}:${SQLCIPHER_LIB_DIR:-/usr/lib}:${LD_LIBRARY_PATH:-}"
-            export LIBRARY_PATH="${OPENSSL_LIB_DIR:-/usr/lib}:${SQLCIPHER_LIB_DIR:-/usr/lib}:${LIBRARY_PATH:-}"
-            export RUSTFLAGS="${RUSTFLAGS:-} -L${OPENSSL_LIB_DIR:-/usr/lib} -L${SQLCIPHER_LIB_DIR:-/usr/lib}"
+            curl -fsSL "https://github.com/sqlcipher/sqlcipher/archive/refs/tags/v${SQLCIPHER_VERSION}.tar.gz" | tar -xz -C "${SQLCIPHER_BUILD_DIR}"
+            cd "${SQLCIPHER_BUILD_DIR}/sqlcipher-${SQLCIPHER_VERSION}"
+            
+            # Configure SQLCipher with static OpenSSL
+            CFLAGS="-I${PREFIX}/include -DSQLITE_HAS_CODEC" \
+            LDFLAGS="-L${PREFIX}/lib" \
+            LIBS="${PREFIX}/lib/libcrypto.a -lpthread" \
+            ./configure \
+              --prefix="${PREFIX}" \
+              --enable-tempstore=yes \
+              --disable-tcl \
+              --disable-shared \
+              --enable-static \
+              --with-crypto-lib=openssl \
+              --enable-fts5
+            
+            make -j"$(nproc)"
+            make install
+            cd "${ORIGINAL_DIR}"
+            rm -rf "${SQLCIPHER_BUILD_DIR}"
+            
+            # Export environment variables for Rust
+            echo "=================== SETTING ENVIRONMENT ==================="
+            export OPENSSL_DIR="${PREFIX}"
+            export OPENSSL_STATIC=1
+            export OPENSSL_LIB_DIR="${PREFIX}/lib"
+            export OPENSSL_INCLUDE_DIR="${PREFIX}/include"
+            export SQLCIPHER_LIB_DIR="${PREFIX}/lib"
+            export SQLCIPHER_INCLUDE_DIR="${PREFIX}/include"
+            export PKG_CONFIG_PATH="${PREFIX}/lib/pkgconfig"
             export PKG_CONFIG_ALLOW_CROSS=1
             
-            # For all Linux builds, ensure static linking of OpenSSL
-            export OPENSSL_STATIC=1
+            # Set target-specific environment variables
+            case "${TARGET}" in
+              x86_64)
+                export X86_64_UNKNOWN_LINUX_GNU_OPENSSL_DIR="${PREFIX}"
+                export X86_64_UNKNOWN_LINUX_GNU_OPENSSL_STATIC=1
+                ;;
+              aarch64)
+                export AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_DIR="${PREFIX}"
+                export AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_STATIC=1
+                ;;
+              armv7)
+                export ARMV7_UNKNOWN_LINUX_GNUEABIHF_OPENSSL_DIR="${PREFIX}"
+                export ARMV7_UNKNOWN_LINUX_GNUEABIHF_OPENSSL_STATIC=1
+                ;;
+            esac
             
-            # Final debug output
-            echo "=================== FINAL CONFIGURATION ==================="
-            echo "Container: ${CONTAINER_TYPE}"
-            echo "Target: ${TARGET}"
-            echo "Current directory: $(pwd)"
-            echo "Contents of current directory:"
-            ls -la
-            echo "OPENSSL_DIR: ${OPENSSL_DIR}"
-            echo "OPENSSL_LIB_DIR: ${OPENSSL_LIB_DIR:-default}"
-            echo "OPENSSL_INCLUDE_DIR: ${OPENSSL_INCLUDE_DIR:-default}"
-            echo "PKG_CONFIG_PATH: ${PKG_CONFIG_PATH}"
-            echo "RUSTFLAGS: ${RUSTFLAGS}"
+            # Set common flags
+            export RUSTFLAGS="${RUSTFLAGS:-} -L${PREFIX}/lib"
+            export LD_LIBRARY_PATH="${PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+            export LIBRARY_PATH="${PREFIX}/lib:${LIBRARY_PATH:-}"
             
-            # Verify OpenSSL
-            if [ -n "${OPENSSL_DIR}" ]; then
-              echo "Checking OpenSSL:"
-              ls "${OPENSSL_DIR}/include/openssl/opensslv.h" 2>/dev/null && echo "✓ OpenSSL headers found" || echo "✗ OpenSSL headers missing"
-              ls "${OPENSSL_LIB_DIR:-${OPENSSL_DIR}/lib}/"libssl* 2>/dev/null | head -1 && echo "✓ OpenSSL libs found" || echo "✗ OpenSSL libs missing"
-            fi
-            
-            # Ensure we're in the right directory for maturin
-            if [ ! -f "Cargo.toml" ]; then
-              echo "ERROR: Cargo.toml not found in current directory!"
-              echo "Current directory: $(pwd)"
-              echo "Looking for Cargo.toml in parent directories..."
-              find / -name "Cargo.toml" -type f 2>/dev/null | head -10
+            # Verify installation
+            echo "=================== VERIFICATION ==================="
+            echo "Checking OpenSSL installation:"
+            if [ -f "${PREFIX}/include/openssl/opensslv.h" ]; then
+              echo "✓ OpenSSL headers found at ${PREFIX}/include"
+            else
+              echo "✗ OpenSSL headers missing!"
               exit 1
             fi
             
-            echo "==========================================================="
+            if [ -f "${PREFIX}/lib/libcrypto.a" ]; then
+              echo "✓ OpenSSL libcrypto.a found at ${PREFIX}/lib"
+            else
+              echo "✗ OpenSSL libcrypto.a missing!"
+              exit 1
+            fi
+            
+            echo "Checking SQLCipher installation:"
+            if [ -f "${PREFIX}/lib/libsqlcipher.a" ]; then
+              echo "✓ SQLCipher library found at ${PREFIX}/lib"
+            else
+              echo "✗ SQLCipher library missing!"
+              exit 1
+            fi
+            
+            echo "Environment variables set:"
+            echo "OPENSSL_DIR=${OPENSSL_DIR}"
+            echo "OPENSSL_LIB_DIR=${OPENSSL_LIB_DIR}"
+            echo "OPENSSL_INCLUDE_DIR=${OPENSSL_INCLUDE_DIR}"
+            echo "SQLCIPHER_LIB_DIR=${SQLCIPHER_LIB_DIR}"
+            echo "PKG_CONFIG_PATH=${PKG_CONFIG_PATH}"
+            echo "RUSTFLAGS=${RUSTFLAGS}"
+            echo "=================== SETUP COMPLETE ==================="
       - run: ${{ (matrix.os == 'windows' && 'dir') || 'ls -lh' }} dist/
 
       - uses: actions/upload-artifact@v4
         with:
-          name: pypi_files_${{ matrix.os }}_${{ matrix.target }}_${{ matrix.interpreter || 'all' }}_${{ matrix.manylinux }}
+          name: pypi_files_${{ matrix.os }}_${{ matrix.target }}_${{ matrix.interpreter || 'all' }}
           path: dist
