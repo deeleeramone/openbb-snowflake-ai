@@ -190,26 +190,46 @@ jobs:
                 tar xzf openssl.tar.gz
                 (
                     cd openssl-3.0.13
-                    ./Configure $OSSL_TARGET no-shared --prefix=/usr/local --openssldir=/usr/local
-                    make
+                    ./Configure $OSSL_TARGET no-shared no-tests --prefix=/usr/local --openssldir=/usr/local
+                    make -j$(nproc)
                     make install_sw
-                )
+                ) || exit 1
             fi
+            
+            # Update PKG_CONFIG_PATH to include the newly installed openssl
+            export PKG_CONFIG_PATH=/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig:${PKG_CONFIG_PATH:-}
 
             # Build SQLCipher from source
             curl -L https://github.com/sqlcipher/sqlcipher/archive/v4.6.0.tar.gz -o sqlcipher.tar.gz
             tar xzf sqlcipher.tar.gz
             (
               cd sqlcipher-4.6.0
-              # Explicitly set flags to help configure find OpenSSL
-              # We prioritize /usr/local where we might have installed the cross-compiled OpenSSL
-              export LDFLAGS="-L/usr/local/lib64 -L/usr/local/lib -L/usr/lib64 -L/usr/lib"
-              export CFLAGS="-I/usr/local/include -I/usr/include -DSQLITE_HAS_CODEC"
               
+              # Use pkg-config to find OpenSSL flags if available
+              if pkg-config --exists libcrypto; then
+                  echo "Found libcrypto via pkg-config"
+                  export LDFLAGS="$LDFLAGS $(pkg-config --libs-only-L libcrypto)"
+                  export CFLAGS="$CFLAGS $(pkg-config --cflags libcrypto)"
+                  export LIBS="$LIBS $(pkg-config --libs-only-l libcrypto)"
+              else
+                  echo "libcrypto not found via pkg-config, falling back to manual flags"
+                  export LDFLAGS="-L/usr/local/lib64 -L/usr/local/lib"
+                  export CFLAGS="-I/usr/local/include"
+                  # For static linking, we might need dl and pthread. 
+                  # On musl, these are empty/implicit, but on glibc they are needed.
+                  # We add them just in case; linker should ignore if not needed or duplicate.
+                  export LIBS="-ldl -lpthread"
+              fi
+              
+              # Ensure CFLAGS has -DSQLITE_HAS_CODEC
+              if [[ "$CFLAGS" != *"SQLITE_HAS_CODEC"* ]]; then
+                  export CFLAGS="$CFLAGS -DSQLITE_HAS_CODEC"
+              fi
+
               ./configure --enable-tempstore=yes --disable-tcl $HOST_ARG
-              make
+              make -j$(nproc)
               make install
-            )
+            ) || exit 1
             
             # Verify installation
             echo "Listing /usr/local/lib:"
