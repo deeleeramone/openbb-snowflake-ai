@@ -392,21 +392,32 @@ jobs:
           echo "Building source distribution..."
           python -m build --sdist --outdir wheelhouse/
           
-          # Generate SHA256 hashes for all files
+          # Generate SHA256 hashes for all files (avoid including CHECKSUMS.sha256 itself)
           cd wheelhouse
           echo "Generating hash signatures..."
+          
+          # Temporary file to accumulate sums
+          TMP_SUMS="$(mktemp)"
+          
+          # Create per-file .sha256 and accumulate into TMP_SUMS
           for file in *.whl *.tar.gz; do
             if [ -f "$file" ]; then
+              sha256sum "$file" >> "$TMP_SUMS"
               sha256sum "$file" > "$file.sha256"
               echo "Generated hash for $file"
             fi
           done
           
-          # Create a summary file with all hashes
-          echo "# SHA256 Checksums" > CHECKSUMS.sha256
-          echo "Generated on: $(date -u)" >> CHECKSUMS.sha256
-          echo "" >> CHECKSUMS.sha256
-          cat *.sha256 >> CHECKSUMS.sha256
+          # Atomically create the master CHECKSUMS.sha256 with a header, using the temp sums
+          {
+            echo "# SHA256 Checksums"
+            echo "Generated on: $(date -u)"
+            echo ""
+            cat "$TMP_SUMS"
+          } > CHECKSUMS.sha256
+          
+          # Cleanup
+          rm -f "$TMP_SUMS"
           
           # Display summary
           echo "=================== Wheelhouse Contents ==================="
