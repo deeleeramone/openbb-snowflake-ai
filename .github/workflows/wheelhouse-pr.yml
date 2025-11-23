@@ -163,58 +163,11 @@ jobs:
           # Move the new wheelhouse into place
           mv wheelhouse-temp wheelhouse
           
-          # Remove large binaries to avoid exceeding GitHub push limits
-          # Delete any wheel/tar/zip files >100MB (GitHub limit)
-          find wheelhouse -type f \( -name '*.whl' -o -name '*.tar.gz' -o -name '*.zip' \) -size +100M -print -delete || true
-          # Also remove top-level archives if present
-          rm -f wheelhouse.tar.gz wheelhouse.zip || true
+          # Remove ALL non-wheel and non-sha256 files
+          find wheelhouse -type f ! \( -name "*.whl" -o -name "*.sha256" -o -name "*.tar.gz" \) -delete
           
-          # Create a README for the wheelhouse
-          cat > wheelhouse/README.md << 'EOF'
-          # Wheelhouse
-
-          This directory contains pre-built wheel packages for all supported platforms.
-
-          ## Installation
-
-          To install a wheel for your platform, use:
-
-          ```bash
-          pip install wheelhouse/<wheel-file-for-your-platform>.whl
-          ```
-
-          ## Platform-specific Requirements
-
-          - **Linux AMD64**: See `requirements-linux-amd64.txt`
-          - **Linux ARM64**: See `requirements-linux-aarch64.txt`
-          - **macOS x86_64**: See `requirements-macos-x86_64.txt`
-          - **macOS ARM64**: See `requirements-macos-arm64.txt`
-          - **Windows AMD64**: See `requirements-windows-amd64.txt`
-          - **Windows ARM64**: See `requirements-windows-arm64.txt`
-
-          ## Verification
-
-          All files include SHA256 checksums. To verify:
-
-          ```bash
-          sha256sum -c wheelhouse/<file>.sha256
-          ```
-
-          Or check against the master list in `CHECKSUMS.sha256`.
-
-          ## Build Information
-
-          - Build Date: $(date -u)
-          - Workflow Run: ${{ github.event.workflow_run.id }}
-          - Commit: ${{ github.event.workflow_run.head_sha }}
-          EOF
-          
-          # Add .gitattributes to mark wheels as binary
-          cat > wheelhouse/.gitattributes << 'EOF'
-          *.whl binary
-          *.tar.gz binary
-          *.zip binary
-          EOF
+          # Remove any files >100MB to avoid GitHub push limits
+          find wheelhouse -type f -size +100M -delete
 
       - name: Commit wheelhouse into repo branch
         env:
@@ -240,7 +193,7 @@ jobs:
           echo "Add wheelhouse files directly (no LFS)"
           git add wheelhouse/
 
-          COMMIT_MSG="chore: add/update wheelhouse artifacts for run ${RUN_ID}"
+          COMMIT_MSG="chore: update wheelhouse artifacts for run ${RUN_ID}"
           if git diff --cached --quiet; then
             echo "No changes to commit (wheelhouse unchanged)"
           else

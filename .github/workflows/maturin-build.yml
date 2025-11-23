@@ -392,32 +392,25 @@ jobs:
           echo "Building source distribution..."
           python -m build --sdist --outdir wheelhouse/
           
-          # Generate SHA256 hashes for all files (avoid including CHECKSUMS.sha256 itself)
+          # Generate SHA256 hashes for all files
           cd wheelhouse
           echo "Generating hash signatures..."
           
-          # Temporary file to accumulate sums
-          TMP_SUMS="$(mktemp)"
-          
-          # Create per-file .sha256 and accumulate into TMP_SUMS
+          # Create per-file .sha256 and master CHECKSUMS.sha256
           for file in *.whl *.tar.gz; do
             if [ -f "$file" ]; then
-              sha256sum "$file" >> "$TMP_SUMS"
               sha256sum "$file" > "$file.sha256"
               echo "Generated hash for $file"
             fi
           done
           
-          # Atomically create the master CHECKSUMS.sha256 with a header, using the temp sums
+          # Create master checksums file
           {
             echo "# SHA256 Checksums"
             echo "Generated on: $(date -u)"
             echo ""
-            cat "$TMP_SUMS"
+            sha256sum *.whl *.tar.gz 2>/dev/null || true
           } > CHECKSUMS.sha256
-          
-          # Cleanup
-          rm -f "$TMP_SUMS"
           
           # Display summary
           echo "=================== Wheelhouse Contents ==================="
@@ -426,52 +419,9 @@ jobs:
           echo "=================== Checksums ==================="
           cat CHECKSUMS.sha256
       
-      - name: Create requirements file for each platform
-        run: |
-          cd wheelhouse
-          
-          # Create platform-specific requirement files
-          echo "# Linux AMD64/x86_64 Requirements" > requirements-linux-amd64.txt
-          ls | grep -E "linux.*x86_64|linux.*amd64" | grep ".whl" >> requirements-linux-amd64.txt || true
-          
-          echo "# Linux ARM64/aarch64 Requirements" > requirements-linux-aarch64.txt
-          ls | grep -E "linux.*aarch64" | grep ".whl" >> requirements-linux-aarch64.txt || true
-          
-          echo "# macOS x86_64 Requirements" > requirements-macos-x86_64.txt
-          ls | grep -E "macosx.*x86_64" | grep ".whl" >> requirements-macos-x86_64.txt || true
-          
-          echo "# macOS ARM64 Requirements" > requirements-macos-arm64.txt
-          ls | grep -E "macosx.*arm64|macosx.*universal2" | grep ".whl" >> requirements-macos-arm64.txt || true
-          
-          echo "# Windows AMD64 Requirements" > requirements-windows-amd64.txt
-          ls | grep -E "win.*amd64" | grep ".whl" >> requirements-windows-amd64.txt || true
-          
-          echo "# Windows ARM64 Requirements" > requirements-windows-arm64.txt
-          ls | grep -E "win.*arm64" | grep ".whl" >> requirements-windows-arm64.txt || true
-      
       - name: Upload wheelhouse
         uses: actions/upload-artifact@v4
         with:
           name: wheelhouse
           path: wheelhouse/
-          retention-days: 30
-      
-      - name: Create release archive
-        run: |
-          tar czf wheelhouse.tar.gz wheelhouse/
-          zip -r wheelhouse.zip wheelhouse/
-          
-          # Generate hashes for archives
-          sha256sum wheelhouse.tar.gz > wheelhouse.tar.gz.sha256
-          sha256sum wheelhouse.zip > wheelhouse.zip.sha256
-      
-      - name: Upload release archives
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-archives
-          path: |
-            wheelhouse.tar.gz
-            wheelhouse.tar.gz.sha256
-            wheelhouse.zip
-            wheelhouse.zip.sha256
           retention-days: 30
