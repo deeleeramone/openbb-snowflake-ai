@@ -361,11 +361,15 @@ jobs:
           }
           
           $pythonVersions = "${{ matrix.interpreter }}".Split()
-          $sdistFlag = "--sdist"
+          $emitSdist = $true
           foreach ($py in $pythonVersions) {
             Write-Host "Building for Python $py on $rustTarget"
-            maturin build --release --target $rustTarget --interpreter $py $sdistFlag
-            $sdistFlag = ""
+            $args = @("--release", "--target", $rustTarget, "--interpreter", $py)
+            if ($emitSdist) {
+              $args += "--sdist"
+              $emitSdist = $false
+            }
+            maturin build @args
           }
           
           # Move all wheels to dist directory
