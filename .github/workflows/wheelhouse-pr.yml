@@ -205,8 +205,8 @@ jobs:
           echo "Restoring wheelhouse files..."
           cp -r /tmp/wheelhouse-save wheelhouse
           
-          echo "Adding wheelhouse files..."
-          git add wheelhouse/
+          echo "Force adding wheelhouse files (ignoring .gitignore)..."
+          git add -f wheelhouse/
 
           COMMIT_MSG="chore: update wheelhouse artifacts for run ${RUN_ID}"
           
