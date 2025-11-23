@@ -106,12 +106,29 @@ jobs:
 
       - name: build wheels
         uses: PyO3/maturin-action@v1
+        env:
+          # Explicitly tell Rust linker where to find the manually built sqlcipher
+          RUSTFLAGS: "-L /usr/local/lib"
+          # Workaround for ring crate build failure on aarch64
+          CFLAGS_aarch64_unknown_linux_gnu: "-D__ARM_ARCH=8"
+          CFLAGS_aarch64_unknown_linux_musl: "-D__ARM_ARCH=8"
+          # Workaround for ring crate build failure on armv7
+          CFLAGS_armv7_unknown_linux_gnueabihf: "-D__ARM_ARCH=7A"
+          CFLAGS_armv7_unknown_linux_musleabihf: "-D__ARM_ARCH=7A"
         with:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
           args: --release --out dist --interpreter ${{ matrix.interpreter || '3.10 3.11 3.12 3.13' }}
           rust-toolchain: stable
-          docker-options: -e CI -e PKG_CONFIG_PATH=/usr/local/lib/pkgconfig -e TARGET=${{ matrix.target }}
+          docker-options: >-
+            -e CI 
+            -e PKG_CONFIG_PATH=/usr/local/lib/pkgconfig 
+            -e TARGET=${{ matrix.target }}
+            -e RUSTFLAGS
+            -e CFLAGS_aarch64_unknown_linux_gnu
+            -e CFLAGS_aarch64_unknown_linux_musl
+            -e CFLAGS_armv7_unknown_linux_gnueabihf
+            -e CFLAGS_armv7_unknown_linux_musleabihf
           before-script-linux: |
             # Install build tools and dependencies
             if command -v apk > /dev/null; then
@@ -155,6 +172,10 @@ jobs:
               make
               make install
             )
+            
+            # Verify installation
+            echo "Listing /usr/local/lib:"
+            ls -l /usr/local/lib
 
       - run: ${{ (matrix.os == 'windows' && 'dir') || 'ls -lh' }} dist/
 
