@@ -314,8 +314,9 @@ jobs:
                 cd "${SQLCIPHER_BUILD_DIR}/sqlcipher-${SQLCIPHER_VERSION}"
                 
                 CC="${MUSL_CC}" \
-                CFLAGS="-I${MUSL_PREFIX}/include" \
-                LDFLAGS="-L${MUSL_PREFIX}/lib" \
+                CFLAGS="-I${MUSL_PREFIX}/include -DSQLITE_HAS_CODEC" \
+                LDFLAGS="-L${MUSL_PREFIX}/lib -static" \
+                LIBS="${MUSL_PREFIX}/lib/libcrypto.a -ldl -lpthread" \
                 ./configure \
                   --prefix="${MUSL_PREFIX}" \
                   --host="${TARGET%-unknown-linux-musl}" \
@@ -327,7 +328,7 @@ jobs:
                 
                 make -j"$(nproc)"
                 make install
-                cd "${ORIGINAL_DIR}"  # Return to original directory
+                cd "${ORIGINAL_DIR}"
                 rm -rf "${SQLCIPHER_BUILD_DIR}"
                 
                 # Set environment
@@ -419,15 +420,20 @@ jobs:
                 curl -fsSL "https://github.com/sqlcipher/sqlcipher/archive/refs/tags/v${SQLCIPHER_VERSION}.tar.gz" | tar -xz -C "${SQLCIPHER_BUILD_DIR}"
                 cd "${SQLCIPHER_BUILD_DIR}/sqlcipher-${SQLCIPHER_VERSION}"
                 
-                CFLAGS="-I${OPENSSL_PREFIX}/include" \
-                LDFLAGS="-L${OPENSSL_PREFIX}/lib" \
+                # Force static linking with OpenSSL
+                CFLAGS="-I${OPENSSL_PREFIX}/include -DSQLITE_HAS_CODEC" \
+                LDFLAGS="-L${OPENSSL_PREFIX}/lib -lcrypto -ldl -lpthread" \
+                LIBS="-L${OPENSSL_PREFIX}/lib -lcrypto -ldl -lpthread" \
                 ./configure \
                   --prefix="${SQLCIPHER_PREFIX}" \
                   --enable-tempstore=yes \
                   --disable-tcl \
+                  --disable-shared \
+                  --enable-static \
                   --with-crypto-lib=openssl \
-                  --enable-static=yes \
-                  --disable-shared
+                  --enable-fts5 \
+                  CPPFLAGS="-I${OPENSSL_PREFIX}/include" \
+                  LIBS="-L${OPENSSL_PREFIX}/lib ${OPENSSL_PREFIX}/lib/libcrypto.a -ldl -lpthread"
                 
                 make -j"$(nproc)"
                 make install
