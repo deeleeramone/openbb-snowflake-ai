@@ -205,10 +205,22 @@ jobs:
           echo "Restoring wheelhouse files..."
           cp -r /tmp/wheelhouse-save wheelhouse
           
-          echo "Force adding wheelhouse files (ignoring .gitignore)..."
-          git add -f wheelhouse/
+          # List what we're about to add
+          echo "Files to be added:"
+          ls -la wheelhouse/
+          
+          echo "Force adding ALL wheelhouse files (including binaries)..."
+          # Add each file type explicitly
+          git add -f wheelhouse/*.whl 2>/dev/null || true
+          git add -f wheelhouse/*.tar.gz 2>/dev/null || true
+          git add -f wheelhouse/*.sha256 2>/dev/null || true
+          git add -f wheelhouse/CHECKSUMS.sha256 2>/dev/null || true
 
           COMMIT_MSG="chore: update wheelhouse artifacts for run ${RUN_ID}"
+          
+          # Check what's staged
+          echo "Staged files:"
+          git status --short
           
           if git diff --cached --quiet; then
             echo "No changes to commit"
