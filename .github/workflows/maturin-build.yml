@@ -81,8 +81,13 @@ jobs:
           brew install openssl@3 sqlcipher pkg-config
           echo "OPENSSL_DIR=$(brew --prefix openssl@3)" >> $GITHUB_ENV
           echo "PKG_CONFIG_PATH=$(brew --prefix openssl@3)/lib/pkgconfig:$(brew --prefix sqlcipher)/lib/pkgconfig" >> $GITHUB_ENV
-          # Explicitly tell Rust linker where to find sqlcipher
-          echo "RUSTFLAGS=-L $(brew --prefix sqlcipher)/lib" >> $GITHUB_ENV
+          # Force dynamic linking so delocate can bundle the dylibs
+          echo "OPENSSL_STATIC=0" >> $GITHUB_ENV
+          echo "SQLCIPHER_STATIC=0" >> $GITHUB_ENV
+          # Tell Rust linker where to find the dylibs at build time
+          echo "RUSTFLAGS=-L $(brew --prefix sqlcipher)/lib -L $(brew --prefix openssl@3)/lib" >> $GITHUB_ENV
+          # Set rpath so the binary can find dylibs before delocate processes them
+          echo "DYLD_LIBRARY_PATH=$(brew --prefix openssl@3)/lib:$(brew --prefix sqlcipher)/lib" >> $GITHUB_ENV
 
       - name: Install dependencies (Windows)
         if: matrix.os == 'windows'
@@ -90,7 +95,8 @@ jobs:
         run: |
           # Determine architecture
           $arch = if ("${{ matrix.target }}" -eq "aarch64") { "arm64" } else { "x64" }
-          $vcpkgTriplet = "${arch}-windows-static"
+          # Use dynamic libraries so delvewheel can bundle them
+          $vcpkgTriplet = "${arch}-windows"
           
           # Check if vcpkg exists and clean it if needed
           if (Test-Path "C:\vcpkg") {
@@ -116,9 +122,9 @@ jobs:
           echo "SQLCIPHER_LIB_DIR=$installPath\lib" >> $env:GITHUB_ENV
           echo "SQLCIPHER_INCLUDE_DIR=$installPath\include" >> $env:GITHUB_ENV
           echo "SQLITE3_LIB_DIR=$installPath\lib" >> $env:GITHUB_ENV
-          # Export RUSTFLAGS including explicit link args for MSVC linker to bring in OpenSSL
-          echo "RUSTFLAGS=-L $installPath\lib -C link-arg=libcrypto.lib -C link-arg=libssl.lib" >> $env:GITHUB_ENV
-          echo "OPENSSL_STATIC=1" >> $env:GITHUB_ENV
+          # For dynamic linking, remove the explicit .lib references and static flag
+          echo "RUSTFLAGS=-L $installPath\lib" >> $env:GITHUB_ENV
+          # Don't set OPENSSL_STATIC
           
           # For ARM64, we need to use the bundled SQLite since cross-compilation is complex
           if ("${{ matrix.target }}" -eq "aarch64") {
@@ -311,7 +317,8 @@ jobs:
           sdist_flag="--sdist"
           for py in ${{ matrix.interpreter }}; do
             echo "Building for Python ${py}"
-            maturin build --release --target ${RUST_TARGET} --interpreter ${py} ${sdist_flag}
+            # Ensure dynamic linking for this build
+            OPENSSL_STATIC=0 SQLCIPHER_STATIC=0 maturin build --release --target ${RUST_TARGET} --interpreter ${py} ${sdist_flag}
             sdist_flag=""
           done
           
@@ -335,7 +342,8 @@ jobs:
         run: |
           # Determine architecture paths
           $arch = if ("${{ matrix.target }}" -eq "aarch64") { "arm64" } else { "x64" }
-          $vcpkgTriplet = "${arch}-windows-static"
+          # Use dynamic libraries
+          $vcpkgTriplet = "${arch}-windows"
           $installPath = "C:\vcpkg\installed\$vcpkgTriplet"
           
           # Set environment variables for the build (ensure linker finds OpenSSL and sqlcipher)
@@ -345,12 +353,12 @@ jobs:
           $env:SQLCIPHER_LIB_DIR = "$installPath\lib"
           $env:SQLCIPHER_INCLUDE_DIR = "$installPath\include"
           $env:SQLITE3_LIB_DIR = "$installPath\lib"
-          # ensure rustc/cargo pass the OpenSSL libs to the MSVC linker
-          $env:RUSTFLAGS = "-L $installPath\lib -C link-arg=libcrypto.lib -C link-arg=libssl.lib"
-          # also set LIB so link.exe will search the directory (runtime)
+          # For dynamic linking
+          $env:RUSTFLAGS = "-L $installPath\lib"
+          # also set LIB so link.exe will search the directory
           $env:LIB = "$installPath\lib;$env:LIB"
-          $env:OPENSSL_STATIC = "1"
-
+          # Don't set OPENSSL_STATIC
+          
           # Confirm sqlcipher.lib exists (helpful debug)
           if (Test-Path "$installPath\lib\sqlcipher.lib") {
             Write-Host "sqlcipher.lib found at $installPath\lib"
