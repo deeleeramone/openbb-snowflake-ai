@@ -114,21 +114,16 @@ jobs:
           rust-toolchain: stable
           docker-options: >-
             -e CI 
-            -e PKG_CONFIG_PATH=/usr/local/lib/pkgconfig 
             -e TARGET=${{ matrix.target }}
-            -e RUSTFLAGS=-L/usr/local/lib
             -e CFLAGS_aarch64_unknown_linux_gnu
             -e CFLAGS_aarch64_unknown_linux_musl
             -e CFLAGS_armv7_unknown_linux_gnueabihf
             -e CFLAGS_armv7_unknown_linux_musleabihf
-            -e OPENSSL_STATIC=1
-            -e OPENSSL_LIB_DIR=/usr/local/lib
-            -e OPENSSL_INCLUDE_DIR=/usr/local/include
           before-script-linux: |
             set -e
             set -x
             
-            # Install build tools and dependencies
+            # Install build tools and dependencies using system package managers
             if command -v apk > /dev/null; then
               apk add pkgconfig perl make gcc musl-dev git openssl-dev tcl
             elif command -v yum > /dev/null; then
@@ -137,100 +132,12 @@ jobs:
               apt-get update && apt-get install -y pkg-config build-essential git libssl-dev tcl
             fi
 
-            # Force OpenSSL to be vendored (built from source) for the Rust crate
+            # Ensure we use vendored openssl for cross-compilation compatibility
             if command -v cargo > /dev/null; then
+              # We use --lock to avoid updating Cargo.lock if not necessary, 
+              # but we need to ensure the feature is enabled.
               cargo add openssl --features vendored
             fi
-
-            # Setup Cross-Compiler Environment
-            HOST_ARG=""
-            OSSL_TARGET=""
-            
-            if [[ "$TARGET" == *"aarch64"* ]]; then
-                if command -v aarch64-unknown-linux-gnu-gcc >/dev/null; then
-                    export CC=aarch64-unknown-linux-gnu-gcc
-                    export AR=aarch64-unknown-linux-gnu-ar
-                    export RANLIB=aarch64-unknown-linux-gnu-ranlib
-                    HOST_ARG="--host=aarch64-unknown-linux-gnu"
-                    OSSL_TARGET="linux-aarch64"
-                elif command -v aarch64-unknown-linux-musl-gcc >/dev/null; then
-                    export CC=aarch64-unknown-linux-musl-gcc
-                    export AR=aarch64-unknown-linux-musl-ar
-                    export RANLIB=aarch64-unknown-linux-musl-ranlib
-                    HOST_ARG="--host=aarch64-unknown-linux-musl"
-                    OSSL_TARGET="linux-aarch64"
-                fi
-            elif [[ "$TARGET" == *"armv7"* ]]; then
-                if command -v armv7-unknown-linux-gnueabihf-gcc >/dev/null; then
-                    export CC=armv7-unknown-linux-gnueabihf-gcc
-                    export AR=armv7-unknown-linux-gnueabihf-ar
-                    export RANLIB=armv7-unknown-linux-gnueabihf-ranlib
-                    HOST_ARG="--host=armv7-unknown-linux-gnueabihf"
-                    OSSL_TARGET="linux-armv4"
-                elif command -v armv7-unknown-linux-musleabihf-gcc >/dev/null; then
-                    export CC=armv7-unknown-linux-musleabihf-gcc
-                    export AR=armv7-unknown-linux-musleabihf-ar
-                    export RANLIB=armv7-unknown-linux-musleabihf-ranlib
-                    HOST_ARG="--host=armv7-unknown-linux-musleabihf"
-                    OSSL_TARGET="linux-armv4"
-                fi
-            fi
-            
-            # Fallback: if CC is set in env (by cross image) and we haven't set HOST_ARG yet
-            if [ -z "$HOST_ARG" ] && [ -n "${CC:-}" ] && [ "${CC:-}" != "gcc" ]; then
-                HOST_TRIPLE="${CC%-gcc}"
-                HOST_ARG="--host=$HOST_TRIPLE"
-            fi
-
-            # Build OpenSSL from source if cross-compiling
-            # (System openssl-devel is x86_64, we need target arch for SQLCipher linking)
-            if [ -n "${OSSL_TARGET:-}" ]; then
-                echo "Building OpenSSL for $TARGET ($OSSL_TARGET)..."
-                curl -L https://www.openssl.org/source/openssl-3.0.13.tar.gz -o openssl.tar.gz
-                tar xzf openssl.tar.gz
-                (
-                    cd openssl-3.0.13
-                    ./Configure $OSSL_TARGET no-shared no-tests --prefix=/usr/local --openssldir=/usr/local
-                    make -j$(nproc)
-                    make install_sw
-                )
-            fi
-            
-            # Update PKG_CONFIG_PATH to include the newly installed openssl
-            export PKG_CONFIG_PATH=/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig:${PKG_CONFIG_PATH:-}
-
-            # Build SQLCipher from source
-            curl -L https://github.com/sqlcipher/sqlcipher/archive/v4.6.0.tar.gz -o sqlcipher.tar.gz
-            tar xzf sqlcipher.tar.gz
-            (
-              cd sqlcipher-4.6.0
-              
-              # Use pkg-config to find OpenSSL flags if available
-              if pkg-config --exists libcrypto; then
-                  echo "Found libcrypto via pkg-config"
-                  export LDFLAGS="${LDFLAGS:-} $(pkg-config --static --libs-only-L libcrypto)"
-                  export CFLAGS="${CFLAGS:-} $(pkg-config --static --cflags libcrypto)"
-                  export LIBS="${LIBS:-} $(pkg-config --static --libs-only-l libcrypto)"
-              else
-                  echo "libcrypto not found via pkg-config, falling back to manual flags"
-                  export LDFLAGS="-L/usr/local/lib64 -L/usr/local/lib"
-                  export CFLAGS="-I/usr/local/include"
-                  export LIBS="-lcrypto -ldl -lpthread"
-              fi
-              
-              # Ensure CFLAGS has -DSQLITE_HAS_CODEC
-              if [[ "${CFLAGS:-}" != *"SQLITE_HAS_CODEC"* ]]; then
-                  export CFLAGS="${CFLAGS:-} -DSQLITE_HAS_CODEC"
-              fi
-
-              ./configure --enable-tempstore=yes --disable-tcl $HOST_ARG
-              make -j$(nproc)
-              make install
-            )
-            
-            # Verify installation
-            echo "Listing /usr/local/lib:"
-            ls -l /usr/local/lib || true
 
       - run: ${{ (matrix.os == 'windows' && 'dir') || 'ls -lh' }} dist/
 
