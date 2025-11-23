@@ -94,8 +94,8 @@ jobs:
         run: |
           # Determine architecture
           $arch = if ("${{ matrix.target }}" -eq "aarch64") { "arm64" } else { "x64" }
-          # Use DYNAMIC libraries - vcpkg defaults to static, we need to specify dynamic
-          $vcpkgTriplet = "${arch}-windows-dynamic"
+          # Use standard triplet - we'll configure for dynamic libraries via features
+          $vcpkgTriplet = "${arch}-windows"
           
           # Check if vcpkg exists and clean it if needed
           if (Test-Path "C:\vcpkg") {
@@ -108,12 +108,21 @@ jobs:
           .\bootstrap-vcpkg.bat
           .\vcpkg integrate install
           
-          # Install OpenSSL and SQLite3 as DYNAMIC libraries
-          Write-Host "Installing DYNAMIC packages for $vcpkgTriplet"
-          .\vcpkg install "openssl:$vcpkgTriplet" "sqlite3:$vcpkgTriplet"
+          # Create custom triplet for dynamic libraries
+          $tripletPath = "C:\vcpkg\triplets\community\${arch}-windows-dynamic.cmake"
+          @"
+          set(VCPKG_TARGET_ARCHITECTURE $arch)
+          set(VCPKG_CRT_LINKAGE dynamic)
+          set(VCPKG_LIBRARY_LINKAGE dynamic)
+          set(VCPKG_BUILD_TYPE release)
+          "@ | Out-File -FilePath $tripletPath -Encoding utf8
+          
+          # Install OpenSSL and SQLite3 as DYNAMIC libraries using custom triplet
+          Write-Host "Installing packages with dynamic linkage for ${arch}-windows-dynamic"
+          .\vcpkg install "openssl:${arch}-windows-dynamic" "sqlite3:${arch}-windows-dynamic"
           
           # Set environment variables for the correct architecture
-          $installPath = "C:\vcpkg\installed\$vcpkgTriplet"
+          $installPath = "C:\vcpkg\installed\${arch}-windows-dynamic"
           
           echo "OPENSSL_DIR=$installPath" >> $env:GITHUB_ENV
           echo "OPENSSL_LIB_DIR=$installPath\lib" >> $env:GITHUB_ENV
@@ -439,7 +448,7 @@ jobs:
         run: |
           # Determine architecture paths
           $arch = if ("${{ matrix.target }}" -eq "aarch64") { "arm64" } else { "x64" }
-          # Use DYNAMIC libraries
+          # Use custom dynamic triplet
           $vcpkgTriplet = "${arch}-windows-dynamic"
           $installPath = "C:\vcpkg\installed\$vcpkgTriplet"
           
