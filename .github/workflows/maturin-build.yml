@@ -208,9 +208,9 @@ jobs:
               # Use pkg-config to find OpenSSL flags if available
               if pkg-config --exists libcrypto; then
                   echo "Found libcrypto via pkg-config"
-                  export LDFLAGS="$LDFLAGS $(pkg-config --libs-only-L libcrypto)"
-                  export CFLAGS="$CFLAGS $(pkg-config --cflags libcrypto)"
-                  export LIBS="$LIBS $(pkg-config --libs-only-l libcrypto)"
+                  export LDFLAGS="${LDFLAGS:-} $(pkg-config --libs-only-L libcrypto)"
+                  export CFLAGS="${CFLAGS:-} $(pkg-config --cflags libcrypto)"
+                  export LIBS="${LIBS:-} $(pkg-config --libs-only-l libcrypto)"
               else
                   echo "libcrypto not found via pkg-config, falling back to manual flags"
                   export LDFLAGS="-L/usr/local/lib64 -L/usr/local/lib"
@@ -222,8 +222,8 @@ jobs:
               fi
               
               # Ensure CFLAGS has -DSQLITE_HAS_CODEC
-              if [[ "$CFLAGS" != *"SQLITE_HAS_CODEC"* ]]; then
-                  export CFLAGS="$CFLAGS -DSQLITE_HAS_CODEC"
+              if [[ "${CFLAGS:-}" != *"SQLITE_HAS_CODEC"* ]]; then
+                  export CFLAGS="${CFLAGS:-} -DSQLITE_HAS_CODEC"
               fi
 
               ./configure --enable-tempstore=yes --disable-tcl $HOST_ARG
