@@ -501,20 +501,121 @@ jobs:
           New-Item -ItemType Directory -Force -Path $bundleDir | Out-Null
           
           # Debug: Show what DLLs are available to bundle
-          Write-Host "DLLs available in $installPath\bin:"
-          Get-ChildItem "$installPath\bin\*.dll" | ForEach-Object { Write-Host "  - $($_.Name)" }
+          Write-Host "`nDLLs available in ${installPath}\bin:"
+          $totalDllSize = 0
+          Get-ChildItem "$installPath\bin\*.dll" -ErrorAction SilentlyContinue | ForEach-Object { 
+            $size = [math]::Round($_.Length / 1MB, 2)
+            $totalDllSize += $_.Length
+            Write-Host "  - $($_.Name) (${size} MB)"
+          }
+          $totalDllSizeMB = [math]::Round($totalDllSize / 1MB, 2)
+          Write-Host "Total DLL size available: ${totalDllSizeMB} MB"
           
+          # Check what our binary actually links against
+          Write-Host "`nChecking wheel dependencies BEFORE repair:"
+          Get-ChildItem -Path target\wheels -Filter *.whl | ForEach-Object {
+            Write-Host "`nAnalyzing: $($_.Name)"
+            $tempPre = Join-Path $env:TEMP "pre_repair_$(Get-Random)"
+            New-Item -ItemType Directory -Force -Path $tempPre | Out-Null
+            python -c "import zipfile; zipfile.ZipFile('$($_.FullName)').extractall('$tempPre')"
+            
+            # Find the .pyd file
+            $pydFile = Get-ChildItem -Path $tempPre -Filter "*.pyd" -Recurse | Select-Object -First 1
+            if ($pydFile) {
+              Write-Host "  Found .pyd: $($pydFile.Name)"
+              # Use dumpbin to check dependencies if available
+              $dumpbin = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.42.34433\bin\Hostx64\$arch\dumpbin.exe"
+              if (-not (Test-Path $dumpbin)) {
+                # Try to find dumpbin in any VS installation
+                $dumpbin = Get-ChildItem -Path "C:\Program Files\Microsoft Visual Studio" -Filter "dumpbin.exe" -Recurse -ErrorAction SilentlyContinue | 
+                           Where-Object { $_.FullName -like "*Host*\$arch\*" -or $_.FullName -like "*Hostx64\x64\*" } | 
+                           Select-Object -First 1
+              }
+              
+              if ($dumpbin -and (Test-Path $dumpbin)) {
+                Write-Host "  Running dumpbin /DEPENDENTS:"
+                & $dumpbin /DEPENDENTS $pydFile.FullName | Select-String -Pattern "\.dll" | ForEach-Object {
+                  Write-Host "    $_"
+                }
+              } else {
+                Write-Host "  WARNING: dumpbin not found, using Python ctypes to check"
+                python -c @"
+                import ctypes.util
+                import os
+                os.chdir(r'$($pydFile.DirectoryName)')
+                try:
+                    # Try to load the pyd and see what it needs
+                    import ctypes
+                    dll = ctypes.CDLL(r'$($pydFile.FullName)')
+                    print('  Successfully loaded (statically linked?)')
+                except Exception as e:
+                    print(f'  Load error (missing DLLs?): {e}')
+                "@
+                              }
+                            }
+                            Remove-Item -Recurse -Force $tempPre
+                          }
+                          
+          Write-Host "`n=== Running delvewheel repair ==="
           Get-ChildItem -Path target -Recurse -Filter *.whl | ForEach-Object {
-            Write-Host "Repairing wheel: $($_.Name)"
-            # Use --add-path to tell delvewheel where to find the DLLs
-            python -m delvewheel repair --add-path "$installPath\bin" -w $bundleDir $_.FullName
+            $originalSize = [math]::Round($_.Length / 1MB, 2)
+            Write-Host "`nRepairing wheel: $($_.Name)"
+            Write-Host "  Original size: ${originalSize} MB"
+            
+            # Run delvewheel with verbose output
+            Write-Host "  Running: python -m delvewheel repair --add-path `"$installPath\bin`" -w `"$bundleDir`" `"$($_.FullName)`""
+            $repairOutput = python -m delvewheel repair --add-path "$installPath\bin" -w "$bundleDir" "$($_.FullName)" 2>&1 | Out-String
+            Write-Host $repairOutput
+            
             if ($LASTEXITCODE -eq 0) {
-              Write-Host "Successfully repaired: $($_.Name)"
+              $repairedPath = Join-Path $bundleDir $_.Name
+              if (Test-Path $repairedPath) {
+                $repairedSize = [math]::Round((Get-Item $repairedPath).Length / 1MB, 2)
+                $sizeDiff = [math]::Round($repairedSize - $originalSize, 2)
+                Write-Host "  Repaired size: ${repairedSize} MB (added ${sizeDiff} MB)"
+                
+                if ($sizeDiff -lt 1) {
+                  Write-Host "  WARNING: Size increase less than 1MB - DLLs may not be bundled!"
+                }
+                
+                # Extract and check what DLLs were bundled
+                $tempExtract = Join-Path $env:TEMP "wheel_check_$(Get-Random)"
+                New-Item -ItemType Directory -Force -Path $tempExtract | Out-Null
+                
+                # Use Python to extract the wheel
+                python -c "import zipfile; zipfile.ZipFile('$repairedPath').extractall('$tempExtract')"
+                
+                # Check for .libs directory
+                $libsDir = Get-ChildItem -Path $tempExtract -Directory -Filter "*.libs" -Recurse | Select-Object -First 1
+                if ($libsDir) {
+                  Write-Host "  Bundled DLLs in $($libsDir.Name):"
+                  $bundledSize = 0
+                  Get-ChildItem -Path $libsDir.FullName -Filter "*.dll" | ForEach-Object {
+                    $dllSize = [math]::Round($_.Length / 1MB, 2)
+                    $bundledSize += $_.Length
+                    Write-Host "    - $($_.Name) (${dllSize} MB)"
+                  }
+                  $bundledSizeMB = [math]::Round($bundledSize / 1MB, 2)
+                  Write-Host "  Total bundled DLL size: ${bundledSizeMB} MB"
+                  
+                  if ($bundledSizeMB -lt 1) {
+                    Write-Host "  ERROR: Less than 1MB of DLLs bundled - OpenSSL likely missing!"
+                  }
+                } else {
+                  Write-Host "  ERROR: No .libs directory found in repaired wheel!"
+                  Write-Host "  Wheel contents:"
+                  Get-ChildItem -Path $tempExtract -Recurse | Select-Object -First 20
+                }
+                
+                Remove-Item -Recurse -Force $tempExtract
+              }
               Remove-Item $_.FullName
             } else {
-              Write-Host "WARNING: Failed to repair: $($_.Name)"
+              Write-Host "  ERROR: delvewheel repair failed with exit code $LASTEXITCODE"
             }
           }
+          
+          Write-Host "`n=== Wheel repair complete ==="
           
           # Move all wheels to dist directory
           New-Item -ItemType Directory -Force -Path dist
