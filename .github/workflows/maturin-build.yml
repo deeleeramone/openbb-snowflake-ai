@@ -241,7 +241,7 @@ jobs:
                 if ! grep -q "\[arch=amd64\]" /etc/apt/sources.list; then
                   sudo sed -i 's/^deb \(http[^ ]*\)/deb [arch=amd64] \1/' /etc/apt/sources.list
                 fi
-                sudo tee "/etc/apt/sources.list.d/${CROSS_ARCH}.list" >/dev/null <<EOF
+                cat <<EOF | sudo tee "/etc/apt/sources.list.d/${CROSS_ARCH}.list" >/dev/null
                 deb [arch=${CROSS_ARCH}] http://ports.ubuntu.com/ubuntu-ports jammy main restricted universe multiverse
                 deb [arch=${CROSS_ARCH}] http://ports.ubuntu.com/ubuntu-ports jammy-updates main restricted universe multiverse
                 deb [arch=${CROSS_ARCH}] http://ports.ubuntu.com/ubuntu-ports jammy-security main restricted universe multiverse
