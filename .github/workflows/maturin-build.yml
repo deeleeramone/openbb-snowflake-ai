@@ -187,9 +187,61 @@ jobs:
               # Try to install sqlcipher-devel but don't fail if it's not available
               yum install -y sqlcipher-devel || echo "sqlcipher-devel not found in yum"
             elif command -v apt-get > /dev/null; then
-              # Debian/Ubuntu
+              case "${TARGET}" in
+                aarch64|aarch64-unknown-linux-gnu)
+                  CROSS_ARCH=arm64
+                  CROSS_LIB_DIR=/usr/lib/aarch64-linux-gnu
+                  CROSS_INCLUDE_DIR=/usr/include/aarch64-linux-gnu
+                  ;;
+                armv7|armv7-unknown-linux-gnueabihf)
+                  CROSS_ARCH=armhf
+                  CROSS_LIB_DIR=/usr/lib/arm-linux-gnueabihf
+                  CROSS_INCLUDE_DIR=/usr/include/arm-linux-gnueabihf
+                  ;;
+                ppc64le|powerpc64le-unknown-linux-gnu)
+                  CROSS_ARCH=ppc64el
+                  CROSS_LIB_DIR=/usr/lib/powerpc64le-linux-gnu
+                  CROSS_INCLUDE_DIR=/usr/include/powerpc64le-linux-gnu
+                  ;;
+                s390x|s390x-unknown-linux-gnu)
+                  CROSS_ARCH=s390x
+                  CROSS_LIB_DIR=/usr/lib/s390x-linux-gnu
+                  CROSS_INCLUDE_DIR=/usr/include/s390x-linux-gnu
+                  ;;
+                *)
+                  CROSS_ARCH=""
+                  ;;
+              esac
+
+              if [ -n "${CROSS_ARCH}" ]; then
+                sudo dpkg --add-architecture "${CROSS_ARCH}" || true
+              fi
+
               sudo apt-get update
-              sudo apt-get install -y pkg-config build-essential git tcl libsqlcipher-dev libssl-dev
+              sudo apt-get install -y pkg-config build-essential dpkg-dev git tcl libsqlcipher-dev libssl-dev
+
+              if [ -n "${CROSS_ARCH}" ]; then
+                sudo apt-get install -y "libssl-dev:${CROSS_ARCH}"
+                export OPENSSL_LIB_DIR="${CROSS_LIB_DIR}"
+                export OPENSSL_INCLUDE_DIR="${CROSS_INCLUDE_DIR}"
+                case "${TARGET}" in
+                  aarch64|aarch64-unknown-linux-gnu)
+                    export AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_DIR=/usr
+                    export AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_LIB_DIR="${CROSS_LIB_DIR}"
+                    export AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_INCLUDE_DIR="${CROSS_INCLUDE_DIR}"
+                    ;;
+                  armv7|armv7-unknown-linux-gnueabihf)
+                    export ARMV7_UNKNOWN_LINUX_GNUEABIHF_OPENSSL_DIR=/usr
+                    export ARMV7_UNKNOWN_LINUX_GNUEABIHF_OPENSSL_LIB_DIR="${CROSS_LIB_DIR}"
+                    export ARMV7_UNKNOWN_LINUX_GNUEABIHF_OPENSSL_INCLUDE_DIR="${CROSS_INCLUDE_DIR}"
+                    ;;
+                esac
+              else
+                HOST_MULTIARCH="$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || echo x86_64-linux-gnu)"
+                export OPENSSL_LIB_DIR="/usr/lib/${HOST_MULTIARCH}"
+                export OPENSSL_INCLUDE_DIR="/usr/include/${HOST_MULTIARCH}"
+              fi
+
               export OPENSSL_DIR=/usr
               export OPENSSL_STATIC=1
             fi
