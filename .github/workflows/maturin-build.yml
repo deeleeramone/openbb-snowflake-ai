@@ -636,62 +636,162 @@ jobs:
             $originalSize = [math]::Round($_.Length / 1MB, 2)
             Write-Host "`nRepairing wheel: $($_.Name)"
             Write-Host "  Original size: ${originalSize} MB"
+
+            # Extract the wheel first
+            $wheelName = $_.Name
+            $wheelPath = $_.FullName
+            $tempDir = Join-Path $env:TEMP "manual_repair_$(Get-Random)"
+            New-Item -ItemType Directory -Force -Path $tempDir | Out-Null
             
-            # Run delvewheel with verbose output
-            Write-Host "  Running: python -m delvewheel repair --add-path `"$installPath\bin`" -w `"$bundleDir`" `"$($_.FullName)`""
-            $repairOutput = python -m delvewheel repair --add-path "$installPath\bin" -w "$bundleDir" "$($_.FullName)" 2>&1 | Out-String
-            Write-Host $repairOutput
+            Write-Host "  Extracting wheel to $tempDir"
+            $tempDirPy = $tempDir.Replace('\', '/')
+            $wheelPathPy = $wheelPath.Replace('\', '/')
+            python -c "import zipfile; zipfile.ZipFile('$wheelPathPy').extractall('$tempDirPy')"
             
-            if ($LASTEXITCODE -eq 0) {
-              $repairedPath = Join-Path $bundleDir $_.Name
-              if (Test-Path $repairedPath) {
-                $repairedSize = [math]::Round((Get-Item $repairedPath).Length / 1MB, 2)
-                $sizeDiff = [math]::Round($repairedSize - $originalSize, 2)
-                Write-Host "  Repaired size: ${repairedSize} MB (added ${sizeDiff} MB)"
-                
-                if ($sizeDiff -lt 1) {
-                  Write-Host "  WARNING: Size increase less than 1MB - DLLs may not be bundled!"
-                }
-                
-                # Extract and check what DLLs were bundled
-                $tempExtract = Join-Path $env:TEMP "wheel_check_$(Get-Random)"
-                New-Item -ItemType Directory -Force -Path $tempExtract | Out-Null
-                
-                # Use Python to extract the wheel - use forward slashes for paths
-                $repairedPathPy = $repairedPath.Replace('\', '/')
-                $tempExtractPy = $tempExtract.Replace('\', '/')
-                python -c "import zipfile; zipfile.ZipFile('$repairedPathPy').extractall('$tempExtractPy')"
-                
-                # Check for .libs directory
-                $libsDir = Get-ChildItem -Path $tempExtract -Directory -Filter "*.libs" -Recurse | Select-Object -First 1
-                if ($libsDir) {
-                  Write-Host "  Bundled DLLs in $($libsDir.Name):"
-                  $bundledSize = 0
-                  Get-ChildItem -Path $libsDir.FullName -Filter "*.dll" | ForEach-Object {
-                    $dllSize = [math]::Round($_.Length / 1MB, 2)
-                    $bundledSize += $_.Length
-                    Write-Host "    - $($_.Name) (${dllSize} MB)"
-                  }
-                  $bundledSizeMB = [math]::Round($bundledSize / 1MB, 2)
-                  Write-Host "  Total bundled DLL size: ${bundledSizeMB} MB"
-                  
-                  if ($bundledSizeMB -lt 1) {
-                    Write-Host "  ERROR: Less than 1MB of DLLs bundled - OpenSSL likely missing!"
-                  }
-                } else {
-                  Write-Host "  ERROR: No .libs directory found in repaired wheel!"
-                  Write-Host "  Wheel contents:"
-                  Get-ChildItem -Path $tempExtract -Recurse | Select-Object -First 20 | ForEach-Object {
-                    Write-Host "    $($_.FullName.Replace($tempExtract, ''))"
-                  }
-                }
-                
-                Remove-Item -Recurse -Force $tempExtract
-              }
-              Remove-Item $_.FullName
-            } else {
-              Write-Host "  ERROR: delvewheel repair failed with exit code $LASTEXITCODE"
+            # Find the package name (should be snowflake_ai)
+            $packageDir = Get-ChildItem -Path $tempDir -Directory | Where-Object { $_.Name -match "snowflake" } | Select-Object -First 1
+            if (-not $packageDir) {
+              Write-Host "  ERROR: Could not find package directory!"
+              Remove-Item -Recurse -Force $tempDir
+              continue
             }
+            
+            # Create .libs directory inside the package
+            $libsDir = Join-Path $packageDir.FullName ".libs"
+            New-Item -ItemType Directory -Force -Path $libsDir | Out-Null
+            Write-Host "  Created $libsDir"
+            
+            Write-Host "  Copying ALL DLLs from $installPath\bin to $libsDir"
+            # List of DLLs we MUST include
+            $requiredDlls = @(
+              "libssl-3-${arch}.dll",
+              "libcrypto-3-${arch}.dll",
+              "sqlcipher.dll",
+              "sqlite3.dll",
+              "legacy.dll"
+            )
+            
+            $copiedDlls = @()
+            foreach ($dllName in $requiredDlls) {
+              $sourceDll = Join-Path "$installPath\bin" $dllName
+              if (Test-Path $sourceDll) {
+                # Generate a unique name to avoid conflicts (like delvewheel does)
+                $hash = [System.Guid]::NewGuid().ToString("N").Substring(0, 32)
+                $baseName = [System.IO.Path]::GetFileNameWithoutExtension($dllName)
+                $mangledName = "${baseName}-${hash}.dll"
+                $destDll = Join-Path $libsDir $mangledName
+                
+                Copy-Item $sourceDll $destDll -Force
+                $size = [math]::Round((Get-Item $destDll).Length / 1MB, 2)
+                Write-Host "    Copied $dllName -> $mangledName (${size} MB)"
+                $copiedDlls += $mangledName
+              } else {
+                Write-Host "    WARNING: $dllName not found at $sourceDll"
+              }
+            }
+            
+            # Now we need to patch the __init__.py to load these DLLs
+            $initPy = Join-Path $packageDir.FullName "__init__.py"
+            if (Test-Path $initPy) {
+              $initContent = Get-Content $initPy -Raw
+            } else {
+              $initContent = ""
+            }
+            
+            # Prepend DLL loading code (similar to what delvewheel does)
+            $dllLoader = @"
+            # DLL loader injected by manual repair
+            import os
+            import sys
+
+            if sys.platform == 'win32':
+                _libs_dir = os.path.join(os.path.dirname(__file__), '.libs')
+                if os.path.isdir(_libs_dir):
+                    os.add_dll_directory(_libs_dir)
+                    # Also try to load specific DLLs we need
+                    import ctypes
+                    for dll_name in os.listdir(_libs_dir):
+                        if dll_name.endswith('.dll'):
+                            try:
+                                dll_path = os.path.join(_libs_dir, dll_name)
+                                ctypes.CDLL(dll_path)
+                            except Exception:
+                                pass  # Some DLLs might not load directly, that's ok
+
+            "@
+                        
+                        # Only add if not already present
+                        if ($initContent -notmatch "os.add_dll_directory") {
+                          $newContent = $dllLoader + "`n" + $initContent
+                          Set-Content -Path $initPy -Value $newContent -Encoding UTF8
+                          Write-Host "  Patched __init__.py to load DLLs"
+                        }
+                        
+                        # Repackage the wheel
+                        Write-Host "  Repackaging wheel..."
+                        $repairedWheelPath = Join-Path $bundleDir $wheelName
+                        
+                        # Create the wheel using Python's zipfile
+                        $pythonScript = @"
+            import zipfile
+            import os
+            import stat
+
+            def make_executable(path):
+                """Make a file executable on Unix-like systems"""
+                try:
+                    st = os.stat(path)
+                    os.chmod(path, st.st_mode | stat.S_IEXEC)
+                except:
+                    pass
+
+            wheel_path = r'$repairedWheelPath'.replace('\\', '/')
+            temp_dir = r'$tempDir'.replace('\\', '/')
+
+            with zipfile.ZipFile(wheel_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for root, dirs, files in os.walk(temp_dir):
+                    for file in files:
+                        file_path = os.path.join(root, file)
+                        arc_path = os.path.relpath(file_path, temp_dir)
+                        # Convert to forward slashes for the archive
+                        arc_path = arc_path.replace('\\', '/')
+                        zf.write(file_path, arc_path)
+                        # Check if it's a .so or .pyd and needs execute permissions
+                        if file.endswith(('.so', '.pyd', '.dll')):
+                            info = zf.getinfo(arc_path)
+                            info.external_attr = 0o755 << 16  # Set execute permissions
+
+            print(f"Created wheel: {wheel_path}")
+            "@
+                        
+            python -c $pythonScript
+            
+            # Verify the repaired wheel
+            if (Test-Path $repairedWheelPath) {
+              $repairedSize = [math]::Round((Get-Item $repairedWheelPath).Length / 1MB, 2)
+              $sizeDiff = [math]::Round($repairedSize - $originalSize, 2)
+              Write-Host "  Repaired size: ${repairedSize} MB (added ${sizeDiff} MB)"
+              
+              # List what we bundled
+              Write-Host "  Manually bundled DLLs:"
+              foreach ($dll in $copiedDlls) {
+                Write-Host "    - $dll"
+              }
+              
+              $totalBundled = (Get-ChildItem $libsDir -Filter "*.dll" | Measure-Object -Property Length -Sum).Sum
+              $totalBundledMB = [math]::Round($totalBundled / 1MB, 2)
+              Write-Host "  Total bundled DLL size: ${totalBundledMB} MB"
+              
+              if ($totalBundledMB -lt 5) {
+                Write-Host "  WARNING: Expected ~10MB of DLLs but only bundled ${totalBundledMB} MB!"
+              }
+            }
+            
+            # Clean up temp directory
+            Remove-Item -Recurse -Force $tempDir
+            
+            # Remove original wheel
+            Remove-Item $wheelPath
           }
           
           # Move all wheels to dist directory
