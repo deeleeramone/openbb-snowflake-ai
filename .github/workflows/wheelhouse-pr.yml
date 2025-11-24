@@ -15,6 +15,7 @@ permissions:
   contents: write
   pull-requests: write
   actions: read
+  id-token: write  # Required for attestations
 
 jobs:
   create-wheelhouse-pr:
@@ -103,7 +104,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: release-archives
-          path: .
+          path: release-archives
           run-id: ${{ env.RUN_ID }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -192,6 +193,7 @@ jobs:
 
       - name: Generate build attestations for wheels
         uses: actions/attest-build-provenance@v1
+        continue-on-error: true  # Don't fail the workflow if attestations fail
         with:
           subject-path: |
             wheelhouse/*.whl
