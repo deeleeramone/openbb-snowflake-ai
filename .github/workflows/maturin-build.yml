@@ -505,12 +505,30 @@ jobs:
           $env:SQLCIPHER_LIB_DIR = "$installPath\lib"
           $env:SQLCIPHER_INCLUDE_DIR = "$installPath\include"
           $env:SQLITE3_LIB_DIR = "$installPath\lib"
-          # Force dynamic linking
-          $env:RUSTFLAGS = "-L $installPath\lib"
-          $env:LIB = "$installPath\lib;$env:LIB"
+          
+          # CRITICAL: Force linking against ALL the DLLs we need
+          # List the actual DLL names without extensions
+          $sslDllName = if ($arch -eq "arm64") { "libssl-3-arm64" } else { "libssl-3-x64" }
+          $cryptoDllName = if ($arch -eq "arm64") { "libcrypto-3-arm64" } else { "libcrypto-3-x64" }
+          
+          # Windows MSVC linker needs the .lib import libraries, but we force it to use the DLLs at runtime
+          # Add all the paths and force linking
+          $env:RUSTFLAGS = "-L `"$installPath\lib`" -L `"$installPath\bin`""
+          $env:RUSTFLAGS += " -C link-arg=/LIBPATH:`"$installPath\lib`""
+          $env:RUSTFLAGS += " -C link-arg=/LIBPATH:`"$installPath\bin`""
+          $env:RUSTFLAGS += " -C link-arg=libssl.lib"
+          $env:RUSTFLAGS += " -C link-arg=libcrypto.lib"
+          $env:RUSTFLAGS += " -C link-arg=sqlcipher.lib"
+          # Force DLL dependencies
+          $env:RUSTFLAGS += " -C link-arg=/DEPENDENTLOADFLAG:0x800"
+          
+          $env:LIB = "$installPath\lib;$installPath\bin;$env:LIB"
           $env:PATH = "$installPath\bin;$env:PATH"
+          
           # Explicitly disable static linking
           $env:OPENSSL_STATIC = "0"
+          # Force OpenSSL sys crate to link dynamically
+          $env:OPENSSL_LIBS = "ssl:libssl;crypto:libcrypto"
           
           # Confirm sqlcipher.lib exists (helpful debug)
           if (Test-Path "$installPath\lib\sqlcipher.lib") {
