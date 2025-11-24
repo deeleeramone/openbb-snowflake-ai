@@ -201,6 +201,9 @@ jobs:
           git config user.name "github-actions[bot]"
           git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           
+          # Define commit message
+          COMMIT_MSG="Update wheelhouse from build run ${RUN_ID}"
+          
           # Save wheelhouse contents to temp location before switching branches
           echo "Saving wheelhouse to temp location..."
           cp -r wheelhouse /tmp/wheelhouse-save
