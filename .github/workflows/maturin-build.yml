@@ -699,71 +699,22 @@ jobs:
             }
             
             # Prepend DLL loading code (similar to what delvewheel does)
-            $dllLoader = @"
-            # DLL loader injected by manual repair
-            import os
-            import sys
-
-            if sys.platform == 'win32':
-                _libs_dir = os.path.join(os.path.dirname(__file__), '.libs')
-                if os.path.isdir(_libs_dir):
-                    os.add_dll_directory(_libs_dir)
-                    # Also try to load specific DLLs we need
-                    import ctypes
-                    for dll_name in os.listdir(_libs_dir):
-                        if dll_name.endswith('.dll'):
-                            try:
-                                dll_path = os.path.join(_libs_dir, dll_name)
-                                ctypes.CDLL(dll_path)
-                            except Exception:
-                                pass  # Some DLLs might not load directly, that's ok
-
-            "@
-                        
-                        # Only add if not already present
-                        if ($initContent -notmatch "os.add_dll_directory") {
-                          $newContent = $dllLoader + "`n" + $initContent
-                          Set-Content -Path $initPy -Value $newContent -Encoding UTF8
-                          Write-Host "  Patched __init__.py to load DLLs"
-                        }
-                        
-                        # Repackage the wheel
-                        Write-Host "  Repackaging wheel..."
-                        $repairedWheelPath = Join-Path $bundleDir $wheelName
-                        
-                        # Create the wheel using Python's zipfile
-                        $pythonScript = @"
-            import zipfile
-            import os
-            import stat
-
-            def make_executable(path):
-                """Make a file executable on Unix-like systems"""
-                try:
-                    st = os.stat(path)
-                    os.chmod(path, st.st_mode | stat.S_IEXEC)
-                except:
-                    pass
-
-            wheel_path = r'$repairedWheelPath'.replace('\\', '/')
-            temp_dir = r'$tempDir'.replace('\\', '/')
-
-            with zipfile.ZipFile(wheel_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-                for root, dirs, files in os.walk(temp_dir):
-                    for file in files:
-                        file_path = os.path.join(root, file)
-                        arc_path = os.path.relpath(file_path, temp_dir)
-                        # Convert to forward slashes for the archive
-                        arc_path = arc_path.replace('\\', '/')
-                        zf.write(file_path, arc_path)
-                        # Check if it's a .so or .pyd and needs execute permissions
-                        if file.endswith(('.so', '.pyd', '.dll')):
-                            info = zf.getinfo(arc_path)
-                            info.external_attr = 0o755 << 16  # Set execute permissions
-
-            print(f"Created wheel: {wheel_path}")
-            "@
-                        
+            $dllLoader = "# DLL loader injected by manual repair`nimport os`nimport sys`n`nif sys.platform == 'win32':`n    _libs_dir = os.path.join(os.path.dirname(__file__), '.libs')`n    if os.path.isdir(_libs_dir):`n        os.add_dll_directory(_libs_dir)`n        # Also try to load specific DLLs we need`n        import ctypes`n        for dll_name in os.listdir(_libs_dir):`n            if dll_name.endswith('.dll'):`n                try:`n                    dll_path = os.path.join(_libs_dir, dll_name)`n                    ctypes.CDLL(dll_path)`n                except Exception:`n                    pass  # Some DLLs might not load directly, that's ok`n"
+            
+            # Only add if not already present
+            if ($initContent -notmatch "os.add_dll_directory") {
+              $newContent = $dllLoader + "`n" + $initContent
+              Set-Content -Path $initPy -Value $newContent -Encoding UTF8
+              Write-Host "  Patched __init__.py to load DLLs"
+            }
+            
+            # Repackage the wheel
+            Write-Host "  Repackaging wheel..."
+            $repairedWheelPath = Join-Path $bundleDir $wheelName
+            
+            # Create the wheel using Python's zipfile - use a single-line script
+            $pythonScript = "import zipfile; import os; import stat; wheel_path = r'$repairedWheelPath'.replace('\\', '/'); temp_dir = r'$tempDir'.replace('\\', '/'); zf = zipfile.ZipFile(wheel_path, 'w', zipfile.ZIP_DEFLATED); [(zf.write(os.path.join(root, file), os.path.relpath(os.path.join(root, file), temp_dir).replace('\\', '/'))) for root, dirs, files in os.walk(temp_dir) for file in files]; zf.close(); print(f'Created wheel: {wheel_path}')"
+            
             python -c $pythonScript
             
             # Verify the repaired wheel
