@@ -190,6 +190,13 @@ jobs:
             echo "release-archives artifact not found; skipping merge."
           fi
 
+      - name: Generate build attestations for wheels
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: |
+            wheelhouse/*.whl
+            wheelhouse/*.tar.gz
+
       - name: Commit wheelhouse into repo branch
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -229,8 +236,19 @@ jobs:
           git rm -f wheelhouse/*.tar.gz.sha256 2>/dev/null || true
           git rm -f wheelhouse/CHECKSUMS.sha256 2>/dev/null || true
           
-          # Copy the NEW wheel files
-          echo "Copying NEW wheelhouse files..."
+          # Copy the NEW wheel files from temp location
+          echo "Copying NEW wheelhouse files from temp location..."
+          mkdir -p wheelhouse
+          cp -v /tmp/wheelhouse-save/* wheelhouse/ 2>/dev/null || true
+          
+          # Add the new files to git
+          echo "Adding new wheelhouse files to git..."
+          git add wheelhouse/*.whl 2>/dev/null || true
+          git add wheelhouse/*.whl.sha256 2>/dev/null || true
+          git add wheelhouse/*.tar.gz 2>/dev/null || true
+          git add wheelhouse/*.tar.gz.sha256 2>/dev/null || true
+          git add wheelhouse/CHECKSUMS.sha256 2>/dev/null || true
+          
           echo "Checking staged files..."
           STAGED_COUNT=$(git diff --cached --name-only | wc -l)
           echo "Number of staged files: $STAGED_COUNT"
