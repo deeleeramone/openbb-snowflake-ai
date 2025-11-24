@@ -6,6 +6,8 @@ on:
 permissions:
   contents: read
   actions: write
+  id-token: write      # Required for OIDC token to sign attestations
+  attestations: write  # Required to persist attestations
 
 jobs:
   build:
@@ -764,6 +766,8 @@ jobs:
     permissions:
       contents: read
       actions: write
+      id-token: write      # Required for OIDC token to sign attestations
+      attestations: write  # Required to persist attestations
     
     steps:
       - uses: actions/checkout@v4
@@ -846,6 +850,14 @@ jobs:
           find wheelhouse -maxdepth 1 -type f \( -name "*.tar.gz" -o -name "*.tar.gz.sha256" -o -name "CHECKSUMS.sha256" \) -exec cp {} release-archives/ \;
           echo "Release archives:"
           ls -lh release-archives || true
+
+      - name: Generate build provenance attestations
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: |
+            wheelhouse/*.whl
+            wheelhouse/*.tar.gz
+          show-summary: true
 
       - name: Upload release archives
         uses: actions/upload-artifact@v4
