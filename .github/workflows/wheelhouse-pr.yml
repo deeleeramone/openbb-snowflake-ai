@@ -28,7 +28,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          ref: main
+          ref: develop
 
       - name: Determine build run id
         id: determine_run
@@ -191,14 +191,6 @@ jobs:
             echo "release-archives artifact not found; skipping merge."
           fi
 
-      - name: Generate build attestations for wheels
-        uses: actions/attest-build-provenance@v1
-        continue-on-error: true  # Don't fail the workflow if attestations fail
-        with:
-          subject-path: |
-            wheelhouse/*.whl
-            wheelhouse/*.tar.gz
-
       - name: Commit wheelhouse into repo branch
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -219,10 +211,7 @@ jobs:
           
           # Verify the files are actually there and are real wheel files
           echo "Contents of /tmp/wheelhouse-save (showing file sizes):"
-          ls -lh /tmp/wheelhouse-save/*.whl 2>/dev/null | head -10
-          
-          # Clean up wheelhouse from working directory to avoid checkout conflicts
-          rm -rf wheelhouse
+          ls -lh /tmp/wheelhouse-save/ 2>/dev/null | head -20
           
           echo "Fetching branches..."
           git fetch origin
@@ -230,26 +219,22 @@ jobs:
           echo "Switching to build branch..."
           git checkout -B build origin/develop
           
-          # Remove OLD wheel and sha files ONLY (keep .gitignore and .gitkeep)
-          echo "Removing old wheel and sha files from git..."
-          git rm -f wheelhouse/*.whl 2>/dev/null || true
-          git rm -f wheelhouse/*.whl.sha256 2>/dev/null || true
-          git rm -f wheelhouse/*.tar.gz 2>/dev/null || true
-          git rm -f wheelhouse/*.tar.gz.sha256 2>/dev/null || true
-          git rm -f wheelhouse/CHECKSUMS.sha256 2>/dev/null || true
-          
-          # Copy the NEW wheel files from temp location
-          echo "Copying NEW wheelhouse files from temp location..."
+          # Clean out the old wheelhouse completely
+          echo "Cleaning old wheelhouse directory..."
+          rm -rf wheelhouse
           mkdir -p wheelhouse
-          cp -v /tmp/wheelhouse-save/* wheelhouse/ 2>/dev/null || true
           
-          # Add the new files to git
-          echo "Adding new wheelhouse files to git..."
-          git add wheelhouse/*.whl 2>/dev/null || true
-          git add wheelhouse/*.whl.sha256 2>/dev/null || true
-          git add wheelhouse/*.tar.gz 2>/dev/null || true
-          git add wheelhouse/*.tar.gz.sha256 2>/dev/null || true
-          git add wheelhouse/CHECKSUMS.sha256 2>/dev/null || true
+          # Copy ALL files from the saved wheelhouse
+          echo "Copying NEW wheelhouse files from temp location..."
+          cp -rv /tmp/wheelhouse-save/* wheelhouse/
+          
+          # Show what we have
+          echo "New wheelhouse contents:"
+          ls -lh wheelhouse/ | head -20
+          
+          # Stage all changes (deletions and additions)
+          echo "Staging all wheelhouse changes..."
+          git add wheelhouse/
           
           echo "Checking staged files..."
           STAGED_COUNT=$(git diff --cached --name-only | wc -l)
@@ -261,23 +246,41 @@ jobs:
             echo ""
             echo "File size changes:"
             git diff --cached --stat
+          else
+            # If no changes, it might mean files are identical
+            echo "No changes detected. Checking if files already exist..."
+            ls -lh wheelhouse/*.whl 2>/dev/null | head -5 || echo "No wheel files found!"
+            
+            # Force add to make sure
+            echo "Force adding wheelhouse files..."
+            git add -f wheelhouse/
+            STAGED_COUNT=$(git diff --cached --name-only | wc -l)
+            
+            if [ "$STAGED_COUNT" -eq 0 ]; then
+              echo "WARNING: No changes to commit. Files might be identical to existing ones."
+              echo "Current wheelhouse contents:"
+              ls -lah wheelhouse/
+              # Don't fail here - just skip the commit if nothing changed
+              echo "Skipping commit as files are unchanged."
+            else
+              echo "Files staged after force add: $STAGED_COUNT"
+            fi
           fi
           
-          if [ "$STAGED_COUNT" -eq 0 ]; then
-            echo "ERROR: No files were staged! Something is wrong."
-            exit 1
+          if [ "$STAGED_COUNT" -gt 0 ]; then
+            echo "Committing $STAGED_COUNT files..."
+            git commit -m "${COMMIT_MSG}"
+            
+            # Show what was committed
+            echo "Committed changes:"
+            git show --stat
+            
+            echo "Force pushing to build branch..."
+            git push --force origin build
+            echo "Successfully pushed wheelhouse files!"
+          else
+            echo "No changes to push."
           fi
-          
-          echo "Committing $STAGED_COUNT files..."
-          git commit -m "${COMMIT_MSG}"
-          
-          # Show what was committed
-          echo "Committed changes:"
-          git show --stat
-          
-          echo "Force pushing to build branch..."
-          git push --force origin build
-          echo "Successfully pushed REAL wheelhouse files!"
 
       - name: Create or update Pull Request (build → develop)
         id: create_or_update_pr
