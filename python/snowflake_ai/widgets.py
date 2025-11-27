@@ -137,11 +137,10 @@ async def upload_widget_file(
                 }
             )
 
-        return {
-            "success": all(r["removed"] for r in results),
-            "action": "remove",
-            "results": results,
-        }
+        if os.environ.get("SNOWFLAKE_DEBUG"):
+            print(f"[DEBUG] Upload widget remove results: {results}")
+
+        return True
 
     file_bytes: bytes | None = None
     file_name: str = ""
@@ -149,9 +148,17 @@ async def upload_widget_file(
 
     # Handle different input methods
     if path := payload.get("path", ""):
-        file_name = path.split("/")[-1]
+        if not os.path.isfile(path):
+            raise HTTPException(
+                status_code=400, detail=f"File path does not exist: {path}"
+            )
+        path_obj = os.path.normpath(path)
+        path = str(path_obj)
+        file_name = path.rsplit("/", maxsplit=1)[-1]
+
         with open(path, "rb") as file:
             file_bytes = file.read()
+
     elif url := payload.get("url", ""):
         file_name = url.split("/")[-1].split("?")[0]  # Remove query params
 
@@ -614,9 +621,11 @@ startxref
             files.append(
                 {
                     "error_type": "download_error",
-                    "content": f"Failed to download {filename}: {exc}",
+                    "content": f"Failed to download {filename}",
                 }
             )
+            if os.environ.get("SNOWFLAKE_DEBUG"):
+                print(f"[ERROR] Failed to download document {filename}: {exc}")
             continue
 
         if not document_content:
