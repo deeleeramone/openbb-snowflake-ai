@@ -80,15 +80,32 @@ jobs:
         if: matrix.os == 'macos'
         run: |
           brew install openssl@3 sqlcipher pkg-config
-          echo "OPENSSL_DIR=$(brew --prefix openssl@3)" >> $GITHUB_ENV
-          echo "PKG_CONFIG_PATH=$(brew --prefix openssl@3)/lib/pkgconfig:$(brew --prefix sqlcipher)/lib/pkgconfig" >> $GITHUB_ENV
+          
+          OPENSSL_PREFIX=$(brew --prefix openssl@3)
+          SQLCIPHER_PREFIX=$(brew --prefix sqlcipher)
+          
+          echo "OPENSSL_DIR=$OPENSSL_PREFIX" >> $GITHUB_ENV
+          echo "OPENSSL_LIB_DIR=$OPENSSL_PREFIX/lib" >> $GITHUB_ENV
+          echo "OPENSSL_INCLUDE_DIR=$OPENSSL_PREFIX/include" >> $GITHUB_ENV
+          
+          # Critical: Set SQLCIPHER paths so libsqlite3-sys finds Homebrew's SQLCipher
+          echo "SQLCIPHER_LIB_DIR=$SQLCIPHER_PREFIX/lib" >> $GITHUB_ENV
+          echo "SQLCIPHER_INCLUDE_DIR=$SQLCIPHER_PREFIX/include" >> $GITHUB_ENV
+          
+          echo "PKG_CONFIG_PATH=$OPENSSL_PREFIX/lib/pkgconfig:$SQLCIPHER_PREFIX/lib/pkgconfig" >> $GITHUB_ENV
+          
           # Force dynamic linking so delocate can bundle the dylibs
           echo "OPENSSL_STATIC=0" >> $GITHUB_ENV
           echo "SQLCIPHER_STATIC=0" >> $GITHUB_ENV
+          
+          # Use pkg-config to find SQLCipher (required when not using bundled feature)
+          echo "LIBSQLITE3_SYS_USE_PKG_CONFIG=1" >> $GITHUB_ENV
+          
           # Tell Rust linker where to find the dylibs at build time
-          echo "RUSTFLAGS=-L $(brew --prefix sqlcipher)/lib -L $(brew --prefix openssl@3)/lib" >> $GITHUB_ENV
-          # Set rpath so the binary can find dylibs before delocate processes them
-          echo "DYLD_LIBRARY_PATH=$(brew --prefix openssl@3)/lib:$(brew --prefix sqlcipher)/lib" >> $GITHUB_ENV
+          echo "RUSTFLAGS=-L $SQLCIPHER_PREFIX/lib -L $OPENSSL_PREFIX/lib" >> $GITHUB_ENV
+          
+          # Set library path so the binary can find dylibs before delocate processes them
+          echo "DYLD_LIBRARY_PATH=$OPENSSL_PREFIX/lib:$SQLCIPHER_PREFIX/lib" >> $GITHUB_ENV
 
       - name: Install dependencies (Windows)
         if: matrix.os == 'windows'

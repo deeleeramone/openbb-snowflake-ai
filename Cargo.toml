@@ -36,6 +36,8 @@ flate2 = "1.0"
 [target.'cfg(windows)'.dependencies]
 openssl-sys = { version = "0.9", features = [] }  
 
+[target.'cfg(target_os = "macos")'.dependencies]
+rusqlite = { version = "0.30.0", features = ["sqlcipher"] }
 
 [features]
 extension-module = ["pyo3/extension-module"]
