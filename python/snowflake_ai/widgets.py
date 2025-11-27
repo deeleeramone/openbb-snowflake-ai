@@ -153,10 +153,10 @@ async def upload_widget_file(
                 status_code=400, detail=f"File path does not exist: {path}"
             )
         path_obj = os.path.normpath(path)
-        path = str(path_obj)
+        new_path = str(path_obj)
         file_name = path.rsplit("/", maxsplit=1)[-1]
 
-        with open(path, "rb") as file:
+        with open(new_path, "rb") as file:
             file_bytes = file.read()
 
     elif url := payload.get("url", ""):
