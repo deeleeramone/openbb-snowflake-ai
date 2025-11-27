@@ -1,5 +1,4 @@
 mod agents;
-mod cache;
 mod engine;
 mod lsp;
 
@@ -968,7 +967,7 @@ async fn main() {
                                 }
 
                                 if !stage_name.is_empty() {
-                                    if let Ok(files) = engine.list_files_in_stage(stage_name).await {
+                                    if let Ok(files) = engine.list_files_in_stage(stage_name, false).await {
                                         let yaml_files: Vec<_> = files
                                             .iter()
                                             .filter(|f| {

@@ -1,7 +1,8 @@
 """LLM streaming response handler for Snowflake AI."""
 
 import asyncio
-import os  # Move this to top-level import
+import json
+import os
 import re
 import threading
 from collections.abc import Iterator
@@ -74,22 +75,69 @@ async def stream_llm_with_tools(
     """
     from openbb_ai import cite
     from openbb_ai.models import CitationHighlightBoundingBox
-    from .helpers import pdf_text_blocks, find_best_match, llm_referenced_quotes
+    from .helpers import (
+        pdf_text_blocks,
+        find_best_match,
+        llm_referenced_quotes,
+        snowflake_document_pages,
+        document_sources,
+        find_best_match_in_snowflake_pages,
+    )
 
+    def estimate_tokens(text: str) -> int:
+        """Estimate token count - roughly 4 characters per token for English."""
+        if not text:
+            return 0
+        return max(1, len(text) // 4)
+
+    # Filter out empty messages and validate content - Cortex API requires valid content
+    filtered_messages = []
+    prompt_text = ""  # Track prompt text for token estimation
+    for role, content in messages:
+        if not content or not content.strip():
+            continue
+        # Ensure role is valid
+        if role not in ("system", "user", "assistant"):
+            if role in ("human",):
+                role = "user"
+            elif role in ("ai",):
+                role = "assistant"
+            else:
+                continue  # Skip invalid roles
+        filtered_messages.append((role, content))
+        prompt_text += content + " "  # Accumulate for token estimation
+
+    if not filtered_messages:
+        yield ("text", "No valid messages to process.")
+        yield (
+            "complete",
+            {"text": "No valid messages to process.", "tool_calls": [], "usage": {}},
+        )
+        return
+
+    # Estimate prompt tokens upfront
+    estimated_prompt_tokens = estimate_tokens(prompt_text)
+
+    # Debug: log message count
+    if os.environ.get("SNOWFLAKE_DEBUG"):
+        print(f"[DEBUG] Sending {len(filtered_messages)} messages to Cortex API")
+
+    # Don't pass tools to the API - they're described in the system prompt
+    # The LLM will output tool calls and we detect them from the event type
     try:
         response_stream = await run_in_thread(
             client.chat_stream,
-            messages=messages,
+            messages=filtered_messages,
             model=model,
             temperature=temperature,
             max_tokens=max_tokens,
-            tools=tools,
+            tools=None,
         )
     except RuntimeError as e:
         if "tool calling is not supported" in str(e):
             response_stream = await run_in_thread(
                 client.chat_stream,
-                messages=messages,
+                messages=filtered_messages,
                 model=model,
                 temperature=temperature,
                 max_tokens=max_tokens,
@@ -100,10 +148,88 @@ async def stream_llm_with_tools(
 
     full_text = ""
     tool_calls_in_progress = {}
-    current_tool_use_id = None
     buffer = ""
     citations_created = {}  # Track which citation numbers we've created
     final_usage = None  # Track usage stats
+
+    def _get_attr(source, *names, default=None):
+        for name in names:
+            if isinstance(source, dict) and name in source:
+                value = source[name]
+                if value is not None:
+                    return value
+            value = getattr(source, name, None)
+            if value is not None:
+                return value
+        return default
+
+    def _ensure_arg_string(arg_piece) -> str:
+        if arg_piece is None:
+            return ""
+        if isinstance(arg_piece, str):
+            return arg_piece
+        try:
+            return json.dumps(arg_piece)
+        except TypeError:
+            return str(arg_piece)
+
+    def upsert_tool_call_entry(call_id: str | None, default_name: str | None = None):
+        if not call_id:
+            call_id = f"tool_call_{len(tool_calls_in_progress) + 1}"
+        entry = tool_calls_in_progress.setdefault(
+            call_id,
+            {"id": call_id, "name": "", "arguments": ""},
+        )
+        if default_name and not entry["name"]:
+            entry["name"] = default_name
+        return entry
+
+    def handle_tool_delta(part) -> bool:
+        if part is None:
+            return False
+
+        part_type = _get_attr(part, "type", "delta_type", "content_type")
+        function_obj = _get_attr(part, "function")
+
+        if part_type in {"tool_use", "tool_call", "tool"} or function_obj:
+            call_id = _get_attr(
+                part,
+                "id",
+                "tool_use_id",
+                "toolUseId",
+                "call_id",
+                "callId",
+            )
+            default_name = _get_attr(part, "name")
+            arguments_piece = _get_attr(part, "arguments", "input")
+
+            if function_obj:
+                default_name = default_name or _get_attr(function_obj, "name")
+                fn_args = _get_attr(function_obj, "arguments")
+                if fn_args is not None:
+                    arguments_piece = (arguments_piece or "") + _ensure_arg_string(
+                        fn_args
+                    )
+
+            if arguments_piece:
+                arguments_piece = _ensure_arg_string(arguments_piece)
+
+            entry = upsert_tool_call_entry(call_id, default_name)
+            if arguments_piece:
+                entry["arguments"] += arguments_piece
+            return True
+
+        if part_type in {"function_call", "function"} or (
+            _get_attr(part, "name") and _get_attr(part, "arguments") is not None
+        ):
+            call_id = _get_attr(part, "id") or "function_call"
+            entry = upsert_tool_call_entry(call_id, _get_attr(part, "name"))
+            arguments_piece = _get_attr(part, "arguments")
+            if arguments_piece:
+                entry["arguments"] += _ensure_arg_string(arguments_piece)
+            return True
+
+        return False
 
     try:
         async for chunk in iterate_sync_generator(response_stream):
@@ -156,30 +282,34 @@ async def stream_llm_with_tools(
                 delta, "type", None
             )
 
-            if delta_type == "tool_use":
-                tool_use_id = getattr(delta, "tool_use_id", None) or getattr(
-                    delta, "toolUseId", None
+            tool_calls_payload = _get_attr(delta, "tool_calls", "toolCalls")
+            if tool_calls_payload:
+                payload_list = (
+                    tool_calls_payload
+                    if isinstance(tool_calls_payload, (list, tuple))
+                    else [tool_calls_payload]
                 )
-                if tool_use_id:
-                    current_tool_use_id = tool_use_id
-                    if current_tool_use_id not in tool_calls_in_progress:
-                        tool_calls_in_progress[current_tool_use_id] = {
-                            "id": current_tool_use_id,
-                            "name": getattr(delta, "name", None),
-                            "arguments": "",
-                        }
+                for call_part in payload_list:
+                    if not handle_tool_delta(call_part):
+                        nested_function = _get_attr(call_part, "function")
+                        if nested_function:
+                            handle_tool_delta(nested_function)
 
-                input_piece = (
-                    getattr(delta, "input", None)
-                    or getattr(delta, "content", None)
-                    or getattr(delta, "text", None)
-                )
-                if input_piece and current_tool_use_id:
-                    tool_calls_in_progress[current_tool_use_id][
-                        "arguments"
-                    ] += input_piece
+            function_call_delta = _get_attr(delta, "function_call", "functionCall")
+            if function_call_delta:
+                handle_tool_delta(function_call_delta)
 
-            elif delta_type == "text" or delta_type == "message":
+            content_list = _get_attr(delta, "content", "content_list")
+            if isinstance(content_list, list):
+                for content_part in content_list:
+                    if handle_tool_delta(content_part):
+                        continue
+
+            if delta_type in {"tool_use", "tool_call", "tool"}:
+                handle_tool_delta(delta)
+                continue
+
+            if delta_type == "text" or delta_type == "message":
                 text_piece = getattr(delta, "text", None) or getattr(
                     delta, "content", None
                 )
@@ -223,19 +353,24 @@ async def stream_llm_with_tools(
                         # Yield the [N] itself
                         yield ("text", f"[{citation_num}]")
 
-                        # Create and yield citation if we have widget info and haven't created this one yet
+                        # Create and yield citation if we have widget info
                         if widget and citation_num not in citations_created:
                             citations_created[citation_num] = True
 
-                            # Get PDF positions
-                            if conv_id in pdf_text_blocks:
-                                pdf_positions = pdf_text_blocks[conv_id]
+                            # Check for available position data sources
+                            has_pdfplumber = (
+                                conv_id in pdf_text_blocks and pdf_text_blocks[conv_id]
+                            )
+                            has_snowflake = (
+                                conv_id in snowflake_document_pages
+                                and snowflake_document_pages[conv_id]
+                            )
 
-                                # Get what the LLM JUST WROTE before this citation
-                                # This is the ACTUAL CLAIM the LLM is making!
+                            if has_pdfplumber or has_snowflake:
+                                # Get what the LLM wrote before this citation
                                 recent_text = (full_text + text_before).strip()
 
-                                # Get the last sentence - this is what the citation refers to!
+                                # Get the last sentence
                                 sentences = re.split(r"(?<=[.!?])\s+", recent_text)
                                 current_sentence = (
                                     sentences[-1] if sentences else recent_text
@@ -257,11 +392,28 @@ async def stream_llm_with_tools(
                                 if section_match:
                                     section_hint = section_match.group(1)
 
-                                selected_position = find_best_match(
-                                    current_sentence,
-                                    pdf_positions,
-                                    preferred_page=page_hint,
-                                )
+                                selected_position = None
+
+                                # Try pdfplumber positions first (more precise coordinates)
+                                if has_pdfplumber:
+                                    pdf_positions = pdf_text_blocks[conv_id]
+                                    selected_position = find_best_match(
+                                        current_sentence,
+                                        pdf_positions,
+                                        preferred_page=page_hint,
+                                    )
+                                    if selected_position:
+                                        selected_position["source"] = "pdfplumber"
+
+                                # Fall back to Snowflake document pages
+                                if not selected_position and has_snowflake:
+                                    selected_position = (
+                                        find_best_match_in_snowflake_pages(
+                                            current_sentence,
+                                            conv_id,
+                                            preferred_page=page_hint,
+                                        )
+                                    )
 
                                 if conv_id:
                                     llm_referenced_quotes.setdefault(
@@ -269,23 +421,31 @@ async def stream_llm_with_tools(
                                     ).append((current_sentence, citation_num))
 
                                 if selected_position:
+                                    # Build extra details
+                                    extra_details = {
+                                        "Page": selected_position["page"],
+                                        "Reference": (
+                                            selected_position["text"][:100] + "..."
+                                            if len(selected_position["text"]) > 100
+                                            else selected_position["text"]
+                                        ),
+                                    }
+                                    if section_hint:
+                                        extra_details["Section"] = section_hint
+                                    if selected_position.get(
+                                        "source"
+                                    ) == "snowflake" and selected_position.get(
+                                        "file_name"
+                                    ):
+                                        extra_details["Document"] = selected_position[
+                                            "file_name"
+                                        ]
+
                                     # Create citation with the ACTUAL matching text
                                     citation_obj = cite(
                                         widget=widget,
                                         input_arguments=widget_input_args or {},
-                                        extra_details={
-                                            "Page": selected_position["page"],
-                                            "Reference": (
-                                                selected_position["text"][:100] + "..."
-                                                if len(selected_position["text"]) > 100
-                                                else selected_position["text"]
-                                            ),
-                                            **(
-                                                {"Section": section_hint}
-                                                if section_hint
-                                                else {}
-                                            ),
-                                        },
+                                        extra_details=extra_details,
                                     )
 
                                     # Add bounding box for highlighting
@@ -303,17 +463,35 @@ async def stream_llm_with_tools(
                                     ]
 
                                     yield ("citation", citation_obj)
-                                else:
-                                    # No match found
-                                    if os.environ.get("SNOWFLAKE_DEBUG"):
-                                        print(f"[DEBUG] No match found for citation")
 
-                                    # Don't highlight random shit!
+                                    if os.environ.get("SNOWFLAKE_DEBUG"):
+                                        print(
+                                            f"[DEBUG] Created citation [{citation_num}] from "
+                                            f"{selected_position.get('source', 'unknown')} source"
+                                        )
+                                else:
+                                    # No match found in any source
+                                    if os.environ.get("SNOWFLAKE_DEBUG"):
+                                        print(
+                                            "[DEBUG] No match found for citation in any source"
+                                        )
+
                                     citation_obj = cite(
                                         widget=widget,
                                         input_arguments=widget_input_args or {},
                                     )
                                     yield ("citation", citation_obj)
+                            else:
+                                # No position data available at all
+                                if os.environ.get("SNOWFLAKE_DEBUG"):
+                                    print(
+                                        f"[DEBUG] No position data for conv_id {conv_id}"
+                                    )
+                                citation_obj = cite(
+                                    widget=widget,
+                                    input_arguments=widget_input_args or {},
+                                )
+                                yield ("citation", citation_obj)
 
                         # Continue with rest of buffer
                         buffer = buffer[match.end() :]
@@ -350,6 +528,16 @@ async def stream_llm_with_tools(
                         ),
                     )
                 )
+
+    # If no usage from API, estimate tokens
+    if not final_usage or not final_usage.get("total_tokens"):
+        estimated_completion_tokens = estimate_tokens(full_text)
+        final_usage = {
+            "prompt_tokens": estimated_prompt_tokens,
+            "completion_tokens": estimated_completion_tokens,
+            "total_tokens": estimated_prompt_tokens + estimated_completion_tokens,
+            "estimated": True,  # Flag that these are estimates
+        }
 
     if os.environ.get("SNOWFLAKE_DEBUG"):
         print(f"[DEBUG] Final usage stats: {final_usage}")

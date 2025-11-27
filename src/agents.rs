@@ -29,26 +29,49 @@ pub struct Message {
 
 #[pyclass]
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct ContentItem {
-    #[pyo3(get, set)]
-    #[serde(rename = "type")]
-    pub content_type: String,
-    #[pyo3(get, set)]
-    pub text: String,
+#[serde(tag = "type")]
+pub enum ContentItem {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "snowflake_file")]
+    SnowflakeFile { snowflake_file: SnowflakeFile },
+}
+
+#[pymethods]
+impl ContentItem {
+    #[staticmethod]
+    fn from_text(text: String) -> Self {
+        ContentItem::Text { text }
+    }
+
+    #[staticmethod]
+    fn from_snowflake_file(path: String) -> Self {
+        ContentItem::SnowflakeFile {
+            snowflake_file: SnowflakeFile { path },
+        }
+    }
 }
 
 #[pymethods]
 impl Message {
     #[pyo3(name = "get_content")]
     pub fn get_content(&self) -> String {
-        self.content
-            .clone()
-            .or_else(|| {
-                self.content_list
-                    .as_ref()
-                    .and_then(|list| list.first().map(|item| item.text.clone()))
-            })
-            .unwrap_or_default()
+        if let Some(content) = &self.content {
+            return content.clone();
+        }
+        if let Some(content_list) = &self.content_list {
+            let texts: Vec<String> = content_list
+                .iter()
+                .filter_map(|item| match item {
+                    ContentItem::Text { text } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect();
+            if !texts.is_empty() {
+                return texts.join("\n");
+            }
+        }
+        String::new()
     }
 }
 
@@ -105,6 +128,21 @@ pub struct Tool {
     pub tool_spec: ToolSpec,
 }
 
+#[pymethods]
+impl Tool {
+    #[new]
+    fn new(tool_spec: ToolSpec) -> Self {
+        Tool { tool_spec }
+    }
+    
+    /// Create a Tool from a JSON string
+    #[staticmethod]
+    fn from_json(json_str: &str) -> PyResult<Self> {
+        serde_json::from_str(json_str)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+}
+
 #[pyclass]
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ToolSpec {
@@ -117,6 +155,15 @@ pub struct ToolSpec {
     pub description: String,
     #[pyo3(get, set)]
     pub input_schema: ToolInputSchema,
+}
+
+#[pymethods]
+impl ToolSpec {
+    #[new]
+    #[pyo3(signature = (name, description, input_schema, tool_type="function".to_string()))]
+    fn new(name: String, description: String, input_schema: ToolInputSchema, tool_type: String) -> Self {
+        ToolSpec { tool_type, name, description, input_schema }
+    }
 }
 
 #[pyclass]
@@ -135,6 +182,21 @@ pub struct ToolInputSchema {
     #[pyo3(get, set)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub required: Option<Vec<String>>,
+}
+
+#[pymethods]
+impl ToolInputSchema {
+    #[new]
+    #[pyo3(signature = (schema_type="object".to_string(), description=None, required=None))]
+    fn new(schema_type: String, description: Option<String>, required: Option<Vec<String>>) -> Self {
+        ToolInputSchema { 
+            schema_type, 
+            description, 
+            properties: None,
+            items: None,
+            required,
+        }
+    }
 }
 
 #[pyclass]
@@ -557,12 +619,35 @@ pub enum MessageContent {
     Text { text: String },
     #[serde(rename = "image_url")]
     ImageUrl { image_url: ImageUrl },
+    #[serde(rename = "document")]
+    Document { document: DocumentUrl },
 }
 
 #[pyclass]
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ImageUrl {
     pub url: String,
+}
+
+#[pyclass]
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DocumentUrl {
+    pub url: String,
+}
+
+#[pyclass]
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SnowflakeFile {
+    #[pyo3(get, set)]
+    pub path: String,
+}
+
+#[pymethods]
+impl SnowflakeFile {
+    #[new]
+    fn new(path: String) -> Self {
+        Self { path }
+    }
 }
 
 #[pyclass]
@@ -662,7 +747,7 @@ pub struct AgentsClient {
     token: String,
     database: String,
     schema: String,
-    conversation_history: Vec<Message>,
+    pub conversation_history: Vec<Message>,
     usage_stats: UsageStats,
     last_metadata: Option<CompletionMetadata>,
 }

@@ -18,35 +18,27 @@ async def load_conversation_history(
     client: SnowflakeAI,
     conv_id: str,
     request_messages: list,
-    max_cached_messages: int = 20,
 ) -> list[dict[str, Any]]:
     """
-    Load conversation history from cache and add new request messages.
+    Load conversation history from the agent's database and add new request messages.
 
     Args:
         client: SnowflakeAI client instance
         conv_id: Conversation ID
         request_messages: New messages from the current request
-        max_cached_messages: Maximum number of cached messages to load
 
     Returns:
         List of conversation messages with role, content, and details
     """
     final_conversation_history = []
 
-    # Load existing messages from cache
+    # Load existing messages from the agent's database
     cached_messages = await run_in_thread(client.get_messages, conv_id)
 
     if os.environ.get("SNOWFLAKE_DEBUG"):
         print(
-            f"[DEBUG] Loaded {len(cached_messages)} messages from cache for conversation {conv_id}"
+            f"[DEBUG] Loaded {len(cached_messages)} messages from database for conversation {conv_id}"
         )
-
-    # Limit how many cached messages we load
-    if len(cached_messages) > max_cached_messages:
-        cached_messages = cached_messages[-max_cached_messages:]
-        if os.environ.get("SNOWFLAKE_DEBUG"):
-            print(f"[DEBUG] Truncated cached messages to last {max_cached_messages}")
 
     # Build history from cached messages
     for message_id, role, content in cached_messages:
@@ -54,7 +46,7 @@ async def load_conversation_history(
             {
                 "role": role,
                 "content": content,
-                "details": None,
+                "details": {"message_id": message_id},
             }
         )
 
@@ -99,67 +91,6 @@ async def load_conversation_history(
     return final_conversation_history
 
 
-async def condense_conversation_context(
-    final_conversation_history: list[dict[str, Any]],
-    context_size_threshold: int = 10,
-    messages_to_keep: int = 3,
-) -> list[dict[str, Any]]:
-    """
-    Condense conversation history to prevent payload errors.
-
-    Args:
-        final_conversation_history: Full conversation history
-        context_size_threshold: Threshold to trigger condensing
-        messages_to_keep: Number of recent messages to keep
-
-    Returns:
-        Condensed conversation history
-    """
-    llm_context_messages = final_conversation_history
-
-    if os.environ.get("SNOWFLAKE_DEBUG"):
-        print(
-            f"[DEBUG] llm_context_messages has {len(llm_context_messages)} messages before condensing"
-        )
-
-    if len(llm_context_messages) > context_size_threshold:
-        history_to_summarize = llm_context_messages[:-messages_to_keep]
-
-        # Create a very brief summary
-        summary_text = f"Previous conversation context: The user and assistant have been discussing various topics over {len(history_to_summarize)} messages."
-
-        # Identify main topic
-        recent_content = " ".join(
-            [
-                msg["content"][:100]
-                for msg in history_to_summarize[-3:]
-                if msg["content"]
-            ]
-        )
-        if "table" in recent_content.lower():
-            summary_text += (
-                " The conversation has involved database tables and schemas."
-            )
-        elif "query" in recent_content.lower() or "sql" in recent_content.lower():
-            summary_text += " The conversation has involved SQL queries."
-
-        summary_message = {
-            "role": "system",
-            "content": summary_text,
-            "details": None,
-        }
-        llm_context_messages = [summary_message] + llm_context_messages[
-            -messages_to_keep:
-        ]
-
-        if os.environ.get("SNOWFLAKE_DEBUG"):
-            print(
-                f"[DEBUG] After condensing: {len(llm_context_messages)} messages in context"
-            )
-
-    return llm_context_messages
-
-
 def format_messages_for_llm(
     messages: list[dict],
     system_prompt: str,
@@ -178,15 +109,24 @@ def format_messages_for_llm(
     """
     formatted = [("system", system_prompt)]
 
-    # Track tool results to include them with context
-    pending_tool_results = []
+    # Track tool results to attach after assistant messages
+    pending_tool_results: list[str] = []
 
     for msg in messages:
         role = msg.get("role", "")
         content = msg.get("content", "")
 
+        # Skip empty messages
+        if not content or not content.strip():
+            continue
+
         # Map roles to what the LLM expects
         if role in ["human", "user"]:
+            # Flush any pending tool results before user message
+            for tool_result in pending_tool_results:
+                formatted.append(("user", tool_result))
+            pending_tool_results.clear()
+
             # Check if this is a tool result
             if content.startswith("[Tool Result"):
                 # Include tool results as user messages for context
@@ -195,6 +135,11 @@ def format_messages_for_llm(
                 # Regular user message
                 formatted.append(("user", content))
         elif role in ["assistant", "ai"]:
+            # Flush any pending tool results before assistant message
+            for tool_result in pending_tool_results:
+                formatted.append(("user", tool_result))
+            pending_tool_results.clear()
+
             formatted.append(("assistant", content))
         elif role == "system":
             # Merge system messages
@@ -203,8 +148,12 @@ def format_messages_for_llm(
             else:
                 formatted.append(("system", content))
         elif role == "tool":
-            # Tool messages get converted to user messages for context
-            formatted.append(("user", f"[Tool Output]\n{content}"))
+            # Queue tool results to be added after the assistant message that called them
+            pending_tool_results.append(f"[Tool Output]\n{content}")
+
+    # Flush any remaining tool results at the end
+    for tool_result in pending_tool_results:
+        formatted.append(("user", tool_result))
 
     return formatted
 

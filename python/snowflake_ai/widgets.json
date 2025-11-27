@@ -30,5 +30,72 @@
             }
         },
         "source": ["Snowflake"]
+    },
+    "snowflake_documents_viewer": {
+        "widgetId": "snowflake_documents_viewer",
+        "name": "Cortex Documents",
+        "description": "View, upload, and remove files in the CORTEX_UPLOADS stage.",
+        "category": "Snowflake",
+        "type": "multi_file_viewer",
+        "endpoint": "widgets/download_document",
+        "gridData": {
+            "w": 40,
+            "h": 25
+        },
+        "params": [
+            {
+                "paramName": "document",
+                "description": "Document to display.",
+                "type": "endpoint",
+                "label": "Document",
+                "optionsEndpoint": "widgets/list_document_choices",
+                "optionsParams": {"show_summary": true},
+                "show": false,
+                "multiSelect": true,
+                "value": ["summary"],
+                "roles": ["fileSelector"]
+            },
+            {
+                "paramName": "payload",
+                "label": "Cortex Documents",
+                "description": "Manage files accessible to Snowflake Cortex AI.",
+                "type": "form",
+                "endpoint": "widgets/upload",
+                "inputParams": [
+                    {
+                        "paramName": "path",
+                        "type": "text",
+                        "value": "",
+                        "label": "File Path",
+                        "description": "Path to a local file."
+                    },
+                    {
+                        "paramName": "url",
+                        "type": "text",
+                        "value": "",
+                        "label": "File URL",
+                        "description": "URL to the file."
+                    },
+                    {
+                        "paramName": "document",
+                        "description": "Document(s) to remove.",
+                        "type": "endpoint",
+                        "label": "Remove Document(s)",
+                        "optionsEndpoint": "widgets/list_document_choices",
+                        "show": true,
+                        "value": null,
+                        "multiSelect": true
+                    },
+                    {
+                        "paramName": "submit",
+                        "type": "button",
+                        "value": true,
+                        "label": "Sumbit",
+                        "description": "Submit and process the request."
+                    }
+                ]
+            }
+        ],
+        "source": ["Snowflake"]
     }
 }

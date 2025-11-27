@@ -1,7 +1,6 @@
 #![cfg(feature = "extension-module")]
 
 pub mod agents;
-pub mod cache;
 pub mod engine;
 
 use crate::agents::Message;
@@ -49,7 +48,93 @@ impl SnowflakeAI {
         })
     }
 
-    #[pyo3(signature = (prompt, model="llama3.1-70b", temperature=0.7, max_tokens=4096, context=None, tools=None))]
+    /// Create a new SnowflakeAgent for AI completions
+    fn create_agent(&self) -> PyResult<SnowflakeAgent> {
+        let engine = Arc::clone(&self.engine);
+        let runtime = Arc::clone(&self.runtime);
+        
+        let (account, database, schema, token) = runtime.block_on(async {
+            let engine = engine.lock().await;
+            let account = std::env::var("SNOWFLAKE_ACCOUNT").unwrap_or_default();
+            let database = engine.get_database().await.unwrap_or_default();
+            let schema = engine.get_schema().await.unwrap_or_default();
+            let token = std::env::var("SNOWFLAKE_PASSWORD").unwrap_or_default();
+            (account, database, schema, token)
+        });
+        
+        let client = agents::AgentsClient::new(account, token, database, schema);
+        
+        Ok(SnowflakeAgent {
+            client: Arc::new(tokio::sync::Mutex::new(client)),
+            runtime,
+        })
+    }
+
+    /// Get messages for a conversation
+    fn get_messages(&self, conversation_id: String) -> PyResult<Vec<(String, String, String)>> {
+        let engine = Arc::clone(&self.engine);
+        let result = self.runtime.block_on(async {
+            let engine = engine.lock().await;
+            engine.get_messages(&conversation_id).await
+        });
+        result.map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
+    }
+
+    /// Add a message to conversation history
+    fn add_message(
+        &self,
+        conversation_id: String,
+        message_id: String,
+        role: String,
+        content: String,
+    ) -> PyResult<()> {
+        let engine = Arc::clone(&self.engine);
+        let result = self.runtime.block_on(async {
+            let engine = engine.lock().await;
+            engine.add_message(conversation_id, message_id, role, content).await
+        });
+        result.map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
+    }
+
+    /// Get or create a conversation with settings
+    fn get_or_create_conversation(
+        &self,
+        conversation_id: String,
+        settings: String,
+    ) -> PyResult<String> {
+        let engine = Arc::clone(&self.engine);
+        let settings_json: serde_json::Value = serde_json::from_str(&settings)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
+        
+        let result = self.runtime.block_on(async {
+            let engine = engine.lock().await;
+            engine.get_or_create_conversation(&conversation_id, settings_json).await
+        });
+        
+        result
+            .and_then(|v| serde_json::to_string(&v).map_err(|e| e.to_string()))
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
+    }
+
+    /// Update conversation settings
+    fn update_conversation_settings(
+        &self,
+        conversation_id: String,
+        settings: String,
+    ) -> PyResult<()> {
+        let engine = Arc::clone(&self.engine);
+        let settings_json: serde_json::Value = serde_json::from_str(&settings)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
+        
+        let result = self.runtime.block_on(async {
+            let engine = engine.lock().await;
+            engine.update_conversation_settings(&conversation_id, settings_json).await
+        });
+        
+        result.map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
+    }
+
+    #[pyo3(signature = (prompt, model="openai-gpt-5-chat", temperature=0.7, max_tokens=4096, context=None, tools=None))]
     fn complete(
         &self,
         prompt: String,
@@ -60,32 +145,52 @@ impl SnowflakeAI {
         tools: Option<Vec<agents::Tool>>,
     ) -> PyResult<String> {
         let engine = Arc::clone(&self.engine);
+        let runtime = Arc::clone(&self.runtime);
         let model = model.to_string();
-        let full_prompt = if let Some(ctx) = context {
-            format!("{}\n\n{}", ctx, prompt)
-        } else {
-            prompt
-        };
-
-        let result = self.runtime.block_on(async move {
+        
+        // Create an agent client and use it for completion
+        let (account, database, schema, token) = runtime.block_on(async {
             let engine = engine.lock().await;
-
-            let options = serde_json::json!({
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-            });
-
-            engine
-                .ai_complete(&model, &full_prompt, Some(options), tools)
-                .await
+            let account = std::env::var("SNOWFLAKE_ACCOUNT").unwrap_or_default();
+            let database = engine.get_database().await.unwrap_or_default();
+            let schema = engine.get_schema().await.unwrap_or_default();
+            let token = std::env::var("SNOWFLAKE_PASSWORD").unwrap_or_default();
+            (account, database, schema, token)
         });
-
-        result
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
-            .map(|s| s.replace("\\_", "_"))
+        
+        let mut client = agents::AgentsClient::new(account, token, database, schema);
+        
+        // Add context as system message if provided
+        if let Some(ctx) = context {
+            client.add_system_message(&ctx);
+        }
+        
+        let result = runtime.block_on(async {
+            client.complete_with_tools(
+                &model,
+                &prompt,
+                false, // don't use history for single completion
+                Some(temperature),
+                None, // top_p
+                Some(max_tokens),
+                tools, // Pass tools to the completion
+                None,  // tool_choice
+            ).await
+        });
+        
+        match result {
+            Ok(response) => {
+                if let Some(choice) = response.choices.first() {
+                    Ok(choice.message.get_content())
+                } else {
+                    Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("No response from model"))
+                }
+            }
+            Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e)),
+        }
     }
 
-    #[pyo3(signature = (messages, model="llama3.1-70b", temperature=0.7, max_tokens=4096, context=None, tools=None))]
+    #[pyo3(signature = (messages, model="openai-gpt-5-chat", temperature=0.7, max_tokens=4096, context=None, tools=None))]
     fn chat(
         &self,
         messages: Vec<(String, String)>,
@@ -96,47 +201,88 @@ impl SnowflakeAI {
         tools: Option<Vec<agents::Tool>>,
     ) -> PyResult<String> {
         let engine = Arc::clone(&self.engine);
+        let runtime = Arc::clone(&self.runtime);
         let model = model.to_string();
-
-        let mut full_prompt = String::new();
-
-        if let Some(ctx) = context {
-            full_prompt.push_str("DOCUMENT CONTEXT:\n");
-            full_prompt.push_str(&ctx);
-            full_prompt.push_str("\n\n");
-        }
-
-        if !messages.is_empty() {
-            full_prompt.push_str("CONVERSATION HISTORY:\n");
-            for (role, content) in &messages[..messages.len().saturating_sub(1)] {
-                full_prompt.push_str(&format!("{}: {}\n\n", role, content));
-            }
-
-            full_prompt.push_str("CURRENT QUESTION:\n");
-            if let Some((_, content)) = messages.last() {
-                full_prompt.push_str(content);
-            }
-        }
-
-        let result = self.runtime.block_on(async move {
+        
+        let (account, database, schema, token) = runtime.block_on(async {
             let engine = engine.lock().await;
-
-            let options = serde_json::json!({
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-            });
-
-            engine
-                .ai_complete(&model, &full_prompt, Some(options), tools)
-                .await
+            let account = std::env::var("SNOWFLAKE_ACCOUNT").unwrap_or_default();
+            let database = engine.get_database().await.unwrap_or_default();
+            let schema = engine.get_schema().await.unwrap_or_default();
+            let token = std::env::var("SNOWFLAKE_PASSWORD").unwrap_or_default();
+            (account, database, schema, token)
         });
-
-        result
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
-            .map(|s| s.replace("\\_", "_"))
+        
+        let mut client = agents::AgentsClient::new(account, token, database, schema);
+        
+        // Add context as system message if provided
+        if let Some(ctx) = context {
+            client.add_system_message(&ctx);
+        }
+        
+        // Convert messages to Message structs and add to history
+        let mut formatted_messages: Vec<Message> = messages
+            .iter()
+            .map(|(role, content)| {
+                Message {
+                    role: Some(role.clone()),
+                    content: Some(content.clone()),
+                    content_list: None,
+                }
+            })
+            .collect();
+        
+        // Get the last user message for the completion
+        let last_message = formatted_messages.pop()
+            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>("No messages provided"))?;
+        
+        let last_content = last_message.content
+            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>("Last message has no content"))?;
+        
+        // Add previous messages to conversation history
+        for msg in formatted_messages {
+            if let (Some(role), Some(content)) = (&msg.role, &msg.content) {
+                match role.as_str() {
+                    "user" | "human" => {
+                        client.conversation_history.push(Message::new_user(content.clone()));
+                    }
+                    "assistant" | "ai" => {
+                        client.add_assistant_response(content.clone());
+                    }
+                    "system" => {
+                        client.add_system_message(content);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        
+        let result = runtime.block_on(async {
+            client.complete_with_tools(
+                &model,
+                &last_content,
+                true, // use history
+                Some(temperature),
+                None, // top_p
+                Some(max_tokens),
+                tools,
+                None, // tool_choice
+            ).await
+        });
+        
+        match result {
+            Ok(response) => {
+                if let Some(choice) = response.choices.first() {
+                    Ok(choice.message.get_content())
+                } else {
+                    Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("No response from model"))
+                }
+            }
+            Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e)),
+        }
     }
 
-    #[pyo3(signature = (messages, model="llama3.1-70b", temperature=0.7, max_tokens=4096, context=None, tools=None))]
+    #[pyo3(signature = (messages, model="openai-gpt-5-chat", temperature=0.7, max_tokens=4096, context=None, tools=None))]
     fn chat_stream(
         &self,
         messages: Vec<(String, String)>,
@@ -147,46 +293,48 @@ impl SnowflakeAI {
         tools: Option<Vec<agents::Tool>>,
     ) -> PyResult<PyStream> {
         let engine = Arc::clone(&self.engine);
-        let model = model.to_string();
         let runtime = Arc::clone(&self.runtime);
-
-        let mut rust_messages: Vec<Message> = messages
-            .into_iter()
+        let model = model.to_string();
+        
+        let (account, database, schema, token) = runtime.block_on(async {
+            let engine = engine.lock().await;
+            let account = std::env::var("SNOWFLAKE_ACCOUNT").unwrap_or_default();
+            let database = engine.get_database().await.unwrap_or_default();
+            let schema = engine.get_schema().await.unwrap_or_default();
+            let token = std::env::var("SNOWFLAKE_PASSWORD").unwrap_or_default();
+            (account, database, schema, token)
+        });
+        
+        let mut client = agents::AgentsClient::new(account, token, database, schema);
+        
+        // Add context as system message if provided
+        if let Some(ctx) = context {
+            client.add_system_message(&ctx);
+        }
+        
+        // Convert messages to Message structs
+        let formatted_messages: Vec<Message> = messages
+            .iter()
             .map(|(role, content)| {
-                if role == "user" || role == "human" {
-                    Message::new_user(content)
-                } else if role == "assistant" || role == "ai" {
-                    Message::new_assistant(content)
-                } else if role == "system" {
-                    Message::new_system(content)
-                } else {
-                    // Default to user, or handle other roles as needed.
-                    // For tool calls, the python code sends a 'system' message.
-                    Message::new_user(content)
+                Message {
+                    role: Some(role.clone()),
+                    content: Some(content.clone()),
+                    content_list: None,
                 }
             })
             .collect();
-
-        if let Some(ctx) = context {
-            let system_message = Message::new_system(format!("DOCUMENT CONTEXT:\n{}", ctx));
-            rust_messages.insert(0, system_message);
-        }
-
-        let result = self.runtime.block_on(async move {
-            let mut engine = engine.lock().await;
-            let mut agent_client = engine.create_agents_client()?;
-            agent_client
-                .stream_complete(
-                    &model,
-                    rust_messages,
-                    Some(temperature),
-                    None, // top_p
-                    Some(max_tokens),
-                    tools,
-                )
-                .await
+        
+        let result = runtime.block_on(async {
+            client.stream_complete(
+                &model,
+                formatted_messages,
+                Some(temperature),
+                None, // top_p
+                Some(max_tokens),
+                tools,
+            ).await
         });
-
+        
         match result {
             Ok((stream, _metadata)) => Ok(PyStream {
                 stream: std::sync::Mutex::new(stream),
@@ -194,6 +342,20 @@ impl SnowflakeAI {
             }),
             Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e)),
         }
+    }
+
+    /// Execute SQL statement without result processing (e.g. DDL)
+    fn execute_statement(&self, statement: String) -> PyResult<String> {
+        let engine = Arc::clone(&self.engine);
+
+        let result = self.runtime.block_on(async move {
+            let engine = engine.lock().await;
+            engine.execute_statement(&statement).await
+        });
+
+        result
+            .and_then(|v| serde_json::to_string(&v).map_err(|e| e.to_string()))
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
     }
 
     /// Execute SQL query and return JSON result
@@ -223,43 +385,22 @@ impl SnowflakeAI {
 
     /// Get list of available AI models
     fn get_available_models(&self) -> PyResult<Vec<(String, String)>> {
-        let engine = Arc::clone(&self.engine);
-        let result = self.runtime.block_on(async move {
-            let engine = engine.lock().await;
-            engine.get_available_models().await
-        });
-        result.map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
+        // Return hardcoded list for Cortex models
+        Ok(vec![
+            ("openai-gpt-5-chat".to_string(), "Meta Llama 3.1 70B".to_string()),
+            ("llama3.1-8b".to_string(), "Meta Llama 3.1 8B".to_string()),
+            ("mistral-large2".to_string(), "Mistral Large 2".to_string()),
+        ])
     }
 
-    /// Close the cache connection
+    /// Close the connection
     fn close(&self) -> PyResult<()> {
         let engine = Arc::clone(&self.engine);
-        self.runtime
-            .block_on(async move {
-                let mut engine = engine.lock().await;
-                engine.close().await
-            })
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-        Ok(())
-    }
-
-    /// Create streaming agent client
-    fn create_agent(&self) -> PyResult<SnowflakeAgent> {
-        let engine = Arc::clone(&self.engine);
-        let runtime = Arc::clone(&self.runtime);
-
-        let agent_client = self
-            .runtime
-            .block_on(async move {
-                let mut engine = engine.lock().await;
-                engine.create_agents_client()
-            })
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
-
-        Ok(SnowflakeAgent {
-            client: Arc::new(Mutex::new(agent_client)),
-            runtime,
-        })
+        let result = self.runtime.block_on(async move {
+            let mut engine = engine.lock().await;
+            engine.close().await
+        });
+        result.map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
     }
 
     /// List all accessible databases
@@ -358,9 +499,10 @@ impl SnowflakeAI {
         let engine = Arc::clone(&self.engine);
         let result = self.runtime.block_on(async move {
             let engine = engine.lock().await;
-            engine.get_current_database().to_string()
+            // Use the getter method
+            engine.get_database().await
         });
-        Ok(result)
+        result.map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
     }
 
     /// Get current schema
@@ -368,9 +510,20 @@ impl SnowflakeAI {
         let engine = Arc::clone(&self.engine);
         let result = self.runtime.block_on(async move {
             let engine = engine.lock().await;
-            engine.get_current_schema().to_string()
+            engine.get_schema().await
         });
-        Ok(result)
+        result.map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
+    }
+
+    /// Get current user
+    fn get_current_user(&self) -> PyResult<String> {
+        let engine = Arc::clone(&self.engine);
+        let result = self.runtime.block_on(async move {
+            let engine = engine.lock().await;
+            // Use the getter method
+            engine.get_user().await
+        });
+        result.map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
     }
 
     /// Get sample data for a specific table, limited to 1 row.
@@ -424,6 +577,360 @@ impl SnowflakeAI {
         result.map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
     }
 
+    /// Get tool definition for get_multiple_table_definitions
+    fn get_multiple_table_definitions_tool(&self) -> PyResult<String> {
+        let tool_def = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "get_multiple_table_definitions",
+                "description": "Get schema definitions for multiple tables at once.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "table_names": {
+                            "type": "array",
+                            "items": {
+                                "type": "string"
+                            },
+                            "description": "List of fully qualified table names (e.g., DATABASE.SCHEMA.TABLE or just TABLE)"
+                        }
+                    },
+                    "required": ["table_names"]
+                }
+            }
+        });
+        serde_json::to_string(&tool_def)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+    }
+
+    /// Get tool definition for list_tables_in
+    fn list_tables_in_tool(&self) -> PyResult<String> {
+        let tool_def = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "list_tables_in",
+                "description": "List tables in a specific database and schema.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "database": {
+                            "type": "string",
+                            "description": "Database name"
+                        },
+                        "schema": {
+                            "type": "string",
+                            "description": "Schema name"
+                        }
+                    },
+                    "required": ["database", "schema"]
+                }
+            }
+        });
+        serde_json::to_string(&tool_def)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+    }
+
+    /// Get tool definition for validate_query
+    fn validate_query_tool(&self) -> PyResult<String> {
+        let tool_def = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "validate_query",
+                "description": "Validate a SQL query without executing it.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "The SQL query to validate"
+                        }
+                    },
+                    "required": ["query"]
+                }
+            }
+        });
+        serde_json::to_string(&tool_def)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+    }
+
+    /// Get tool definition for extract_answer
+    fn extract_answer_tool(&self) -> PyResult<String> {
+        let tool_def = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "extract_answer",
+                "description": "Extract an answer to a question from a text document using Cortex.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "question": {
+                            "type": "string",
+                            "description": "The question to answer"
+                        },
+                        "document": {
+                            "type": "string",
+                            "description": "The document text or stage path"
+                        }
+                    },
+                    "required": ["question", "document"]
+                }
+            }
+        });
+        serde_json::to_string(&tool_def)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+    }
+
+    /// Get tool definition for sentiment
+    fn sentiment_tool(&self) -> PyResult<String> {
+        let tool_def = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "sentiment",
+                "description": "Analyze the sentiment of a text using Cortex.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "text": {
+                            "type": "string",
+                            "description": "The text to analyze"
+                        }
+                    },
+                    "required": ["text"]
+                }
+            }
+        });
+        serde_json::to_string(&tool_def)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+    }
+
+    /// Get tool definition for summarize
+    fn summarize_tool(&self) -> PyResult<String> {
+        let tool_def = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "summarize",
+                "description": "Summarize a text using Cortex.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "text": {
+                            "type": "string",
+                            "description": "The text to summarize"
+                        }
+                    },
+                    "required": ["text"]
+                }
+            }
+        });
+        serde_json::to_string(&tool_def)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+    }
+
+    /// Get tool definition for translate
+    fn translate_tool(&self) -> PyResult<String> {
+        let tool_def = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "translate",
+                "description": "Translate text from one language to another using Cortex.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "text": {
+                            "type": "string",
+                            "description": "The text to translate"
+                        },
+                        "to_lang": {
+                            "type": "string",
+                            "description": "Target language code (e.g., 'en', 'fr')"
+                        },
+                        "from_lang": {
+                            "type": "string",
+                            "description": "Source language code (optional)"
+                        }
+                    },
+                    "required": ["text", "to_lang"]
+                }
+            }
+        });
+        serde_json::to_string(&tool_def)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+    }
+
+    /// Get tool definition for get_table_sample_data
+    fn get_table_sample_data_tool(&self) -> PyResult<String> {
+        let tool_def = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "get_table_sample_data",
+                "description": "Get sample data from a Snowflake table. Returns up to 1 row of data to understand the table structure and content.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "table_name": {
+                            "type": "string",
+                            "description": "The fully qualified table name (e.g., DATABASE.SCHEMA.TABLE or just TABLE)"
+                        }
+                    },
+                    "required": ["table_name"]
+                }
+            }
+        });
+        serde_json::to_string(&tool_def)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+    }
+
+    /// Get tool definition for execute_query
+    fn execute_query_tool(&self) -> PyResult<String> {
+        let tool_def = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "execute_query",
+                "description": "Execute a SQL query against Snowflake and return the results as JSON.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "The SQL query to execute"
+                        }
+                    },
+                    "required": ["query"]
+                }
+            }
+        });
+        serde_json::to_string(&tool_def)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+    }
+
+    /// Get tool definition for execute_statement
+    fn execute_statement_tool(&self) -> PyResult<String> {
+        let tool_def = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "execute_statement",
+                "description": "Execute any Snowflake SQL statement (DDL/DML/SHOW) and return structured results when available.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "statement": {
+                            "type": "string",
+                            "description": "The exact SQL statement to run"
+                        }
+                    },
+                    "required": ["statement"]
+                }
+            }
+        });
+        serde_json::to_string(&tool_def)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+    }
+
+    /// Get tool definition for list_tables
+    fn list_tables_tool(&self) -> PyResult<String> {
+        let tool_def = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "list_tables",
+                "description": "List all tables accessible in the current Snowflake context.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            }
+        });
+        serde_json::to_string(&tool_def)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+    }
+
+    /// Get tool definition for get_table_schema
+    fn get_table_schema_tool(&self) -> PyResult<String> {
+        let tool_def = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "get_table_schema",
+                "description": "Get the schema/structure of a Snowflake table including column names, types, and constraints.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "table_name": {
+                            "type": "string",
+                            "description": "The fully qualified table name (e.g., DATABASE.SCHEMA.TABLE or just TABLE)"
+                        }
+                    },
+                    "required": ["table_name"]
+                }
+            }
+        });
+        serde_json::to_string(&tool_def)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+    }
+
+    /// Get tool definition for list_databases
+    fn list_databases_tool(&self) -> PyResult<String> {
+        let tool_def = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "list_databases",
+                "description": "List all databases accessible in Snowflake.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            }
+        });
+        serde_json::to_string(&tool_def)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+    }
+
+    /// Get tool definition for list_schemas
+    fn list_schemas_tool(&self) -> PyResult<String> {
+        let tool_def = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "list_schemas",
+                "description": "List all schemas in a database.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "database": {
+                            "type": "string",
+                            "description": "The database name. If not provided, uses the current database."
+                        }
+                    },
+                    "required": []
+                }
+            }
+        });
+        serde_json::to_string(&tool_def)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+    }
+
+    /// Get tool definition for describe_table
+    fn describe_table_tool(&self) -> PyResult<String> {
+        let tool_def = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "describe_table",
+                "description": "Describe a Snowflake table structure using DESCRIBE TABLE command.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "table_name": {
+                            "type": "string",
+                            "description": "The fully qualified table name (e.g., DATABASE.SCHEMA.TABLE or just TABLE)"
+                        }
+                    },
+                    "required": ["table_name"]
+                }
+            }
+        });
+        serde_json::to_string(&tool_def)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+    }
+
     /// List all stages accessible to the user
     fn list_stages(&self) -> PyResult<Vec<String>> {
         let engine = Arc::clone(&self.engine);
@@ -434,8 +941,50 @@ impl SnowflakeAI {
         result.map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
     }
 
+    /// List documents available in Cortex (from DOCUMENT_PARSE_RESULTS table)
+    /// Returns a list of tuples with (file_name, stage_path, is_parsed, page_count)
+    fn list_cortex_documents(&self) -> PyResult<Vec<(String, String, bool, i64)>> {
+        let engine = Arc::clone(&self.engine);
+        let result = self.runtime.block_on(async move {
+            let engine = engine.lock().await;
+            engine.list_cortex_documents().await
+        });
+        result.map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
+    }
+
+    /// Download a document from Snowflake stage and return base64-encoded content
+    /// document_id is the FILE_NAME from DOCUMENT_PARSE_RESULTS
+    fn download_cortex_document(&self, document_id: String) -> PyResult<String> {
+        let engine = Arc::clone(&self.engine);
+        let result = self.runtime.block_on(async move {
+            let engine = engine.lock().await;
+            engine.download_cortex_document(&document_id).await
+        });
+        result.map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
+    }
+
+    /// Upload bytes directly to a Snowflake stage (for widget PDF uploads)
+    /// Returns the stage path where the file was uploaded
+    #[pyo3(signature = (file_bytes, file_name, stage_name = None))]
+    fn upload_bytes_to_stage(
+        &self,
+        file_bytes: Vec<u8>,
+        file_name: String,
+        stage_name: Option<String>,
+    ) -> PyResult<String> {
+        let engine = Arc::clone(&self.engine);
+        let result = self.runtime.block_on(async move {
+            let engine = engine.lock().await;
+            engine
+                .upload_bytes_to_stage(&file_bytes, &file_name, stage_name.as_deref())
+                .await
+        });
+        result.map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
+    }
+
     /// List files in a specific stage
-    fn list_files_in_stage(&self, stage_name: String) -> PyResult<Vec<String>> {
+    #[pyo3(signature = (stage_name, no_cache = false))]
+    fn list_files_in_stage(&self, stage_name: String, no_cache: bool) -> PyResult<Vec<String>> {
         let engine = Arc::clone(&self.engine);
         let result = self.runtime.block_on(async move {
             let mut engine = engine.lock().await;
@@ -461,12 +1010,44 @@ impl SnowflakeAI {
                 }
             }
 
-            engine.list_files_in_stage(stage).await
+            engine.list_files_in_stage(stage, no_cache).await
         });
         result.map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
     }
 
-    /// Set conversation-specific data in the cache
+    /// Upload a file to a Snowflake stage.
+    #[pyo3(signature = (file_path, stage_name))]
+    fn upload_file_to_stage(&self, file_path: String, stage_name: String) -> PyResult<String> {
+        let engine = Arc::clone(&self.engine);
+        let result = self.runtime.block_on(async move {
+            let engine = engine.lock().await;
+            engine
+                .upload_file_to_stage(std::path::Path::new(&file_path), &stage_name)
+                .await
+        });
+        result.map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
+    }
+
+    /// Parse a document from a Snowflake stage.
+    #[pyo3(signature = (stage_file_path, mode=None))]
+    fn parse_document(
+        &self,
+        stage_file_path: String,
+        mode: Option<String>,
+    ) -> PyResult<String> {
+        let engine = self.engine.clone();
+        let mode_ref = mode.as_deref();
+        
+        self.runtime.block_on(async move {
+            let engine_lock = engine.lock().await;
+            engine_lock
+                .ai_parse_document(&stage_file_path, mode_ref)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
+        })
+    }
+
+    /// Set conversation-specific data in Snowflake tables
     #[pyo3(signature = (conversation_id, key, value))]
     fn set_conversation_data(
         &self,
@@ -475,22 +1056,51 @@ impl SnowflakeAI {
         value: String,
     ) -> PyResult<()> {
         let engine = Arc::clone(&self.engine);
-        self.runtime
-            .block_on(async move {
-                let cache = {
-                    let engine = engine.lock().await;
-                    engine.cache.clone()
-                };
-                let guard = cache.lock().await;
-                guard
-                    .set_conversation_data(conversation_id, key, value)
-                    .await
-            })
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-        Ok(())
+        let result = self.runtime.block_on(async {
+            let engine = engine.lock().await;
+            let user = engine.get_user().await.map_err(|e| e.to_string())?;
+            let schema_name = format!("USER_{}", user.chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect::<String>().to_uppercase());
+            let table_name = format!("OPENBB_AGENTS.{}.AGENTS_CONTEXT_OBJECTS", schema_name);
+            
+            // Use MERGE to insert or update
+            let object_id = format!("{}_{}", conversation_id, key);
+            let escaped_object_id = object_id.replace("'", "''");
+            let escaped_conv_id = conversation_id.replace("'", "''");
+            let escaped_key = key.replace("'", "''");
+            
+            // Check if value is already valid JSON - if so, store it directly
+            // If not, wrap it in {"value": "..."} 
+            let json_value = if serde_json::from_str::<serde_json::Value>(&value).is_ok() {
+                // Value is already valid JSON - use it directly
+                // Just need to escape $$ delimiter if present
+                value.replace("$$", "$ $")
+            } else {
+                // Value is a plain string - wrap it in JSON object
+                let escaped = value
+                    .replace("\\", "\\\\")
+                    .replace("\"", "\\\"")
+                    .replace("\n", "\\n")
+                    .replace("\r", "\\r")
+                    .replace("\t", "\\t")
+                    .replace("$$", "$ $");
+                format!("{{\"value\": \"{}\"}}", escaped)
+            };
+            
+            let query = format!(
+                "MERGE INTO {} AS target
+                 USING (SELECT '{}' AS OBJECT_ID) AS source
+                 ON target.OBJECT_ID = source.OBJECT_ID
+                 WHEN MATCHED THEN UPDATE SET OBJECT_VALUE = PARSE_JSON($${}$$)
+                 WHEN NOT MATCHED THEN INSERT (OBJECT_ID, CONVERSATION_ID, OBJECT_TYPE, OBJECT_KEY, OBJECT_VALUE)
+                 VALUES ('{}', '{}', 'context', '{}', PARSE_JSON($${}$$))",
+                table_name, escaped_object_id, json_value, escaped_object_id, escaped_conv_id, escaped_key, json_value
+            );
+            engine.execute_statement(&query).await.map(|_| ())
+        });
+        result.map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
     }
 
-    /// Get conversation-specific data from the cache
+    /// Get conversation-specific data from Snowflake tables
     #[pyo3(signature = (conversation_id, key))]
     fn get_conversation_data(
         &self,
@@ -498,50 +1108,110 @@ impl SnowflakeAI {
         key: String,
     ) -> PyResult<Option<String>> {
         let engine = Arc::clone(&self.engine);
-        let result = self
-            .runtime
-            .block_on(async move {
-                let cache = {
-                    let engine = engine.lock().await;
-                    engine.cache.clone()
-                };
-                let guard = cache.lock().await;
-                guard.get_conversation_data(&conversation_id, &key).await
-            })
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-        Ok(result)
+        let debug_enabled = std::env::var("SNOWFLAKE_DEBUG").is_ok();
+        let result: Result<Option<String>, String> = self.runtime.block_on(async {
+            let engine = engine.lock().await;
+            let user = engine.get_user().await.map_err(|e| e.to_string())?;
+            let schema_name = format!("USER_{}", user.chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect::<String>().to_uppercase());
+            let table_name = format!("OPENBB_AGENTS.{}.AGENTS_CONTEXT_OBJECTS", schema_name);
+            
+            let object_id = format!("{}_{}", conversation_id, key);
+            // Try to get either the wrapped value or the raw JSON
+            // COALESCE handles both formats: {"value": "..."} and raw JSON objects
+            let query = format!(
+                "SELECT COALESCE(OBJECT_VALUE:value::STRING, TO_JSON(OBJECT_VALUE)::STRING) AS value FROM {} WHERE OBJECT_ID = '{}'",
+                table_name, object_id
+            );
+            
+            if debug_enabled {
+                eprintln!("[DEBUG] get_conversation_data query: {}", query);
+            }
+            
+            let result = engine.execute_statement(&query).await?;
+            
+            if debug_enabled {
+                eprintln!("[DEBUG] get_conversation_data result: {:?}", result);
+            }
+            
+            // Parse the JSON result
+            if let Some(rows) = result.as_array() {
+                if let Some(first_row) = rows.first() {
+                    if debug_enabled {
+                        eprintln!("[DEBUG] get_conversation_data first_row: {:?}", first_row);
+                    }
+                    if let Some(value) = first_row.get("VALUE").or(first_row.get("value")) {
+                        if debug_enabled {
+                            eprintln!("[DEBUG] get_conversation_data value: {:?}", value);
+                        }
+                        if let Some(s) = value.as_str() {
+                            return Ok(Some(s.to_string()));
+                        }
+                        // Also try to handle if value is a JSON object/number and convert to string
+                        if !value.is_null() {
+                            return Ok(Some(value.to_string()));
+                        }
+                    }
+                }
+            }
+            Ok(None)
+        });
+        result.map_err(|e: String| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
     }
 
-    /// Delete conversation-specific data from the cache
+    /// Delete conversation-specific data from Snowflake tables
     #[pyo3(signature = (conversation_id, key))]
     fn delete_conversation_data(&self, conversation_id: String, key: String) -> PyResult<()> {
         let engine = Arc::clone(&self.engine);
-        self.runtime
-            .block_on(async move {
-                let cache = {
-                    let engine = engine.lock().await;
-                    engine.cache.clone()
-                };
-                let guard = cache.lock().await;
-                guard.delete_conversation_data(&conversation_id, &key).await
-            })
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-        Ok(())
+        let result = self.runtime.block_on(async {
+            let engine = engine.lock().await;
+            let user = engine.get_user().await.map_err(|e| e.to_string())?;
+            let schema_name = format!("USER_{}", user.chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect::<String>().to_uppercase());
+            let table_name = format!("OPENBB_AGENTS.{}.AGENTS_CONTEXT_OBJECTS", schema_name);
+            
+            let object_id = format!("{}_{}", conversation_id, key);
+            let query = format!("DELETE FROM {} WHERE OBJECT_ID = '{}'", table_name, object_id);
+            engine.execute_statement(&query).await.map(|_| ())
+        });
+        result.map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
     }
 
     /// List all conversation-specific data for a conversation
     #[pyo3(signature = (conversation_id))]
     fn list_conversation_data(&self, conversation_id: String) -> PyResult<Vec<(String, String)>> {
         let engine = Arc::clone(&self.engine);
-        let result = self.runtime.block_on(async move {
-            let cache = {
-                let engine = engine.lock().await;
-                engine.cache.clone()
-            };
-            let guard = cache.lock().await;
-            guard.list_conversation_data(&conversation_id).await
+        let result: Result<Vec<(String, String)>, String> = self.runtime.block_on(async {
+            let engine = engine.lock().await;
+            let user = engine.get_user().await.map_err(|e| e.to_string())?;
+            let schema_name = format!("USER_{}", user.chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect::<String>().to_uppercase());
+            let table_name = format!("OPENBB_AGENTS.{}.AGENTS_CONTEXT_OBJECTS", schema_name);
+            
+            let query = format!(
+                "SELECT OBJECT_KEY, OBJECT_VALUE:value::STRING AS value FROM {} WHERE CONVERSATION_ID = '{}'",
+                table_name, conversation_id
+            );
+            let result = engine.execute_statement(&query).await?;
+            
+            let mut data = Vec::new();
+            if let Some(rows) = result.as_array() {
+                for row in rows {
+                    let key = row.get("OBJECT_KEY")
+                        .or(row.get("object_key"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let value = row.get("VALUE")
+                        .or(row.get("value"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if !key.is_empty() {
+                        data.push((key, value));
+                    }
+                }
+            }
+            Ok(data)
         });
-        result.map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+        result.map_err(|e: String| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
     }
 
     /// Clear conversation (delete all messages)
@@ -550,366 +1220,16 @@ impl SnowflakeAI {
         let engine = Arc::clone(&self.engine);
         self.runtime
             .block_on(async move {
-                let cache = {
-                    let engine = engine.lock().await;
-                    engine.cache.clone()
-                };
-                let guard = cache.lock().await;
-                guard.clear_conversation(&conversation_id).await
+                let engine = engine.lock().await;
+                // Clear from Snowflake tables - use getter method for user
+                let user = engine.get_user().await.map_err(|e| e.to_string())?;
+                let schema_name = format!("USER_{}", user.chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect::<String>().to_uppercase());
+                let table_name = format!("OPENBB_AGENTS.{}.AGENTS_MESSAGES", schema_name);
+                let query = format!("DELETE FROM {} WHERE CONVERSATION_ID = '{}'", table_name, conversation_id);
+                engine.execute_statement(&query).await
             })
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
         Ok(())
-    }
-
-    /// Add a message to the conversation cache
-    #[pyo3(signature = (conversation_id, message_id, role, content))]
-    fn add_message(
-        &self,
-        conversation_id: String,
-        message_id: String,
-        role: String,
-        content: String,
-    ) -> PyResult<()> {
-        let engine = Arc::clone(&self.engine);
-        self.runtime
-            .block_on(async move {
-                let cache = {
-                    let engine = engine.lock().await;
-                    engine.cache.clone()
-                };
-                let guard = cache.lock().await;
-                guard
-                    .add_message(conversation_id, message_id, role, content)
-                    .await
-            })
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-        Ok(())
-    }
-
-    /// Get all messages for a conversation (ordered by timestamp)
-    fn get_messages(&self, conversation_id: String) -> PyResult<Vec<(String, String, String)>> {
-        let engine = Arc::clone(&self.engine);
-        self.runtime
-            .block_on(async move {
-                let cache = {
-                    let engine = engine.lock().await;
-                    engine.cache.clone()
-                };
-                let guard = cache.lock().await;
-                guard.get_messages(&conversation_id).await
-            })
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
-    }
-
-    /// Get conversation history from the cache (DEPRECATED - use get_messages instead)
-    #[pyo3(signature = (conversation_id))]
-    fn get_conversation_history(&self, conversation_id: String) -> PyResult<Option<String>> {
-        let engine = Arc::clone(&self.engine);
-        let result = self
-            .runtime
-            .block_on(async move {
-                let cache = {
-                    let engine = engine.lock().await;
-                    engine.cache.clone()
-                };
-                let guard = cache.lock().await;
-                guard
-                    .get_conversation_data(&conversation_id, "conversation_history")
-                    .await
-            })
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-        Ok(result)
-    }
-
-    /// Set conversation history in the cache (DEPRECATED - use add_message instead)
-    #[pyo3(signature = (conversation_id, history))]
-    fn set_conversation_history(&self, conversation_id: String, history: String) -> PyResult<()> {
-        let engine = Arc::clone(&self.engine);
-        self.runtime
-            .block_on(async move {
-                let cache = {
-                    let engine = engine.lock().await;
-                    engine.cache.clone()
-                };
-                let guard = cache.lock().await;
-                guard
-                    .set_conversation_data(
-                        conversation_id,
-                        "conversation_history".to_string(),
-                        history,
-                    )
-                    .await
-            })
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-        Ok(())
-    }
-
-    // Tool definitions
-    #[staticmethod]
-    fn get_table_sample_data_tool() -> agents::Tool {
-        agents::Tool {
-            tool_spec: agents::ToolSpec {
-                tool_type: "generic".to_string(),
-                name: "get_table_sample_data".to_string(),
-                description: "Retrieves sample data from a specified table. Use this to understand the content and structure of a table.".to_string(),
-                input_schema: agents::ToolInputSchema {
-                    schema_type: "object".to_string(),
-                    description: None,
-                    properties: Some(
-                        vec![
-                            (
-                                "table_name".to_string(),
-                                agents::ToolInputSchema {
-                                    schema_type: "string".to_string(),
-                                    description: Some("The fully qualified name of the table (e.g., DATABASE.SCHEMA.TABLE_NAME).".to_string()),
-                                    properties: None,
-                                    items: None,
-                                    required: None,
-                                },
-                            ),
-                        ]
-                        .into_iter()
-                        .collect(),
-                    ),
-                    items: None,
-                    required: Some(vec!["table_name".to_string()]),
-                },
-            },
-        }
-    }
-
-    #[staticmethod]
-    fn get_table_definition_tool() -> agents::Tool {
-        agents::Tool {
-            tool_spec: agents::ToolSpec {
-                tool_type: "generic".to_string(),
-                name: "get_table_definition".to_string(),
-                description: "Retrieves the column definitions (schema) for a specified table. Use this to understand the structure and data types of a table.".to_string(),
-                input_schema: agents::ToolInputSchema {
-                    schema_type: "object".to_string(),
-                    description: None,
-                    properties: Some(
-                        vec![(
-                            "table_name".to_string(),
-                            agents::ToolInputSchema {
-                                schema_type: "string".to_string(),
-                                description: Some("The fully qualified name of the table (e.g., DATABASE.SCHEMA.TABLE_NAME).".to_string()),
-                                properties: None,
-                                items: None,
-                                required: None,
-                            },
-                        )]
-                        .into_iter()
-                        .collect(),
-                    ),
-                    items: None,
-                    required: Some(vec!["table_name".to_string()]),
-                },
-            },
-        }
-    }
-
-    #[staticmethod]
-    fn get_multiple_table_definitions_tool() -> agents::Tool {
-        agents::Tool {
-            tool_spec: agents::ToolSpec {
-                tool_type: "generic".to_string(),
-                name: "get_multiple_table_definitions".to_string(),
-                description:
-                    "Retrieves the column definitions (schema) for a list of specified tables."
-                        .to_string(),
-                input_schema: agents::ToolInputSchema {
-                    schema_type: "object".to_string(),
-                    description: None,
-                    properties: Some(
-                        vec![(
-                            "table_names".to_string(),
-                            agents::ToolInputSchema {
-                                schema_type: "array".to_string(),
-                                description: Some(
-                                    "The list of fully qualified table names.".to_string(),
-                                ),
-                                properties: None,
-                                items: Some(Box::new(agents::ToolInputSchema {
-                                    schema_type: "string".to_string(),
-                                    description: None,
-                                    properties: None,
-                                    items: None,
-                                    required: None,
-                                })),
-                                required: None,
-                            },
-                        )]
-                        .into_iter()
-                        .collect(),
-                    ),
-                    items: None,
-                    required: Some(vec!["table_names".to_string()]),
-                },
-            },
-        }
-    }
-
-    #[staticmethod]
-    fn list_databases_tool() -> agents::Tool {
-        agents::Tool {
-            tool_spec: agents::ToolSpec {
-                tool_type: "generic".to_string(),
-                name: "list_databases".to_string(),
-                description: "Lists all databases accessible to the user.".to_string(),
-                input_schema: agents::ToolInputSchema {
-                    schema_type: "object".to_string(),
-                    description: None,
-                    properties: Some(std::collections::HashMap::new()), // No properties
-                    items: None,
-                    required: None,
-                },
-            },
-        }
-    }
-
-    #[staticmethod]
-    fn list_schemas_tool() -> agents::Tool {
-        agents::Tool {
-            tool_spec: agents::ToolSpec {
-                tool_type: "generic".to_string(),
-                name: "list_schemas".to_string(),
-                description: "Lists all schemas in a specified database. If no database is specified, lists schemas in the current database.".to_string(),
-                input_schema: agents::ToolInputSchema {
-                    schema_type: "object".to_string(),
-                    description: None,
-                    properties: Some(
-                        vec![
-                            (
-                                "database".to_string(),
-                                agents::ToolInputSchema {
-                                    schema_type: "string".to_string(),
-                                    description: Some("The name of the database to list schemas for.".to_string()),
-                                    properties: None,
-                                    items: None,
-                                    required: None, // Optional
-                                },
-                            ),
-                        ]
-                        .into_iter()
-                        .collect(),
-                    ),
-                    items: None,
-                    required: None,
-                },
-            },
-        }
-    }
-
-    #[staticmethod]
-    fn list_tables_in_tool() -> agents::Tool {
-        agents::Tool {
-            tool_spec: agents::ToolSpec {
-                tool_type: "generic".to_string(),
-                name: "list_tables_in".to_string(),
-                description: "Lists all tables in a specified database and schema.".to_string(),
-                input_schema: agents::ToolInputSchema {
-                    schema_type: "object".to_string(),
-                    description: None,
-                    properties: Some(
-                        vec![
-                            (
-                                "database".to_string(),
-                                agents::ToolInputSchema {
-                                    schema_type: "string".to_string(),
-                                    description: Some("The name of the database.".to_string()),
-                                    properties: None,
-                                    items: None,
-                                    required: None,
-                                },
-                            ),
-                            (
-                                "schema".to_string(),
-                                agents::ToolInputSchema {
-                                    schema_type: "string".to_string(),
-                                    description: Some(
-                                        "The name of the schema within the database.".to_string(),
-                                    ),
-                                    properties: None,
-                                    items: None,
-                                    required: None,
-                                },
-                            ),
-                        ]
-                        .into_iter()
-                        .collect(),
-                    ),
-                    items: None,
-                    required: Some(vec!["database".to_string(), "schema".to_string()]),
-                },
-            },
-        }
-    }
-
-    #[staticmethod]
-    fn validate_query_tool() -> agents::Tool {
-        agents::Tool {
-            tool_spec: agents::ToolSpec {
-                tool_type: "generic".to_string(),
-                name: "validate_query".to_string(),
-                description: "Validates a given SQL query without executing it. Returns an error if the query is invalid.".to_string(),
-                input_schema: agents::ToolInputSchema {
-                    schema_type: "object".to_string(),
-                    description: None,
-                    properties: Some(
-                        vec![
-                            (
-                                "query".to_string(),
-                                agents::ToolInputSchema {
-                                    schema_type: "string".to_string(),
-                                    description: Some("The SQL query string to validate.".to_string()),
-                                    properties: None,
-                                    items: None,
-                                    required: None,
-                                },
-                            ),
-                        ]
-                        .into_iter()
-                        .collect(),
-                    ),
-                    items: None,
-                    required: Some(vec!["query".to_string()]),
-                },
-            },
-        }
-    }
-
-    #[staticmethod]
-    fn execute_query_tool() -> agents::Tool {
-        agents::Tool {
-            tool_spec: agents::ToolSpec {
-                tool_type: "generic".to_string(),
-                name: "execute_query".to_string(),
-                description: "Executes a given SQL query and returns the results. Use this to retrieve data from the database.".to_string(),
-                input_schema: agents::ToolInputSchema {
-                    schema_type: "object".to_string(),
-                    description: None,
-                    properties: Some(
-                        vec![
-                            (
-                                "query".to_string(),
-                                agents::ToolInputSchema {
-                                    schema_type: "string".to_string(),
-                                    description: Some("The SQL query string to execute.".to_string()),
-                                    properties: None,
-                                    items: None,
-                                    required: None,
-                                },
-                            ),
-                        ]
-                        .into_iter()
-                        .collect(),
-                    ),
-                    items: None,
-                    required: Some(vec!["query".to_string()]),
-                },
-            },
-        }
     }
 }
 
@@ -945,7 +1265,7 @@ impl PyStream {
 
 #[pymethods]
 impl SnowflakeAgent {
-    #[pyo3(signature = (message, model="llama3.1-70b", temperature=None, max_tokens=None))]
+    #[pyo3(signature = (message, model="openai-gpt-5-chat", temperature=None, max_tokens=None))]
     fn stream_complete(
         &self,
         message: String,
@@ -980,7 +1300,7 @@ impl SnowflakeAgent {
         }
     }
 
-    #[pyo3(signature = (message, model="llama3.1-70b", temperature=None, max_tokens=None, use_history=true))]
+    #[pyo3(signature = (message, model="openai-gpt-5-chat", temperature=None, max_tokens=None, use_history=true))]
     fn complete(
         &self,
         message: String,
@@ -1013,7 +1333,7 @@ impl SnowflakeAgent {
         }
     }
 
-    #[pyo3(signature = (message, model="llama3.1-70b", temperature=None, max_tokens=None, use_history=true, tools=None, tool_choice=None))]
+    #[pyo3(signature = (message, model="openai-gpt-5-chat", temperature=None, max_tokens=None, use_history=true, tools=None, tool_choice=None))]
     fn complete_with_tools(
         &self,
         message: String,
@@ -1067,7 +1387,7 @@ impl SnowflakeAgent {
         }
     }
 
-    #[pyo3(signature = (message, model="llama3.1-70b", temperature=None, max_tokens=None, use_history=true))]
+    #[pyo3(signature = (message, model="openai-gpt-5-chat", temperature=None, max_tokens=None, use_history=true))]
     fn get_complete_details(
         &self,
         message: String,
@@ -1777,6 +2097,8 @@ fn _snowflake_ai(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SnowflakeAgent>()?;
     m.add_class::<PyStream>()?;
     m.add_class::<agents::Message>()?;
+    m.add_class::<agents::SnowflakeFile>()?;
+    m.add_class::<agents::DocumentUrl>()?;
     m.add_class::<agents::ContentItem>()?;
     m.add_class::<agents::Tool>()?;
     m.add_class::<agents::ToolSpec>()?;

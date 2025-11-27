@@ -1,23 +1,18 @@
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fmt;
-use std::path::PathBuf;
-use tokio::task;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use snowflake_connector_rs::{
-    Error, SnowflakeAuthMethod, SnowflakeClient, SnowflakeClientConfig, SnowflakeSession,
+    Error,
+    SnowflakeAuthMethod,
+    SnowflakeClient,
+    SnowflakeClientConfig,
+    SnowflakeSession,
 };
 
-use crate::agents::AgentsClient;
-use crate::cache::CacheConnection;
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use tokio::sync::{Mutex, OnceCell};
-
-pub static CACHE_DB: OnceCell<Arc<Mutex<CacheConnection>>> = OnceCell::const_new();
-static CACHE_INIT_LOCK: Mutex<()> = Mutex::const_new(());
-static UPDATING_ALL_TABLES: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Schema {
@@ -124,7 +119,10 @@ pub enum CortexResponseContent {
 pub struct SnowflakeEngine {
     session: Arc<SnowflakeSession>,
     account: String,
+    user: String,
     password: Option<String>,
+    role: String,
+    warehouse: String,
     database: String,
     schema: String,
     cortex_enabled: bool,
@@ -133,18 +131,29 @@ pub struct SnowflakeEngine {
     semantic_model_file: Option<String>,
     conversation_history: Vec<CortexMessage>,
     jwt_token: Option<String>,
-    pub cache: Arc<Mutex<CacheConnection>>,
 }
 
 impl fmt::Debug for SnowflakeEngine {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SnowflakeEngine")
             .field("account", &self.account)
+            .field("user", &self.user)
+            .field("role", &self.role)
+            .field("warehouse", &self.warehouse)
             .field("database", &self.database)
             .field("schema", &self.schema)
             .field("cortex_enabled", &self.cortex_enabled)
             .finish()
     }
+}
+
+fn _get_user_schema_name(user_id: &str) -> String {
+    let sanitized = user_id
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+        .collect::<String>()
+        .to_uppercase();
+    format!("USER_{}", sanitized)
 }
 
 impl SnowflakeEngine {
@@ -172,35 +181,13 @@ impl SnowflakeEngine {
         .map_err(|e| e.to_string())?;
         let session = Arc::new(client.create_session().await.map_err(|e| e.to_string())?);
 
-        let cache = if let Some(cache) = CACHE_DB.get() {
-            cache.clone()
-        } else {
-            let _lock = CACHE_INIT_LOCK.lock().await;
-            if let Some(cache) = CACHE_DB.get() {
-                cache.clone()
-            } else {
-                let cache_path = std::env::var("SNOWFLAKE_CACHE").ok();
-                let cache_key = std::env::var("SNOWFLAKE_CACHE_KEY")
-                    .map_err(|_| "SNOWFLAKE_CACHE_KEY environment variable must be set for cache encryption. Please generate a secure, random key (e.g., using `openssl rand -base64 32`) and set it as an environment variable.".to_string())?;
-                if cache_key.is_empty() {
-                    return Err("SNOWFLAKE_CACHE_KEY environment variable cannot be empty for cache encryption. Please generate a secure, random key (e.g., using `openssl rand -base64 32`) and set it as an environment variable.".to_string());
-                }
-                let new_cache = Arc::new(Mutex::new(
-                    CacheConnection::new(cache_path.as_deref(), &cache_key)
-                        .await
-                        .map_err(|e| format!("Failed to initialize cache: {}", e))?,
-                ));
-                CACHE_DB
-                    .set(new_cache)
-                    .map_err(|_| "Cache already initialized".to_string())?;
-                CACHE_DB.get().unwrap().clone()
-            }
-        };
-
-        Ok(SnowflakeEngine {
+        let engine = SnowflakeEngine {
             session,
             account: account.to_string(),
+            user: user.to_string(),
             password: Some(password.to_string()),
+            role: role.to_string(),
+            warehouse: warehouse.to_string(),
             database: database.to_string(),
             schema: schema.to_string(),
             cortex_enabled: true,
@@ -209,8 +196,124 @@ impl SnowflakeEngine {
             semantic_model_file: None,
             conversation_history: Vec::new(),
             jwt_token: None,
-            cache,
-        })
+        };
+
+        // Only ensure the database exists, not user-specific resources
+        engine.setup_openbb_agents_database().await?;
+        Ok(engine)
+    }
+
+    /// Ensures the OPENBB_AGENTS database exists. User-specific resources are created on-demand.
+    async fn setup_openbb_agents_database(&self) -> Result<(), String> {
+        let db_name = "OPENBB_AGENTS";
+        self.execute_statement(&format!("CREATE DATABASE IF NOT EXISTS {}", db_name)).await?;
+        Ok(())
+    }
+
+    /// Creates a user-specific schema and tables if they don't exist.
+    pub async fn setup_user_resources(&self, user_id: &str) -> Result<(), String> {
+        let db_name = "OPENBB_AGENTS";
+        let schema_name = _get_user_schema_name(user_id);
+        let fq_schema_name = format!("{}.{}", db_name, schema_name);
+
+        // First ensure the database exists
+        self.execute_statement(&format!("CREATE DATABASE IF NOT EXISTS {}", db_name)).await?;
+
+        self.execute_statement(&format!("CREATE SCHEMA IF NOT EXISTS {}", fq_schema_name)).await?;
+
+        self.execute_statement(&format!(
+            "CREATE TABLE IF NOT EXISTS {}.AGENTS_CONVERSATIONS (
+                CONVERSATION_ID STRING PRIMARY KEY,
+                CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+                LAST_UPDATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+                SUMMARY STRING,
+                METADATA VARIANT
+            )",
+            fq_schema_name
+        ))
+        .await?;
+
+        self.execute_statement(&format!(
+            "CREATE TABLE IF NOT EXISTS {}.AGENTS_MESSAGES (
+                MESSAGE_ID STRING PRIMARY KEY,
+                CONVERSATION_ID STRING,
+                PARENT_MESSAGE_ID STRING,
+                ROLE STRING,
+                CONTENT STRING,
+                METADATA VARIANT,
+                TIMESTAMP TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+            )",
+            fq_schema_name
+        ))
+        .await?;
+
+        self.execute_statement(&format!(
+            "CREATE TABLE IF NOT EXISTS {}.AGENTS_CONTEXT_OBJECTS (
+                OBJECT_ID STRING PRIMARY KEY,
+                CONVERSATION_ID STRING,
+                OBJECT_TYPE STRING,
+                OBJECT_KEY STRING,
+                OBJECT_VALUE VARIANT,
+                CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+            )",
+            fq_schema_name
+        ))
+        .await?;
+
+        Ok(())
+    }
+    
+    pub async fn add_message(
+        &self,
+        conversation_id: String,
+        message_id: String,
+        role: String,
+        content: String,
+    ) -> Result<(), String> {
+        // Ensure user resources exist first using the actual user
+        self.setup_user_resources(&self.user).await?;
+        
+        let schema_name = _get_user_schema_name(&self.user);
+        let table_name = format!("OPENBB_AGENTS.{}.AGENTS_MESSAGES", schema_name);
+        let query = format!(
+            "INSERT INTO {} (CONVERSATION_ID, MESSAGE_ID, ROLE, CONTENT) VALUES ('{}', '{}', '{}', '{}')",
+            table_name,
+            conversation_id,
+            message_id,
+            role,
+            content.replace("'", "''")
+        );
+        self.execute_statement(&query).await?;
+        Ok(())
+    }
+
+    pub async fn get_messages(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<(String, String, String)>, String> {
+        // Ensure user resources exist first using the actual user
+        self.setup_user_resources(&self.user).await?;
+        
+        let schema_name = _get_user_schema_name(&self.user);
+        let table_name = format!("OPENBB_AGENTS.{}.AGENTS_MESSAGES", schema_name);
+        let query = format!(
+            "SELECT MESSAGE_ID, ROLE, CONTENT FROM {} WHERE CONVERSATION_ID = '{}' ORDER BY TIMESTAMP ASC",
+            table_name,
+            conversation_id
+        );
+        let results = self.execute_statement(&query).await?;
+        let mut messages = Vec::new();
+        if let Some(rows) = results.as_array() {
+            for row in rows {
+                if let Some(obj) = row.as_object() {
+                    let message_id = obj.get("MESSAGE_ID").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let role = obj.get("ROLE").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let content = obj.get("CONTENT").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    messages.push((message_id, role, content));
+                }
+            }
+        }
+        Ok(messages)
     }
 
     pub fn generate_jwt(&mut self) -> Result<(), String> {
@@ -269,7 +372,10 @@ impl SnowflakeEngine {
         self.semantic_model = Some(semantic_model);
         self.semantic_model_stage = Some(format!(
             "@\"{}\".\"{}\".\"{}\"/{}",
-            self.database, self.schema, stage_name, filename
+            self.database,
+            self.schema,
+            stage_name,
+            filename
         ));
 
         Ok(format!(
@@ -397,7 +503,7 @@ impl SnowflakeEngine {
             .await
             .map_err(|e| format!("Failed to read response: {}", e))?;
 
-        let cortex_response: CortexAnalystResponse =
+        let cortex_response: CortexAnalystResponse = 
             serde_json::from_str(&response_text).map_err(|e| {
                 format!(
                     "Failed to parse Cortex response: {}. Body: {}",
@@ -459,7 +565,7 @@ impl SnowflakeEngine {
         for table_name in tables {
             match self.get_table_info(&table_name).await {
                 Ok(schema_json_str) => {
-                    let schema_json: serde_json::Value =
+                    let schema_json: serde_json::Value = 
                         match serde_json::from_str(&schema_json_str) {
                             Ok(json) => json,
                             Err(_) => continue, // Skip if JSON is invalid
@@ -479,7 +585,7 @@ impl SnowflakeEngine {
                                     })
                                     .collect();
                                 context.push_str(&format!(
-                                    "-- {}({})\n",
+                                    "-- {}({}\n",
                                     full_table_name,
                                     column_names.join(", ")
                                 ));
@@ -551,8 +657,8 @@ impl SnowflakeEngine {
     }
 
     pub async fn generate_semantic_model_from_schema(&self) -> Result<SemanticModel, String> {
-        let schema = self.get_schema().await?;
-        let mut tables_map: std::collections::HashMap<String, Vec<Schema>> =
+        let schema = self.get_detailed_schema().await?;
+        let mut tables_map: std::collections::HashMap<String, Vec<Schema>> = 
             std::collections::HashMap::new();
 
         for col in schema {
@@ -610,7 +716,7 @@ impl SnowflakeEngine {
         &mut self,
         partial_query: &str,
     ) -> Result<Vec<String>, String> {
-        if !self.is_cortex_enabled() {
+        if !self.cortex_enabled {
             return Ok(vec![]);
         }
 
@@ -696,6 +802,47 @@ impl SnowflakeEngine {
         }
     }
 
+    pub async fn execute_statement(&self, statement: &str) -> Result<serde_json::Value, String> {
+        let mut cleaned_query = statement.trim().to_string();
+        if cleaned_query.ends_with(';') {
+            cleaned_query.pop();
+        }
+
+        let results = self
+            .session
+            .query(cleaned_query.as_str())
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let column_names: Vec<String> = results.first().map_or(vec![], |first_row| {
+            first_row
+                .column_types()
+                .into_iter()
+                .map(|col| col.name().to_string())
+                .collect()
+        });
+
+        let row_data: Vec<_> = results
+            .into_iter()
+            .map(|row| {
+                let mut row_map = serde_json::Map::new();
+                for name in &column_names {
+                    let value = match row.get::<serde_json::Value>(name) {
+                        Ok(v) => v,
+                        Err(_) => match row.get::<String>(name) {
+                            Ok(s) => serde_json::Value::String(s),
+                            Err(_) => serde_json::Value::Null,
+                        },
+                    };
+                    row_map.insert(name.clone(), value);
+                }
+                serde_json::Value::Object(row_map)
+            })
+            .collect();
+
+        Ok(json!(row_data))
+    }
+
     pub async fn execute_query(
         &self,
         query: &str,
@@ -777,7 +924,7 @@ impl SnowflakeEngine {
         }))
     }
 
-    pub async fn get_schema(&self) -> Result<Vec<Schema>, String> {
+    pub async fn get_detailed_schema(&self) -> Result<Vec<Schema>, String> {
         let query = format!(
             "SELECT TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, \n             ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, DATA_TYPE \n             FROM \"{}\".INFORMATION_SCHEMA.COLUMNS \n             WHERE TABLE_SCHEMA = '{}' \n             ORDER BY TABLE_NAME, ORDINAL_POSITION",
             self.database, self.schema
@@ -814,83 +961,8 @@ impl SnowflakeEngine {
             [t] => (self.database.as_str(), self.schema.as_str(), *t),
             _ => return Err("Invalid table name format".to_string()),
         };
-        // Check cache first
-        let cache_lock = self.cache.lock().await;
-        if let Ok(Some(cached_columns)) = cache_lock.get_table_schema(catalog, schema, table).await
-        {
-            drop(cache_lock);
 
-            // Convert ColumnInfo back to JSON format
-            let columns_json: Vec<serde_json::Value> = cached_columns
-                .into_iter()
-                .map(|col| {
-                    json!({
-                        "COLUMN_NAME": col.column_name,
-                        "DATA_TYPE": col.data_type,
-                        "IS_NULLABLE": col.is_nullable,
-                        "COLUMN_DEFAULT": col.column_default,
-                        "ORDINAL_POSITION": col.ordinal_position,
-                    })
-                })
-                .collect();
-
-            return Ok(serde_json::to_string(&json!({
-                "columns": columns_json,
-                "primary_keys": [],
-                "foreign_keys": [],
-            }))
-            .unwrap());
-        }
-        drop(cache_lock);
-
-        // Cache miss - fetch from Snowflake
-        let schema_json = self.get_table_info_direct(table_name).await?;
-
-        // Extract columns and cache them
-        if let Some(columns_arr) = schema_json.get("columns").and_then(|c| c.as_array()) {
-            let column_infos: Vec<crate::cache::ColumnInfo> = columns_arr
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, col)| {
-                    Some(crate::cache::ColumnInfo {
-                        column_name: col.get("COLUMN_NAME")?.as_str()?.to_string(),
-                        ordinal_position: idx as i64,
-                        column_default: col
-                            .get("COLUMN_DEFAULT")
-                            .and_then(|v| v.as_str())
-                            .map(String::from),
-                        is_nullable: col.get("IS_NULLABLE")?.as_str()?.to_string(),
-                        data_type: col.get("DATA_TYPE")?.as_str()?.to_string(),
-                    })
-                })
-                .collect();
-
-            if !column_infos.is_empty() {
-                let cache = self.cache.clone();
-                let cat = catalog.to_string();
-                let sch = schema.to_string();
-                let tbl = table.to_string();
-                task::spawn(async move {
-                    let cache_lock = cache.lock().await;
-                    let _ = cache_lock
-                        .set_table_schema(cat, sch, tbl, column_infos)
-                        .await;
-                });
-            }
-        }
-
-        serde_json::to_string(&schema_json).map_err(|e| e.to_string())
-    }
-
-    async fn get_table_info_direct(&self, table_name: &str) -> Result<serde_json::Value, String> {
-        let parts: Vec<&str> = table_name.split('.').collect();
-        let (catalog, schema, table) = match parts.as_slice() {
-            [c, s, t] => (*c, *s, *t),
-            [s, t] => (self.database.as_str(), *s, *t),
-            [t] => (self.database.as_str(), self.schema.as_str(), *t),
-            _ => return Err("Invalid table name format".to_string()),
-        };
-
+        // Always query directly from Snowflake (no cache)
         let full_table_name = format!("\"{}\".\"{}\".\"{}\"", catalog, schema, table);
         let describe_query = format!("DESCRIBE TABLE {}", full_table_name);
 
@@ -905,405 +977,412 @@ impl SnowflakeEngine {
             .into_iter()
             .filter_map(|row| {
                 let mut col = serde_json::Map::new();
-                col.insert("name".to_string(), json!(row.get::<String>("name").ok()?));
-                col.insert("type".to_string(), json!(row.get::<String>("type").ok()?));
-                col.insert(
-                    "kind".to_string(),
-                    json!(row.get::<String>("kind").unwrap_or_default()),
-                );
-                col.insert(
-                    "null?".to_string(),
-                    json!(row.get::<String>("null?").unwrap_or_default()),
-                );
-                col.insert(
-                    "default".to_string(),
-                    json!(row.get::<Option<String>>("default").ok().flatten()),
-                );
-                col.insert(
-                    "primary key".to_string(),
-                    json!(row.get::<String>("primary key").unwrap_or_default()),
-                );
-                col.insert(
-                    "unique key".to_string(),
-                    json!(row.get::<String>("unique key").unwrap_or_default()),
-                );
-                col.insert(
-                    "check".to_string(),
-                    json!(row.get::<Option<String>>("check").ok().flatten()),
-                );
-                col.insert(
-                    "expression".to_string(),
-                    json!(row.get::<Option<String>>("expression").ok().flatten()),
-                );
-                col.insert(
-                    "comment".to_string(),
-                    json!(row.get::<Option<String>>("comment").ok().flatten()),
-                );
-                col.insert(
-                    "policy name".to_string(),
-                    json!(row.get::<Option<String>>("policy name").ok().flatten()),
-                );
-                col.insert(
-                    "privacy domain".to_string(),
-                    json!(row.get::<Option<String>>("privacy domain").ok().flatten()),
-                );
+                col.insert("COLUMN_NAME".to_string(), json!(row.get::<String>("name").ok()?));
+                col.insert("DATA_TYPE".to_string(), json!(row.get::<String>("type").ok()?));
+                col.insert("IS_NULLABLE".to_string(), json!(row.get::<String>("null?").unwrap_or_default()));
+                col.insert("COLUMN_DEFAULT".to_string(), json!(row.get::<Option<String>>("default").ok().flatten()));
+                col.insert("ORDINAL_POSITION".to_string(), json!(0)); // Not provided by DESCRIBE
                 Some(serde_json::Value::Object(col))
             })
             .collect();
 
-        Ok(serde_json::Value::Array(columns_json))
+        Ok(serde_json::to_string(&json!({
+            "columns": columns_json,
+            "primary_keys": [],
+            "foreign_keys": [],
+        })).unwrap())
     }
 
     /// Get list of tables in current schema
     pub async fn get_table_list(&self) -> Result<Vec<String>, String> {
-        let cache_lock = self.cache.lock().await;
-        if let Ok(tables) = cache_lock
-            .get_tables_in_schema(&self.database, &self.schema)
+        // Always query directly from Snowflake
+        self.list_tables_in_current_schema_direct()
             .await
-        {
-            if !tables.is_empty() {
-                return Ok(tables);
+            .map_err(|e| e.to_string())
+    }
+
+    async fn list_tables_in_current_schema_direct(&self) -> Result<Vec<String>, Error> {
+        let query = format!(
+            "SELECT TABLE_NAME FROM \"{}\".INFORMATION_SCHEMA.TABLES              WHERE TABLE_SCHEMA = '{}'              ORDER BY TABLE_NAME",
+            self.database, self.schema
+        );
+
+        let results = self.session.query(query.as_str()).await?;
+        let mut tables = Vec::new();
+        for row in results {
+            if let Ok(name) = row.get::<String>("TABLE_NAME") {
+                tables.push(name);
             }
         }
-        drop(cache_lock); // Release the lock before potentially awaiting another async call
-
-        let tables = self
-            .list_tables_in_current_schema_direct()
-            .await
-            .map_err(|e| e.to_string())?;
-        let cache = self.cache.clone();
-        let db = self.database.clone();
-        let s = self.schema.clone();
-        let tables_clone = tables.clone();
-        task::spawn(async move {
-            let cache_lock = cache.lock().await;
-            let _ = cache_lock.set_tables_in_schema(db, s, tables_clone).await;
-        });
         Ok(tables)
     }
 
-    pub fn is_cortex_enabled(&self) -> bool {
-        self.cortex_enabled && self.password.is_some()
+    /// List documents available in the user's Cortex uploads stage
+    /// Returns a list of (file_name, stage_path, is_parsed, page_count) tuples
+    /// This lists files from the stage and checks if they have been parsed
+    pub async fn list_cortex_documents(&self) -> Result<Vec<(String, String, bool, i64)>, String> {
+        let schema_name = _get_user_schema_name(&self.user);
+        let stage_name = format!("OPENBB_AGENTS.{}.CORTEX_UPLOADS", schema_name);
+        let table_name = format!("OPENBB_AGENTS.{}.DOCUMENT_PARSE_RESULTS", schema_name);
+
+        // First, list files from the stage
+        let list_query = format!("LIST @\"OPENBB_AGENTS\".\"{}\".\"CORTEX_UPLOADS\"", schema_name);
+        
+        let stage_files = match self.session.query(list_query.as_str()).await {
+            Ok(results) => {
+                let mut files = Vec::new();
+                for row in results {
+                    if let Ok(name) = row.get::<String>("name") {
+                        // Extract just the filename from the full path
+                        let filename = name.split('/').next_back().unwrap_or(&name).to_string();
+                        if !filename.is_empty() && !filename.ends_with('/') {
+                            files.push(filename);
+                        }
+                    }
+                }
+                files
+            }
+            Err(_) => Vec::new(), // Stage might not exist
+        };
+
+        if stage_files.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Check which files have been parsed and get their page counts
+        let mut documents = Vec::new();
+        
+        for file_name in stage_files {
+            let stage_path = format!("@{}/{}", stage_name, file_name);
+            
+            // Check if this file has been parsed
+            let check_query = format!(
+                "SELECT COUNT(*) as PAGE_COUNT FROM \"OPENBB_AGENTS\".\"{}\".\"DOCUMENT_PARSE_RESULTS\" WHERE FILE_NAME = '{}'",
+                schema_name,
+                file_name.replace("'", "''")
+            );
+            
+            let (is_parsed, page_count) = match self.session.query(check_query.as_str()).await {
+                Ok(results) => {
+                    if let Some(row) = results.into_iter().next() {
+                        let count: i64 = row.get("PAGE_COUNT").unwrap_or(0);
+                        (count > 0, count)
+                    } else {
+                        (false, 0)
+                    }
+                }
+                Err(_) => (false, 0), // Table might not exist
+            };
+            
+            documents.push((file_name, stage_path, is_parsed, page_count));
+        }
+        
+        Ok(documents)
     }
 
-    pub fn get_semantic_model(&self) -> Option<&SemanticModel> {
-        self.semantic_model.as_ref()
+    /// Download a document from Snowflake stage and return base64-encoded content
+    /// document_id is the FILE_NAME - file is downloaded from CORTEX_UPLOADS stage
+    pub async fn download_cortex_document(&self, document_id: &str) -> Result<String, String> {
+        let schema_name = _get_user_schema_name(&self.user);
+        
+        // Extract just the filename if a full stage path was provided
+        // Input could be: "@OPENBB_AGENTS.USER_XXX.CORTEX_UPLOADS/file.pdf" or just "file.pdf"
+        let file_name = if document_id.contains('/') {
+            // Extract filename from path like "@OPENBB_AGENTS.USER_XXX.CORTEX_UPLOADS/file.pdf"
+            document_id.rsplit('/').next().unwrap_or(document_id)
+        } else {
+            document_id
+        };
+
+        // Use GET command to download the file via Snow CLI
+        let snow_cli_path = self
+            .find_snow_cli()
+            .ok_or_else(|| "Snow CLI not found. Please install snowflake-cli-python.".to_string())?;
+
+        // Create a temp directory for the download
+        let temp_dir = std::env::temp_dir().join(format!("snowflake_download_{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir)
+            .map_err(|e| format!("Failed to create temp directory: {}", e))?;
+
+        // Build GET query - proper syntax per Snowflake docs:
+        // GET @[namespace.]stage_name/path 'file:///local_path/'
+        // The stage path should be: '@OPENBB_AGENTS.USER_XXX.CORTEX_UPLOADS/filename'
+        // Local path needs trailing slash for directory
+        // Both paths must be single-quoted, especially if filename contains spaces
+        let local_path = format!("file://{}/", temp_dir.to_string_lossy().replace("\\", "/"));
+        let stage_path = format!("@OPENBB_AGENTS.{}.CORTEX_UPLOADS/{}", schema_name, file_name);
+        
+        let get_query = format!("GET '{}' '{}'", stage_path, local_path);
+
+        eprintln!("[DEBUG] GET query: {}", get_query);
+        eprintln!("[DEBUG] Temp dir: {}", temp_dir.display());
+
+        let mut cmd = std::process::Command::new(&snow_cli_path);
+        cmd.arg("sql")
+            .arg("-q")
+            .arg(&get_query)
+            .arg("--database")
+            .arg("OPENBB_AGENTS")
+            .arg("--schema")
+            .arg(&schema_name);
+
+        if let Some(pwd) = &self.password {
+            cmd.env("SNOWFLAKE_PASSWORD", pwd);
+        }
+
+        let output = cmd
+            .output()
+            .map_err(|e| format!("Failed to execute Snow CLI: {}", e))?;
+
+        let stdout_str = String::from_utf8_lossy(&output.stdout);
+        let stderr_str = String::from_utf8_lossy(&output.stderr);
+        eprintln!("[DEBUG] Snow CLI stdout: {}", stdout_str);
+        eprintln!("[DEBUG] Snow CLI stderr: {}", stderr_str);
+
+        if !output.status.success() {
+            // Clean up temp dir
+            let _ = std::fs::remove_dir_all(&temp_dir);
+            return Err(format!("Failed to download file: {}", stderr_str));
+        }
+
+        // List files in temp directory to see what was downloaded
+        let mut found_file: Option<std::path::PathBuf> = None;
+        if let Ok(entries) = std::fs::read_dir(&temp_dir) {
+            eprintln!("[DEBUG] Files in temp dir:");
+            for entry in entries.flatten() {
+                let path = entry.path();
+                eprintln!("[DEBUG]   - {}", path.display());
+                // Snowflake may compress files with .gz extension
+                let entry_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if entry_name == file_name || entry_name == format!("{}.gz", file_name) {
+                    found_file = Some(path);
+                }
+            }
+        }
+
+        // Try the exact filename first, then check for .gz version
+        let downloaded_file = if let Some(f) = found_file {
+            f
+        } else {
+            temp_dir.join(file_name)
+        };
+        
+        eprintln!("[DEBUG] Looking for file at: {}", downloaded_file.display());
+        
+        // Check if file exists
+        if !downloaded_file.exists() {
+            let _ = std::fs::remove_dir_all(&temp_dir);
+            return Err(format!(
+                "Downloaded file not found at '{}'. GET command output: {}",
+                downloaded_file.display(),
+                stdout_str
+            ));
+        }
+
+        let file_content = if downloaded_file.extension().and_then(|e| e.to_str()) == Some("gz") {
+            // Decompress gzip file
+            use std::io::Read;
+            let file = std::fs::File::open(&downloaded_file)
+                .map_err(|e| format!("Failed to open compressed file: {}", e))?;
+            let mut decoder = flate2::read::GzDecoder::new(file);
+            let mut decompressed = Vec::new();
+            decoder.read_to_end(&mut decompressed)
+                .map_err(|e| format!("Failed to decompress file: {}", e))?;
+            decompressed
+        } else {
+            std::fs::read(&downloaded_file)
+                .map_err(|e| format!("Failed to read downloaded file '{}': {}", downloaded_file.display(), e))?
+        };
+
+        eprintln!("[DEBUG] Read {} bytes from file", file_content.len());
+
+        // Clean up temp directory
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        // Return base64-encoded content for binary files
+        use base64::Engine;
+        Ok(base64::engine::general_purpose::STANDARD.encode(&file_content))
     }
 
-    pub fn has_semantic_model_stage(&self) -> bool {
-        self.semantic_model_stage.is_some()
+    /// Upload bytes directly to a Snowflake stage (for widget PDF uploads)
+    /// Returns the stage path where the file was uploaded
+    pub async fn upload_bytes_to_stage(
+        &self,
+        file_bytes: &[u8],
+        file_name: &str,
+        stage_name: Option<&str>,
+    ) -> Result<String, String> {
+        let schema_name = _get_user_schema_name(&self.user);
+        let stage = stage_name.unwrap_or("CORTEX_UPLOADS");
+        let qualified_stage_name = format!("OPENBB_AGENTS.{}.{}", schema_name, stage);
+
+        // Ensure stage exists
+        let create_stage_query = format!(
+            "CREATE STAGE IF NOT EXISTS \"OPENBB_AGENTS\".\"{}\".\"{}\" \
+             DIRECTORY = (ENABLE = TRUE) \
+             ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE')",
+            schema_name, stage
+        );
+        self.session.query(create_stage_query.as_str()).await
+            .map_err(|e| format!("Failed to create stage: {}", e))?;
+
+        // Write bytes to temp file
+        let temp_dir = std::env::temp_dir().join(format!("snowflake_upload_{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir)
+            .map_err(|e| format!("Failed to create temp directory: {}", e))?;
+
+        let temp_file_path = temp_dir.join(file_name);
+        std::fs::write(&temp_file_path, file_bytes)
+            .map_err(|e| format!("Failed to write temp file: {}", e))?;
+
+        // Find Snow CLI
+        let snow_cli_path = self
+            .find_snow_cli()
+            .ok_or_else(|| "Snow CLI not found. Please install snowflake-cli-python.".to_string())?;
+
+        // Build PUT query
+        let temp_file_str = temp_file_path.to_string_lossy().replace("\\", "/");
+        let put_query = format!(
+            "PUT 'file://{}' @\"{}\".\"{}\" AUTO_COMPRESS = FALSE OVERWRITE = TRUE",
+            temp_file_str, schema_name, stage
+        );
+
+        let mut cmd = std::process::Command::new(&snow_cli_path);
+        cmd.arg("sql")
+            .arg("-q")
+            .arg(&put_query)
+            .arg("--database")
+            .arg("OPENBB_AGENTS")
+            .arg("--schema")
+            .arg(&schema_name);
+
+        if let Some(pwd) = &self.password {
+            cmd.env("SNOWFLAKE_PASSWORD", pwd);
+        }
+
+        let output = cmd
+            .output()
+            .map_err(|e| format!("Failed to execute Snow CLI: {}", e))?;
+
+        // Clean up temp directory
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("Failed to upload file: {}", stderr));
+        }
+
+        // Refresh stage directory
+        let refresh_query = format!(
+            "ALTER STAGE \"OPENBB_AGENTS\".\"{}\".\"{}\" REFRESH",
+            schema_name, stage
+        );
+        let _ = self.session.query(refresh_query.as_str()).await;
+
+        // Return the stage path
+        Ok(format!("@{}/{}", qualified_stage_name, file_name))
     }
 
     /// List all stages available to the user
     pub async fn list_stages(&self) -> Result<Vec<String>, String> {
-        let cache_lock = self.cache.lock().await;
-        if let Ok(stages) = cache_lock.get_stages().await {
-            if !stages.is_empty() {
-                return Ok(stages);
-            }
-        }
-        drop(cache_lock); // Release the lock before potentially awaiting another async call
-
-        let stages = self.list_stages_direct().await.map_err(|e| e.to_string())?;
-        let cache = self.cache.clone();
-        let stages_clone = stages.clone();
-        task::spawn(async move {
-            let cache_lock = cache.lock().await;
-            let _ = cache_lock.set_stages(stages_clone).await;
-        });
-        Ok(stages)
+        // Always query directly from Snowflake
+        self.list_stages_direct().await.map_err(|e| e.to_string())
     }
 
     /// List files in a specific stage
-    pub async fn list_files_in_stage(&self, stage_name: &str) -> Result<Vec<String>, String> {
-        let cache_lock = self.cache.lock().await;
-        if let Ok(files) = cache_lock.get_stage_files(stage_name).await {
-            if !files.is_empty() {
-                return Ok(files);
+    pub async fn list_files_in_stage(&self, stage_name: &str, _no_cache: bool) -> Result<Vec<String>, String> {
+        // Always query directly from Snowflake (ignore no_cache parameter)
+        self.list_files_in_stage_direct(stage_name)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn list_stages_direct(&self) -> Result<Vec<String>, Error> {
+        let results = self.session.query("SHOW STAGES").await?;
+
+        let mut stages = Vec::new();
+        for row in results {
+            if let Ok(name) = row.get::<String>("name") {
+                stages.push(name);
             }
         }
-        drop(cache_lock); // Release the lock before potentially awaiting another async call
+        Ok(stages)
+    }
 
-        let files = self
-            .list_files_in_stage_direct(stage_name)
-            .await
-            .map_err(|e| e.to_string())?;
-        let cache = self.cache.clone();
-        let stage_name_clone = stage_name.to_string();
-        let files_clone = files.clone();
-        task::spawn(async move {
-            let cache_lock = cache.lock().await;
-            let _ = cache_lock
-                .set_stage_files(stage_name_clone, files_clone)
-                .await;
-        });
+    async fn list_files_in_stage_direct(&self, stage_name: &str) -> Result<Vec<String>, Error> {
+        let query = format!("LIST @\"{}\"", stage_name);
+        let results = self.session.query(query.as_str()).await?;
+
+        let mut files = Vec::new();
+        for row in results {
+            if let Ok(name) = row.get::<String>("name") {
+                // Extract just the filename from the full path
+                let filename = name.split('/').next_back().unwrap_or(&name);
+                files.push(filename.to_string());
+            }
+        }
         Ok(files)
-    }
-
-    /// Switch to a different semantic model stage and file
-    pub fn switch_semantic_model(&mut self, stage: String, file: String) {
-        let stage_path = format!(
-            "@\"{}\".\"{}\".\"{}\"/{}",
-            self.database, self.schema, stage, file
-        );
-        self.semantic_model_stage = Some(stage_path);
-        self.semantic_model_file = Some(file);
-    }
-
-    /// Get current semantic model stage and file
-    pub fn get_semantic_model_config(&self) -> (Option<&str>, Option<&str>) {
-        (
-            self.semantic_model_stage.as_deref(),
-            self.semantic_model_file.as_deref(),
-        )
-    }
-
-    /// Execute AI_COMPLETE function with database context
-    pub async fn ai_complete(
-        &self,
-        model: &str,
-        prompt: &str,
-        options: Option<serde_json::Value>,
-        tools: Option<Vec<crate::agents::Tool>>,
-    ) -> Result<String, String> {
-        let mut full_prompt = prompt.to_string();
-        if let Ok(context) = self.get_database_context_string().await {
-            if !context.is_empty() {
-                full_prompt = format!("{}\n\n{}", context, prompt);
-            }
-        }
-        self.ai_complete_raw(model, &full_prompt, options, tools)
-            .await
-    }
-
-    /// Execute AI_COMPLETE function without database context (faster)
-    pub async fn ai_complete_raw(
-        &self,
-        model: &str,
-        prompt: &str,
-        options: Option<serde_json::Value>,
-        tools: Option<Vec<crate::agents::Tool>>,
-    ) -> Result<String, String> {
-        let tools_json = if let Some(t) = tools {
-            serde_json::to_string(&t).map_err(|e| e.to_string())?
-        } else {
-            "NULL".to_string()
-        };
-
-        let query = if let Some(opts) = options {
-            let mut option_pairs = Vec::new();
-            if let Some(obj) = opts.as_object() {
-                for (key, value) in obj {
-                    let val_str = match value {
-                        serde_json::Value::Number(n) => n.to_string(),
-                        serde_json::Value::String(s) => format!("'{}'", s.replace("'", "''")),
-                        serde_json::Value::Bool(b) => b.to_string(),
-                        _ => value.to_string(),
-                    };
-                    option_pairs.push(format!("'{}', {}", key, val_str));
-                }
-            }
-            let options_str = option_pairs.join(", ");
-
-            format!(
-                "SELECT SNOWFLAKE.CORTEX.COMPLETE('{}', '{}', OBJECT_CONSTRUCT({}, 'tools', PARSE_JSON('{}'))) AS response",
-                model,
-                prompt.replace("'", "''"),
-                options_str,
-                tools_json
-            )
-        } else {
-            format!(
-                "SELECT SNOWFLAKE.CORTEX.COMPLETE('{}', '{}', OBJECT_CONSTRUCT('tools', PARSE_JSON('{}'))) AS response",
-                model,
-                prompt.replace("'", "''"),
-                tools_json
-            )
-        };
-
-        let results = self
-            .session
-            .query(query.as_str())
-            .await
-            .map_err(|e| e.to_string())?;
-
-        if let Some(row) = results.into_iter().next() {
-            row.get::<String>("response").map_err(|e| e.to_string())
-        } else {
-            Err("No response from CORTEX.COMPLETE".to_string())
-        }
-    }
-
-    /// Get list of available AI models from Snowflake
-    pub async fn get_available_models(&self) -> Result<Vec<(String, String)>, String> {
-        // Query Snowflake for available models
-        let query = "SELECT * FROM TABLE(CORTEX.COMPLETE.SHOW_AVAILABLE_MODELS())";
-
-        match self.session.query(query).await {
-            Ok(results) => {
-                let mut models = Vec::new();
-                for row in results {
-                    if let (Ok(name), Ok(desc)) = (
-                        row.get::<String>("MODEL_NAME"),
-                        row.get::<String>("DESCRIPTION"),
-                    ) {
-                        models.push((name, desc));
-                    }
-                }
-
-                // If query succeeds but returns empty, fallback to documented models
-                if models.is_empty() {
-                    Ok(self.get_documented_models())
-                } else {
-                    Ok(models)
-                }
-            }
-            Err(_) => {
-                // If query fails (maybe no permissions), return documented models
-                Ok(self.get_documented_models())
-            }
-        }
-    }
-
-    fn get_documented_models(&self) -> Vec<(String, String)> {
-        // REAL models from https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-rest-api#model-availability
-        vec![
-            ("claude-4-sonnet".to_string(), "Claude 4 Sonnet".to_string()),
-            ("claude-4-opus".to_string(), "Claude 4 Opus".to_string()),
-            (
-                "claude-3-7-sonnet".to_string(),
-                "Claude 3.7 Sonnet".to_string(),
-            ),
-            (
-                "claude-3-5-sonnet".to_string(),
-                "Claude 3.5 Sonnet".to_string(),
-            ),
-            ("openai-gpt-4.1".to_string(), "OpenAI GPT-4.1".to_string()),
-            ("openai-o4-mini".to_string(), "OpenAI o4-mini".to_string()),
-            (
-                "openai-gpt-5-chat".to_string(),
-                "OpenAI GPT-5 Chat".to_string(),
-            ),
-            (
-                "llama4-maverick".to_string(),
-                "Llama 4 Maverick".to_string(),
-            ),
-            ("llama3.1-8b".to_string(), "Llama 3.1 8B".to_string()),
-            ("llama3.1-70b".to_string(), "Llama 3.1 70B".to_string()),
-            ("llama3.1-405b".to_string(), "Llama 3.1 405B".to_string()),
-            ("deepseek-r1".to_string(), "DeepSeek R1".to_string()),
-            ("mistral-7b".to_string(), "Mistral 7B".to_string()),
-            ("mistral-large".to_string(), "Mistral Large".to_string()),
-            ("mistral-large2".to_string(), "Mistral Large 2".to_string()),
-            (
-                "snowflake-llama-3.3-70b".to_string(),
-                "Snowflake Llama 3.3 70B".to_string(),
-            ),
-        ]
-    }
-
-    /// Create an AgentsClient for streaming complete interactions
-    pub fn create_agents_client(&mut self) -> Result<AgentsClient, String> {
-        // Generate/set token if we don't have one
-        if self.jwt_token.is_none() {
-            self.generate_jwt()?;
-        }
-        let token = self.jwt_token.as_ref().unwrap().clone();
-
-        Ok(AgentsClient::new(
-            self.account.clone(),
-            token,
-            self.database.clone(),
-            self.schema.clone(),
-        ))
-    }
-
-    /// Get current database
-    pub fn get_current_database(&self) -> &str {
-        &self.database
-    }
-
-    /// Get current schema
-    pub fn get_current_schema(&self) -> &str {
-        &self.schema
-    }
-
-    /// Get current account
-    pub fn get_current_account(&self) -> &str {
-        &self.account
     }
 
     /// List all databases accessible to the user
     pub async fn list_databases(&self) -> Result<Vec<String>, String> {
-        let cache_lock = self.cache.lock().await;
-        if let Ok(databases) = cache_lock.get_databases().await {
-            if !databases.is_empty() {
-                return Ok(databases);
+        let query = "SHOW DATABASES";
+        let results = self.session.query(query).await.map_err(|e| e.to_string())?;
+        
+        let mut databases = Vec::new();
+        for row in results {
+            if let Ok(name) = row.get::<String>("name") {
+                databases.push(name);
             }
         }
-        drop(cache_lock); // Release the lock before potentially awaiting another async call
-
-        let databases = self
-            .list_databases_direct()
-            .await
-            .map_err(|e| e.to_string())?;
-        let cache = self.cache.clone();
-        let databases_clone = databases.clone();
-        task::spawn(async move {
-            let cache_lock = cache.lock().await;
-            let _ = cache_lock.set_databases(databases_clone).await;
-        });
         Ok(databases)
     }
 
     /// List all schemas in a specific database (or current if None)
     pub async fn list_schemas(&self, database: Option<&str>) -> Result<Vec<String>, String> {
-        let db_to_filter = database.unwrap_or(&self.database);
+        let db_to_use = database.unwrap_or(&self.database);
+        // Always query directly from Snowflake
+        self.list_schemas_direct(Some(db_to_use))
+            .await
+            .map_err(|e| e.to_string())
+    }
 
-        let cache_lock = self.cache.lock().await;
-        if let Ok(schemas) = cache_lock.get_schemas(db_to_filter).await {
-            if !schemas.is_empty() {
-                return Ok(schemas);
+    async fn list_schemas_direct(&self, database: Option<&str>) -> Result<Vec<String>, Error> {
+        let query = if let Some(db) = database {
+            format!("SHOW SCHEMAS IN DATABASE \"{}\"", db)
+        } else {
+            "SHOW SCHEMAS".to_string()
+        };
+
+        let results = self.session.query(query.as_str()).await?;
+
+        let mut schemas = Vec::new();
+        for row in results {
+            if let Ok(name) = row.get::<String>("name") {
+                schemas.push(name);
             }
         }
-        drop(cache_lock); // Release the lock before potentially awaiting another async call
-
-        let schemas = self
-            .list_schemas_direct(Some(db_to_filter))
-            .await
-            .map_err(|e| e.to_string())?;
-        let cache = self.cache.clone();
-        let db_to_filter_clone = db_to_filter.to_string();
-        let schemas_clone = schemas.clone();
-        task::spawn(async move {
-            let cache_lock = cache.lock().await;
-            let _ = cache_lock
-                .set_schemas(db_to_filter_clone, schemas_clone)
-                .await;
-        });
         Ok(schemas)
     }
 
     /// List all warehouses accessible to the user
     pub async fn list_warehouses(&self) -> Result<Vec<String>, String> {
-        let cache_lock = self.cache.lock().await;
-        if let Ok(warehouses) = cache_lock.get_warehouses().await {
-            if !warehouses.is_empty() {
-                return Ok(warehouses);
+        // Always query directly from Snowflake
+        self.list_warehouses_direct()
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn list_warehouses_direct(&self) -> Result<Vec<String>, Error> {
+        let query = "SHOW WAREHOUSES";
+        let results = self.session.query(query).await?;
+
+        let mut warehouses = Vec::new();
+        for row in results {
+            if let Ok(name) = row.get::<String>("name") {
+                warehouses.push(name);
             }
         }
-        drop(cache_lock); // Release the lock before potentially awaiting another async call
-
-        let warehouses = self
-            .list_warehouses_direct()
-            .await
-            .map_err(|e| e.to_string())?;
-        let cache = self.cache.clone();
-        let warehouses_clone = warehouses.clone();
-        task::spawn(async move {
-            let cache_lock = cache.lock().await;
-            let _ = cache_lock.set_warehouses(warehouses_clone).await;
-        });
         Ok(warehouses)
     }
 
@@ -1339,54 +1418,11 @@ impl SnowflakeEngine {
 
     /// List all tables across all accessible databases and schemas
     pub async fn list_all_tables(&self) -> Result<Vec<(String, String, String)>, String> {
-        let cache_lock = self.cache.lock().await;
-        if let Ok(tables) = cache_lock.get_all_tables().await {
-            if !tables.is_empty() {
-                return Ok(tables);
-            }
-        }
-        drop(cache_lock); // Release the lock before potentially awaiting another async call
-
-        // If cache is empty, check if an update is already in progress
-        if UPDATING_ALL_TABLES.load(Ordering::SeqCst) {
-            return Ok(Vec::new()); // Return empty immediately if an update is in progress
-        }
-
-        // If no update in progress, set the flag and spawn a background task
-        UPDATING_ALL_TABLES.store(true, Ordering::SeqCst);
-        let cache = self.cache.clone();
-        let session = self.session.clone();
-        let database = self.database.clone();
-        let schema = self.schema.clone();
-
-        task::spawn(async move {
-            let engine = SnowflakeEngine {
-                session,
-                account: String::new(), // Not used in list_all_tables_direct
-                password: None,         // Not used
-                database,
-                schema,
-                cortex_enabled: false,            // Not used
-                semantic_model: None,             // Not used
-                semantic_model_stage: None,       // Not used
-                semantic_model_file: None,        // Not used
-                conversation_history: Vec::new(), // Not used
-                jwt_token: None,                  // Not used
-                cache: cache.clone(),
-            };
-            match engine.list_all_tables_direct().await {
-                Ok(tables) => {
-                    let cache_lock = cache.lock().await;
-                    let _ = cache_lock.set_all_tables(tables).await;
-                }
-                Err(e) => {
-                    eprintln!("Error updating all tables in background: {}", e);
-                }
-            }
-            UPDATING_ALL_TABLES.store(false, Ordering::SeqCst);
-        });
-
-        Ok(Vec::new()) // Return empty immediately
+        // Always query directly from Snowflake
+        // This might be slow, so consider limiting scope
+        self.list_all_tables_direct()
+            .await
+            .map_err(|e| e.to_string())
     }
 
     /// List tables in a specific database and schema
@@ -1395,45 +1431,10 @@ impl SnowflakeEngine {
         database: &str,
         schema: &str,
     ) -> Result<Vec<String>, String> {
-        let cache_lock = self.cache.lock().await;
-        if let Ok(tables) = cache_lock.get_tables_in_schema(database, schema).await {
-            if !tables.is_empty() {
-                return Ok(tables);
-            }
-        }
-        drop(cache_lock); // Release the lock before potentially awaiting another async call
-
-        let tables = self
-            .list_tables_in_direct(database, schema)
+        // Always query directly from Snowflake
+        self.list_tables_in_direct(database, schema)
             .await
-            .map_err(|e| e.to_string())?;
-        let cache = self.cache.clone();
-        let db = database.to_string();
-        let s = schema.to_string();
-        let tables_clone = tables.clone();
-        task::spawn(async move {
-            let cache_lock = cache.lock().await;
-            let _ = cache_lock.set_tables_in_schema(db, s, tables_clone).await;
-        });
-        Ok(tables)
-    }
-
-    async fn list_tables_in_current_schema_direct(&self) -> Result<Vec<String>, Error> {
-        let query = format!(
-            "SELECT TABLE_NAME FROM \"{}\".INFORMATION_SCHEMA.TABLES \
-             WHERE TABLE_SCHEMA = '{}' \
-             ORDER BY TABLE_NAME",
-            self.database, self.schema
-        );
-
-        let results = self.session.query(query.as_str()).await?;
-        let mut tables = Vec::new();
-        for row in results {
-            if let Ok(name) = row.get::<String>("TABLE_NAME") {
-                tables.push(name);
-            }
-        }
-        Ok(tables)
+            .map_err(|e| e.to_string())
     }
 
     async fn list_tables_in_direct(
@@ -1442,9 +1443,7 @@ impl SnowflakeEngine {
         schema: &str,
     ) -> Result<Vec<String>, Error> {
         let query = format!(
-            "SELECT TABLE_NAME FROM \"{}\".INFORMATION_SCHEMA.TABLES \
-             WHERE TABLE_SCHEMA = '{}' \
-             ORDER BY TABLE_NAME",
+            "SELECT TABLE_NAME FROM \"{}\".INFORMATION_SCHEMA.TABLES              WHERE TABLE_SCHEMA = '{}'              ORDER BY TABLE_NAME",
             database, schema
         );
 
@@ -1458,83 +1457,14 @@ impl SnowflakeEngine {
         Ok(tables)
     }
 
-    async fn list_warehouses_direct(&self) -> Result<Vec<String>, Error> {
-        let query = "SHOW WAREHOUSES";
-        let results = self.session.query(query).await?;
-
-        let mut warehouses = Vec::new();
-        for row in results {
-            if let Ok(name) = row.get::<String>("name") {
-                warehouses.push(name);
-            }
-        }
-        Ok(warehouses)
-    }
-
-    async fn list_stages_direct(&self) -> Result<Vec<String>, Error> {
-        let results = self.session.query("SHOW STAGES").await?;
-
-        let mut stages = Vec::new();
-        for row in results {
-            if let Ok(name) = row.get::<String>("name") {
-                stages.push(name);
-            }
-        }
-        Ok(stages)
-    }
-
-    async fn list_files_in_stage_direct(&self, stage_name: &str) -> Result<Vec<String>, Error> {
-        let query = format!("LIST @\"{}\"", stage_name);
-        let results = self.session.query(query.as_str()).await?;
-
-        let mut files = Vec::new();
-        for row in results {
-            if let Ok(name) = row.get::<String>("name") {
-                // Extract just the filename from the full path
-                let filename = name.split('/').next_back().unwrap_or(&name);
-                files.push(filename.to_string());
-            }
-        }
-        Ok(files)
-    }
-
-    async fn list_databases_direct(&self) -> Result<Vec<String>, Error> {
-        let query = "SHOW DATABASES";
-        let results = self.session.query(query).await?;
-
-        let mut databases = Vec::new();
-        for row in results {
-            if let Ok(name) = row.get::<String>("name") {
-                databases.push(name);
-            }
-        }
-        Ok(databases)
-    }
-
-    async fn list_schemas_direct(&self, database: Option<&str>) -> Result<Vec<String>, Error> {
-        let query = if let Some(db) = database {
-            format!("SHOW SCHEMAS IN DATABASE \"{}\"", db)
-        } else {
-            "SHOW SCHEMAS".to_string()
-        };
-
-        let results = self.session.query(query.as_str()).await?;
-
-        let mut schemas = Vec::new();
-        for row in results {
-            if let Ok(name) = row.get::<String>("name") {
-                schemas.push(name);
-            }
-        }
-        Ok(schemas)
-    }
-
-    async fn list_all_tables_direct(&self) -> Result<Vec<(String, String, String)>, Error> {
-        let databases = self.list_databases_direct().await?;
+    /// List all tables across all accessible databases and schemas
+    async fn list_all_tables_direct(&self) -> Result<Vec<(String, String, String)>, String> {
+        let databases = self.list_databases().await
+            .map_err(|e| format!("Failed to list databases: {}", e))?;
         let mut all_tables = Vec::new();
 
-        for db in databases {
-            match self.list_schemas_direct(Some(&db)).await {
+        for db in &databases {
+            match self.list_schemas_direct(Some(db)).await.map_err(|e| e.to_string()) {
                 Ok(schemas) => {
                     for schema in &schemas {
                         let query = format!(
@@ -1545,7 +1475,7 @@ impl SnowflakeEngine {
                             db, schema
                         );
 
-                        match self.session.query(query.as_str()).await {
+                        match self.session.query(query.as_str()).await.map_err(|e| e.to_string()) {
                             Ok(results) => {
                                 for row in results {
                                     if let (Ok(catalog), Ok(schema_name), Ok(table)) = (
@@ -1557,11 +1487,11 @@ impl SnowflakeEngine {
                                     }
                                 }
                             }
-                            Err(_) => continue, // Skip schemas we can't access
+                            Err(_) => continue,
                         }
                     }
                 }
-                Err(_) => continue, // Skip databases we can't access
+                Err(_) => continue,
             }
         }
 
@@ -1569,7 +1499,310 @@ impl SnowflakeEngine {
     }
 
     pub async fn close(&mut self) -> Result<(), String> {
-        let mut cache = self.cache.lock().await;
-        cache.close().await.map_err(|e| e.to_string())
+        // Nothing to close anymore (no cache)
+        Ok(())
+    }
+
+    fn find_snow_cli(&self) -> Option<PathBuf> {
+        if let Ok(path) = std::env::var("PATH") {
+            for part in std::env::split_paths(&path) {
+                let exe_name = if cfg!(windows) { "snow.exe" } else { "snow" };
+                let exe = part.join(exe_name);
+                if exe.exists() && !exe.is_dir() {
+                    return Some(exe);
+                }
+            }
+        }
+
+        // On Windows, which("snow") should find snow.cmd
+        if let Some(path) = which::which("snow").ok() {
+            return Some(path);
+        }
+
+        None
+    }
+
+    pub async fn upload_file_to_stage(
+        &self,
+        file_path: &Path,
+        stage_name: &str,
+    ) -> Result<String, String> {
+        // First ensure the stage exists
+        let qualified_stage_name = format!(
+            "\"{}\".\"{}\".\"{}\"",
+            self.database, self.schema, stage_name
+        );
+
+        let create_stage_query = format!(
+            "CREATE STAGE IF NOT EXISTS {} DIRECTORY = (ENABLE = TRUE) ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE')",
+            qualified_stage_name
+        );
+
+        self.session
+            .query(create_stage_query.as_str())
+            .await
+            .map_err(|e| format!("Failed to create stage: {}", e))?;
+
+        // Refresh directory table
+        let refresh_stage_query = format!("ALTER STAGE {} REFRESH", qualified_stage_name);
+        self.session
+            .query(refresh_stage_query.as_str())
+            .await
+            .map_err(|e| format!("Failed to refresh stage: {}", e))?;
+
+        // Check if file exists
+        if !file_path.exists() {
+            return Err(format!("File does not exist: {}", file_path.display()));
+        }
+
+        // Find Snow CLI
+        let snow_cli_path = self
+            .find_snow_cli()
+            .ok_or_else(|| "Snow CLI binary not found. Please install `snowflake-cli-python` and ensure it's in your PATH.".to_string())?;
+
+        // Use absolute path for the file
+        let abs_path = if file_path.is_absolute() {
+            file_path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map_err(|e| e.to_string())? // Use map_err for better error handling
+                .join(file_path)
+        };
+        // Normalize path separators for Windows to forward slashes as required by PUT command
+        let abs_path_str = abs_path
+            .to_string_lossy()
+            .replace("\\", "/");
+
+        // Determine auto-compression
+        let compressed_extensions = [
+            "gz", "bz2", "brotli", "zstd", "zip", "parquet", "orc",
+        ];
+        let auto_compress = match file_path.extension().and_then(|s| s.to_str()) {
+            Some(ext) => !compressed_extensions.contains(&ext.to_lowercase().as_str()),
+            None => true,
+        };
+
+        // Execute Snow CLI
+        let mut cmd = std::process::Command::new(snow_cli_path);
+        let auto_compress_val = if auto_compress { "TRUE" } else { "FALSE" };
+        let put_query = format!(
+            "PUT 'file://{}' @\"{}\".\"{}\".\"{}\" AUTO_COMPRESS = {} OVERWRITE = TRUE",
+            abs_path_str, self.database, self.schema, stage_name, auto_compress_val
+        );
+
+        cmd.arg("sql").arg("-q").arg(put_query.as_str());
+
+        // Snow CLI should pick up other connection details from env vars
+        if let Some(pwd) = &self.password {
+            cmd.env("SNOWFLAKE_PASSWORD", pwd);
+        }
+
+        let output = cmd
+            .output()
+            .map_err(|e| format!("Failed to execute Snow CLI: {}", e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            return Err(format!(
+                "Snow CLI upload failed.\nStdout: {}\nStderr: {}",
+                stdout, stderr
+            ));
+        }
+
+        let file_name = file_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file");
+        Ok(format!(
+            "Successfully uploaded {} to {}",
+            file_name, qualified_stage_name
+        ))
+    }
+
+    pub async fn ai_parse_document(
+        &self,
+        stage_file_path: &str,
+        mode: Option<&str>,
+    ) -> Result<String, String> {
+        // Parse mode: LAYOUT preserves formatting, OCR for text extraction
+        let parse_mode = mode.unwrap_or("LAYOUT");
+        
+        // Parse the stage path to build the TO_FILE call correctly
+        let query = if stage_file_path.starts_with("@") {
+            // Stage path format: @stage_name/file.pdf or @db.schema.stage/file.pdf
+            let path = stage_file_path.trim_start_matches('@');
+            
+            // Split into stage and file parts
+            if let Some(slash_pos) = path.find('/') {
+                let stage = &path[..slash_pos];
+                let file = &path[slash_pos + 1..];
+                
+                // Build the proper AI_PARSE_DOCUMENT query
+                format!(
+                    "SELECT AI_PARSE_DOCUMENT(TO_FILE('@{}', '{}'), {{'mode': '{}', 'page_split': true}}) as parsed_content",
+                    stage, file, parse_mode
+                )
+            } else {
+                return Err(format!("Invalid stage path format - must include file: {}", stage_file_path));
+            }
+        } else {
+            return Err(format!("Stage path must start with @: {}", stage_file_path));
+        };
+
+        if std::env::var("SNOWFLAKE_DEBUG").is_ok() {
+            println!("[DEBUG] AI_PARSE_DOCUMENT query: {}", query);
+        }
+
+        let results = self
+            .session
+            .query(query.as_str())
+            .await
+            .map_err(|e| format!("Failed to parse document: {}", e))?;
+
+        if let Some(row) = results.into_iter().next() {
+            // Get the parsed content - it returns a VARIANT/JSON
+            let parsed_content: serde_json::Value = row.get("parsed_content")
+                .map_err(|e| format!("Failed to get parsed content: {}", e))?;
+            
+            // Convert to JSON string for Python
+            Ok(serde_json::to_string(&parsed_content).map_err(|e| e.to_string())?)
+        } else {
+            Err("No content returned from AI_PARSE_DOCUMENT".to_string())
+        }
+    }
+
+    pub async fn create_table_from_file(
+        &self,
+        stage_path: &str,
+        table_name: &str,
+        file_type: &str,
+    ) -> Result<(), String> {
+        let sanitized_table_name = table_name.to_uppercase().replace(|c: char| !c.is_alphanumeric() && c != '_', "_");
+        let file_type_upper = file_type.to_uppercase();
+
+        if file_type_upper != "JSON" && file_type_upper != "XML" {
+            return Err("Invalid file_type specified. Must be 'JSON' or 'XML'.".to_string());
+        }
+
+        let file_format_name = format!("FORMAT_{}", sanitized_table_name);
+        let create_format_query = if file_type_upper == "XML" {
+            format!("CREATE OR REPLACE FILE FORMAT {} TYPE = XML STRIP_OUTER_ELEMENT = TRUE", file_format_name)
+        } else {
+            format!("CREATE OR REPLACE FILE FORMAT {} TYPE = JSON STRIP_OUTER_ARRAY = TRUE", file_format_name)
+        };
+        self.session.query(&*create_format_query).await.map_err(|e| e.to_string())?;
+
+        let create_table_query = format!("CREATE OR REPLACE TABLE {} (RAW_DATA VARIANT)", sanitized_table_name);
+        self.session.query(&*create_table_query).await.map_err(|e| e.to_string())?;
+
+        let copy_into_query = format!("COPY INTO {} FROM '{}' FILE_FORMAT = (FORMAT_NAME = '{}') ON_ERROR = 'CONTINUE'", sanitized_table_name, stage_path, file_format_name);
+        self.session.query(copy_into_query.as_str()).await.map_err(|e| e.to_string())?;
+
+        Ok(())
+    }
+
+    pub async fn query_json_table(
+        &self,
+        table_name: &str,
+        json_path: &str,
+        variant_column: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        let column = variant_column.unwrap_or("RAW_DATA");
+        let sanitized_path = json_path.replace("'", "''");
+        let query = format!("SELECT {}:{} FROM {}", column, sanitized_path, table_name);
+        self.execute_query(&query, None, None, None).await
+    }
+
+    pub async fn query_xml_table(
+        &self,
+        table_name: &str,
+        element_name: &str,
+        element_index: Option<i64>,
+        variant_column: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        let column = variant_column.unwrap_or("RAW_DATA");
+        
+        let select_expression = if let Some(index) = element_index {
+            format!("XMLGET({}, '{}', {}):'$'", column, element_name, index)
+        } else {
+            format!("XMLGET({}, '{}'):'$'", column, element_name)
+        };
+
+        // Casting to VARCHAR here to get the content as a string.
+        // If the element contains complex XML/JSON, it will be returned as such.
+        let query = format!("SELECT {sel_expr}::VARCHAR FROM {table_name}", sel_expr = select_expression, table_name = table_name);
+        
+        self.execute_query(&query, None, None, None).await
+    }
+
+    pub async fn get_or_create_conversation(
+        &self,
+        conversation_id: &str,
+        settings: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        // Use the actual user for schema name, not conversation_id
+        self.setup_user_resources(&self.user).await?;
+        let schema_name = _get_user_schema_name(&self.user);
+        let table_name = format!("OPENBB_AGENTS.{}.AGENTS_CONVERSATIONS", schema_name);
+
+        let query = format!(
+            "SELECT METADATA FROM {} WHERE CONVERSATION_ID = '{}'",
+            table_name,
+            conversation_id
+        );
+        let result = self.execute_statement(&query).await?;
+
+        if let Some(rows) = result.as_array() {
+            if !rows.is_empty() {
+                if let Some(metadata_str) = rows[0].get("METADATA").and_then(|v| v.as_str()) {
+                    if !metadata_str.is_empty() {
+                        return serde_json::from_str(metadata_str).map_err(|e| e.to_string());
+                    }
+                }
+            }
+        }
+        
+        let settings_str = serde_json::to_string(&settings).map_err(|e| e.to_string())?;
+        let insert_query = format!(
+            "INSERT INTO {} (CONVERSATION_ID, METADATA) SELECT '{}', PARSE_JSON('{}')",
+            table_name,
+            conversation_id,
+            settings_str.replace("'", "''")
+        );
+        self.execute_statement(&insert_query).await?;
+        Ok(settings)
+    }
+
+    pub async fn update_conversation_settings(
+        &self,
+        conversation_id: &str,
+        settings: serde_json::Value,
+    ) -> Result<(), String> {
+        // Use the actual user for schema name
+        let schema_name = _get_user_schema_name(&self.user);
+        let table_name = format!("OPENBB_AGENTS.{}.AGENTS_CONVERSATIONS", schema_name);
+        let settings_str = serde_json::to_string(&settings).map_err(|e| e.to_string())?;
+        let query = format!(
+            "UPDATE {} SET METADATA = PARSE_JSON('{}'), LAST_UPDATED_AT = CURRENT_TIMESTAMP() WHERE CONVERSATION_ID = '{}'",
+            table_name,
+            settings_str.replace("'", "''"),
+            conversation_id
+        );
+        self.execute_statement(&query).await?;
+        Ok(())
+    }
+
+    // Add public getter methods for private fields
+    pub async fn get_database(&self) -> Result<String, String> {
+        Ok(self.database.clone())
+    }
+    
+    pub async fn get_schema(&self) -> Result<String, String> {
+        Ok(self.schema.clone())
+    }
+    
+    pub async fn get_user(&self) -> Result<String, String> {
+        Ok(self.user.clone())
     }
 }

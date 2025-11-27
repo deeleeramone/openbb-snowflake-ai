@@ -2,9 +2,16 @@
 
 import json
 import os
+import shutil
+import subprocess
 from typing import Any, Tuple
 
 from ._snowflake_ai import SnowflakeAI, ToolCall
+
+
+def _find_snow_cli_binary():
+    """Find the snow CLI binary."""
+    return shutil.which("snow")
 
 
 async def execute_tool(
@@ -14,12 +21,9 @@ async def execute_tool(
     """
     Execute a tool call and return formatted output for both LLM and user.
 
-    CRITICAL: This function must NEVER truncate, summarize, or hide data.
-    ALL data from Snowflake must be returned in full.
-
     Returns:
         Tuple of (llm_output, raw_data)
-        - llm_output: The COMPLETE data to send to the LLM
+        - llm_output: The data to send to the LLM
         - raw_data: The raw data for storage/caching
     """
     import asyncio
@@ -44,21 +48,22 @@ async def execute_tool(
             )
             result_json = json.loads(result)
 
-            # NEVER TRUNCATE - Return ALL data
             row_data = result_json.get("rowData", [])
             num_rows = len(row_data)
 
             if num_rows == 0:
                 output = f"No data found in table {table_name}."
             else:
-                # Format ALL rows as a table - NO TRUNCATION
+                # Limit rows for sample
+                limit = 5
                 headers = list(row_data[0].keys()) if row_data else []
-                output = f"Sample data from {table_name} ({num_rows} rows):\n\n"
+                output = f"Sample data from {table_name} ({min(num_rows, limit)} of {num_rows} rows):\n\n"
                 output += "| " + " | ".join(headers) + " |\n"
                 output += "|" + "|".join(["---" for _ in headers]) + "|\n"
 
-                # Include EVERY SINGLE ROW
-                for row in row_data:
+                for i, row in enumerate(row_data):
+                    if i >= limit:
+                        break
                     values = [str(row.get(h, "")) for h in headers]
                     output += "| " + " | ".join(values) + " |\n"
 
@@ -68,44 +73,34 @@ async def execute_tool(
             error_msg = f"Error getting sample data for {table_name}: {str(e)}"
             return error_msg, {"error": str(e)}
 
-    elif tool_name == "get_table_definition":
+    elif tool_name == "get_table_schema":
         table_name = tool_args.get("table_name", "")
         try:
             result = await asyncio.to_thread(client.get_table_info, table_name)
             result_json = json.loads(result)
 
-            # Handle cases where result_json is not a list of dicts
-            if not isinstance(result_json, list) or not all(
-                isinstance(item, dict) for item in result_json
-            ):
+            # Extract columns list from the result dict
+            columns = result_json.get("columns", [])
+            if not isinstance(columns, list):
                 return (
-                    f"Error: Invalid format for table definition for {table_name}. Expected a list of columns.",
+                    f"Error: Invalid format for table schema for {table_name}.",
                     {"error": "Invalid format"},
                 )
 
-            # Format ALL columns - NO TRUNCATION
-            output = f"Table definition for {table_name}:\n\n"
-            output += "| name | type | kind | null? | default | primary key | unique key | check | expression | comment | policy name | privacy domain |\n"
-            output += "|---|---|---|---|---|---|---|---|---|---|---|---|\n"
+            output = f"Table schema for {table_name}:\n\n"
+            output += "| Column Name | Data Type | Nullable | Default |\n"
+            output += "|---|---|---|---|\n"
 
-            for col in result_json:
-                output += f"| {col.get('name', '')} "
-                output += f"| {col.get('type', '')} "
-                output += f"| {col.get('kind', '')} "
-                output += f"| {col.get('null?', '')} "
-                output += f"| {col.get('default', '')} "
-                output += f"| {col.get('primary key', '')} "
-                output += f"| {col.get('unique key', '')} "
-                output += f"| {col.get('check', '')} "
-                output += f"| {col.get('expression', '')} "
-                output += f"| {col.get('comment', '')} "
-                output += f"| {col.get('policy name', '')} "
-                output += f"| {col.get('privacy domain', '')} |\n"
+            for col in columns:
+                output += f"| {col.get('COLUMN_NAME', '')} "
+                output += f"| {col.get('DATA_TYPE', '')} "
+                output += f"| {col.get('IS_NULLABLE', '')} "
+                output += f"| {col.get('COLUMN_DEFAULT', '')} |\n"
 
             return output, result_json
 
         except Exception as e:
-            error_msg = f"Error getting table definition for {table_name}: {str(e)}"
+            error_msg = f"Error getting table schema for {table_name}: {str(e)}"
             return error_msg, {"error": str(e)}
 
     elif tool_name == "get_multiple_table_definitions":
@@ -229,8 +224,10 @@ async def execute_tool(
                 # Get headers from the first row
                 headers = list(row_data[0].keys()) if row_data else []
 
-                # Check if output would be too large (>20k chars for safety)
-                # Estimate size: header + rows
+                # Limit output to 50 rows for LLM context
+                limit = 50
+                display_rows = min(num_rows, limit)
+
                 estimated_size = (
                     len("| " + " | ".join(headers) + " |\n") * 2
                 )  # Header + separator
@@ -335,6 +332,63 @@ async def execute_tool(
                 print(f"[DEBUG] Query execution error: {e}")
             return error_msg, {"error": str(e)}
 
+    elif tool_name == "execute_statement":
+        statement = (tool_args.get("statement", "") or "").strip()
+        if not statement:
+            return "Error: 'statement' argument is required.", {
+                "error": "Missing statement"
+            }
+
+        try:
+            result = await asyncio.to_thread(client.execute_statement, statement)
+            try:
+                rows = json.loads(result)
+            except json.JSONDecodeError:
+                return (
+                    "Statement executed successfully. Raw response returned.",
+                    {"raw": result},
+                )
+
+            if not isinstance(rows, list):
+                return (
+                    "Statement executed successfully.",
+                    rows,
+                )
+
+            if not rows:
+                return "Statement executed successfully. No rows returned.", []
+
+            headers = []
+            for row in rows:
+                if isinstance(row, dict):
+                    for key in row.keys():
+                        if key not in headers:
+                            headers.append(key)
+
+            output = f"Statement executed successfully. Returned {len(rows)} rows.\n\n"
+            if headers:
+                output += "| " + " | ".join(headers) + " |\n"
+                output += "|" + "|".join(["---" for _ in headers]) + "|\n"
+
+                for row in rows:
+                    if isinstance(row, dict):
+                        values = []
+                        for header in headers:
+                            val = row.get(header, "")
+                            if val is None:
+                                values.append("NULL")
+                            else:
+                                values.append(str(val))
+                        output += "| " + " | ".join(values) + " |\n"
+
+            return output.strip(), rows
+
+        except Exception as e:
+            error_msg = f"Statement execution failed: {str(e)}"
+            if os.environ.get("SNOWFLAKE_DEBUG"):
+                print(f"[DEBUG] Statement execution error: {e}")
+            return error_msg, {"error": str(e)}
+
     elif tool_name == "continue_output":
         continuation_key = tool_args.get("continuation_key", "")
         conv_id = tool_args.get("conversation_id", "default")
@@ -367,20 +421,222 @@ async def execute_tool(
             error_msg = f"Error continuing output: {str(e)}"
             return error_msg, {"error": str(e)}
 
-    else:
-        error_msg = f"Unknown tool: {tool_name}"
-        return error_msg, {"error": "Unknown tool"}
+    elif tool_name in ("extract_answer", "sentiment", "summarize", "translate"):
+        snow_cli = _find_snow_cli_binary()
+        if not snow_cli:
+            return "Snowflake CLI not found.", {"error": "Snowflake CLI not found"}
+
+        command = [snow_cli, "cortex", tool_name.replace("_", "-")]
+        if tool_name == "extract_answer":
+            command.extend(
+                [
+                    "--question",
+                    tool_args["question"],
+                    "--document",
+                    tool_args["document"],
+                ]
+            )
+        elif tool_name == "translate":
+            command.extend(["--text", tool_args["text"], "--to", tool_args["to_lang"]])
+            if "from_lang" in tool_args:
+                command.extend(["--from", tool_args["from_lang"]])
+        else:  # sentiment, summarize
+            command.append(tool_args["text"])
+
+        try:
+            result = await asyncio.to_thread(
+                subprocess.run, command, capture_output=True, text=True, check=True
+            )
+            data = json.loads(result.stdout)
+            return result.stdout, data
+        except (subprocess.CalledProcessError, json.JSONDecodeError, KeyError) as e:
+            error_msg = f"Error executing {tool_name}: {e}"
+            return error_msg, {"error": str(e)}
+
+    elif tool_name == "read_document":
+        file_name = tool_args.get("file_name", "")
+        page_numbers = tool_args.get("page_numbers", [])
+
+        if not file_name:
+            return "Error: file_name is required", {"error": "file_name required"}
+
+        try:
+            # Get user schema
+            snowflake_user = await asyncio.to_thread(client.get_current_user)
+            sanitized_user = "".join(c if c.isalnum() else "_" for c in snowflake_user)
+            user_schema = f"USER_{sanitized_user}".upper()
+
+            # Build query
+            if page_numbers:
+                page_list = ",".join(str(p) for p in page_numbers)
+                query = f"""
+                SELECT PAGE_NUMBER, PAGE_CONTENT 
+                FROM OPENBB_AGENTS.{user_schema}.DOCUMENT_PARSE_RESULTS 
+                WHERE FILE_NAME = '{file_name}' 
+                AND PAGE_NUMBER IN ({page_list})
+                ORDER BY PAGE_NUMBER
+                """
+            else:
+                query = f"""
+                SELECT PAGE_NUMBER, PAGE_CONTENT 
+                FROM OPENBB_AGENTS.{user_schema}.DOCUMENT_PARSE_RESULTS 
+                WHERE FILE_NAME = '{file_name}'
+                ORDER BY PAGE_NUMBER
+                """
+
+            result = await asyncio.to_thread(client.execute_query, query)
+            result_json = json.loads(result)
+
+            row_data = result_json.get("rowData", [])
+            if not row_data:
+                return (
+                    f"No content found for document '{file_name}'. The document may not be parsed yet.",
+                    {"error": "No content"},
+                )
+
+            # Format document content
+            output = f"**Document: {file_name}** ({len(row_data)} pages)\n\n"
+            for row in row_data:
+                page_num = row.get("PAGE_NUMBER", row.get("page_number", "?"))
+                content = row.get("PAGE_CONTENT", row.get("page_content", ""))
+                output += f"---\n**Page {page_num}:**\n{content}\n\n"
+
+            return output, {
+                "file_name": file_name,
+                "pages": len(row_data),
+                "content": row_data,
+            }
+
+        except Exception as e:
+            error_msg = f"Error reading document '{file_name}': {str(e)}"
+            return error_msg, {"error": str(e)}
+
+    elif tool_name == "remove_document":
+        file_name = tool_args.get("file_name", "")
+
+        if not file_name:
+            return "Error: file_name is required", {"error": "file_name required"}
+
+        try:
+            from .helpers import remove_file_from_stage
+
+            # Add .gz extension if not present (files are gzipped on upload)
+            file_to_remove = file_name
+            if not file_to_remove.endswith(".gz"):
+                file_to_remove = f"{file_name}.gz"
+
+            success, message = await remove_file_from_stage(client, file_to_remove)
+
+            if success:
+                return (
+                    f"Successfully removed document '{file_name}' and any associated parsed content.",
+                    {"success": True, "file_name": file_name, "message": message},
+                )
+            else:
+                return (
+                    f"Failed to remove document '{file_name}': {message}",
+                    {"success": False, "error": message},
+                )
+
+        except Exception as e:
+            error_msg = f"Error removing document '{file_name}': {str(e)}"
+            return error_msg, {"error": str(e)}
 
 
 def get_tool_definitions(client: SnowflakeAI) -> list:
     """Get the list of available tool definitions."""
-    return [
+    raw_tools = [
         client.get_table_sample_data_tool(),
-        client.get_table_definition_tool(),
+        client.get_table_schema_tool(),
         client.get_multiple_table_definitions_tool(),
         client.list_databases_tool(),
         client.list_schemas_tool(),
         client.list_tables_in_tool(),
         client.validate_query_tool(),
         client.execute_query_tool(),
+        client.execute_statement_tool(),
+        client.extract_answer_tool(),
+        client.sentiment_tool(),
+        client.summarize_tool(),
+        client.translate_tool(),
     ]
+
+    # Add get_widget_data tool for fetching dashboard widget data
+    get_widget_data_tool = {
+        "type": "function",
+        "function": {
+            "name": "get_widget_data",
+            "description": "Fetch data from dashboard widgets. Use this tool when the user asks about charts, tables, or other visualizations on their dashboard. The data will be retrieved from the widget and made available for analysis.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "widget_uuids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of widget UUIDs to fetch data from. If not specified, data from all available widgets will be fetched.",
+                    }
+                },
+                "required": [],
+            },
+        },
+    }
+    raw_tools.append(get_widget_data_tool)
+
+    # Add read_document tool for easy document content retrieval
+    read_document_tool = {
+        "type": "function",
+        "function": {
+            "name": "read_document",
+            "description": "Read the content of an uploaded document from Snowflake. Use this when the user asks about or references a document they've uploaded. The document must have been parsed (check 'parsed' status in available documents list).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_name": {
+                        "type": "string",
+                        "description": "The exact filename of the document to read (e.g., 'technology-investment.pdf'). Match user's description to the available documents list.",
+                    },
+                    "page_numbers": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "Optional list of specific page numbers to retrieve. If not specified, all pages are returned.",
+                    },
+                },
+                "required": ["file_name"],
+            },
+        },
+    }
+    raw_tools.append(read_document_tool)
+
+    # Add remove_document tool for deleting uploaded documents
+    remove_document_tool = {
+        "type": "function",
+        "function": {
+            "name": "remove_document",
+            "description": "Remove an uploaded document from Snowflake storage. Use this when the user wants to delete a document they've uploaded. This will remove both the file from the stage and any parsed content.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_name": {
+                        "type": "string",
+                        "description": "The filename to remove (e.g., 'technology-investment.pdf' or 'widget_pdf_abc123.pdf.gz'). Can include or exclude the .gz extension.",
+                    },
+                },
+                "required": ["file_name"],
+            },
+        },
+    }
+    raw_tools.append(remove_document_tool)
+
+    normalized_tools: list[Any] = []
+    for tool in raw_tools:
+        if isinstance(tool, str):
+            try:
+                parsed = json.loads(tool)
+                normalized_tools.append(parsed)
+            except json.JSONDecodeError:
+                # Fall back to simple wrapper so downstream code can inspect name
+                normalized_tools.append({"function": {"name": tool}})
+        else:
+            normalized_tools.append(tool)
+
+    return normalized_tools

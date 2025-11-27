@@ -75,20 +75,6 @@ impl CacheConnection {
                     columns_json TEXT NOT NULL,
                     PRIMARY KEY (database, schema, table_name)
                 );
-                CREATE TABLE IF NOT EXISTS conversation_data (
-                    conversation_id TEXT NOT NULL,
-                    key TEXT NOT NULL,
-                    value TEXT NOT NULL,
-                    PRIMARY KEY (conversation_id, key)
-                );
-                CREATE TABLE IF NOT EXISTS conversation_messages (
-                    conversation_id TEXT NOT NULL,
-                    message_id TEXT NOT NULL,
-                    role TEXT NOT NULL,
-                    content TEXT NOT NULL,
-                    timestamp INTEGER NOT NULL,
-                    PRIMARY KEY (conversation_id, message_id)
-                );
                 ",
                 )?;
                 Ok(())
@@ -96,58 +82,6 @@ impl CacheConnection {
             .await
     }
 
-    pub async fn add_message(
-        &self,
-        conversation_id: String,
-        message_id: String,
-        role: String,
-        content: String,
-    ) -> Result<(), tokio_rusqlite::Error> {
-        self.conn.as_ref().unwrap().call(move |conn| {
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64;
-
-            // Use REPLACE instead of INSERT OR IGNORE to update if exists
-            let result = conn.execute(
-                "INSERT OR REPLACE INTO conversation_messages (conversation_id, message_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)",
-                [&conversation_id, &message_id, &role, &content, &timestamp.to_string()],
-            )?;
-            
-            // Log for debugging
-            if std::env::var("SNOWFLAKE_DEBUG").is_ok() {
-                eprintln!("[CACHE DEBUG] Added message {} for conversation {} (role: {}, rows affected: {})", 
-                    message_id, conversation_id, role, result);
-            }
-            
-            Ok(())
-        }).await
-    }
-
-    pub async fn get_messages(
-        &self,
-        conversation_id: &str,
-    ) -> Result<Vec<(String, String, String)>, tokio_rusqlite::Error> {
-        let conversation_id = conversation_id.to_string();
-        self.conn.as_ref().unwrap().call(move |conn| {
-            let mut stmt = conn.prepare(
-                "SELECT message_id, role, content FROM conversation_messages WHERE conversation_id = ? ORDER BY timestamp ASC"
-            )?;
-            let mut rows = stmt.query([conversation_id.clone()])?;
-            let mut messages = Vec::new();
-            while let Some(row) = rows.next()? {
-                messages.push((row.get(0)?, row.get(1)?, row.get(2)?));
-            }
-            
-            // Log for debugging
-            if std::env::var("SNOWFLAKE_DEBUG").is_ok() {
-                eprintln!("[CACHE DEBUG] Retrieved {} messages for conversation {}", messages.len(), conversation_id);
-            }
-            
-            Ok(messages)
-        }).await
-    }
 
     pub async fn get_warehouses(&self) -> Result<Vec<String>, tokio_rusqlite::Error> {
         self.conn
@@ -309,6 +243,26 @@ impl CacheConnection {
             .await
     }
 
+    pub async fn invalidate_tables_in_schema(
+        &self,
+        database: &str,
+        schema: &str,
+    ) -> Result<(), tokio_rusqlite::Error> {
+        let database = database.to_string();
+        let schema = schema.to_string();
+        self.conn
+            .as_ref()
+            .unwrap()
+            .call(move |conn| {
+                conn.execute(
+                    "DELETE FROM tables WHERE database = ? AND schema = ?",
+                    [&database, &schema],
+                )?;
+                Ok(())
+            })
+            .await
+    }
+
     pub async fn get_all_tables(
         &self,
     ) -> Result<Vec<(String, String, String)>, tokio_rusqlite::Error> {
@@ -383,6 +337,17 @@ impl CacheConnection {
             .await
     }
 
+    pub async fn invalidate_stages(&self) -> Result<(), tokio_rusqlite::Error> {
+        self.conn
+            .as_ref()
+            .unwrap()
+            .call(move |conn| {
+                conn.execute("DELETE FROM stages", [])?;
+                Ok(())
+            })
+            .await
+    }
+
     pub async fn get_stage_files(
         &self,
         stage_name: &str,
@@ -425,6 +390,21 @@ impl CacheConnection {
                 }
                 drop(stmt);
                 tx.commit()?;
+                Ok(())
+            })
+            .await
+    }
+
+    pub async fn invalidate_stage_files(
+        &self,
+        stage_name: &str,
+    ) -> Result<(), tokio_rusqlite::Error> {
+        let stage_name = stage_name.to_string();
+        self.conn
+            .as_ref()
+            .unwrap()
+            .call(move |conn| {
+                conn.execute("DELETE FROM stage_files WHERE stage_name = ?", [&stage_name])?;
                 Ok(())
             })
             .await

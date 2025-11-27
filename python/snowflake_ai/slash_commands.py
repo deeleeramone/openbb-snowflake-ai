@@ -1,16 +1,29 @@
 """Slash command handler for Snowflake AI server."""
 
+import asyncio
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
 from typing import Any, AsyncIterator
 
 from ._snowflake_ai import SnowflakeAI, SnowflakeAgent
-from .helpers import to_sse
+from .helpers import clear_message_signatures, get_row_value, to_sse
 
 
 async def run_in_thread(func, *args, **kwargs):
     """Run a function in a background thread."""
-    import asyncio
-
     return await asyncio.to_thread(func, *args, **kwargs)
+
+
+def find_snow_cli_binary():
+    """Find the snow CLI binary."""
+    snow_path = shutil.which("snow")
+    if snow_path:
+        return snow_path
+    return None
 
 
 async def handle_slash_command(
@@ -24,6 +37,7 @@ async def handle_slash_command(
     model_preferences: dict,
     temperature_preferences: dict,
     max_tokens_preferences: dict,
+    token_usage: dict,
 ) -> AsyncIterator[dict[str, Any]]:
     """
     Handle slash commands and yield SSE events.
@@ -33,589 +47,1114 @@ async def handle_slash_command(
     """
     from openbb_ai import message_chunk, reasoning_step
 
+    # Store current working context
+    current_working_db = await run_in_thread(client.get_current_database)
+    current_working_schema = await run_in_thread(client.get_current_schema)
+
     if user_command == "/help":
-        help_text = """### Available Commands
+        help_text = """**Available Commands:**
 
-**Model Management:**
+📁 **File Management**
+- `/upload <file_path>` - Upload a file to Snowflake stage
+- `/parse <stage_path>` - Parse a document from stage
+- `/stages` - List all available stages
+- `/stage_files <stage>` - List files in a specific stage
+
+🔧 **Model Settings**
 - `/models` - List available AI models
-- `/model <name>` - Switch to a different model
-- `/temperature <0.0-1.0>` - Set response temperature
-- `/max_tokens <number>` - Set max response tokens
+- `/model <name>` - Set the active model
+- `/temperature <value>` - Set temperature (0.0-1.0)
+- `/max_tokens <value>` - Set max tokens
+- `/current` - Show current settings
 
-**Session Information:**
-- `/current` - Show current session info (database, model config, usage stats)
-- `/history` - Show conversation history summary
-
-**Database Navigation:**
+🗄️ **Database Navigation**
 - `/databases` - List all databases
-- `/schemas [database]` - List schemas (optionally in specific database)
-- `/tables` - List tables in current database.schema
+- `/schemas [database]` - List schemas
+- `/tables` - List tables in current schema
 - `/warehouses` - List available warehouses
-- `/stages` - List available stages
-- `/stage_files <stage_name>` - List files in a stage
+- `/use_database <name>` - Switch database
+- `/use_schema <name>` - Switch schema
+- `/use_warehouse <name>` - Switch warehouse
 
-**Context Switching:**
-- `/use_database <name>` - Switch to a different database
-- `/use_schema <name>` - Switch to a different schema
-- `/use_warehouse <name>` - Switch to a different warehouse
+💬 **Conversation**
+- `/clear` - Clear conversation history
+- `/history` - Show conversation history
+- `/context` - Show database context
+- `/complete <prompt>` - Complete a prompt
 
-**Conversation Management:**
-- `/clear` - Clear conversation history (all messages)
-
-**SQL Assistance:**
-- `/complete <partial_query>` - Complete a partial SQL query
-
-💡 **Tip:** All commands must be typed exactly as shown."""
+Type any command to get started!"""
         yield to_sse(message_chunk(help_text))
-        return
 
-    elif user_command == "/models":
-        yield to_sse(reasoning_step("Fetching available models...", event_type="INFO"))
-        models = await run_in_thread(client.get_available_models)
+    elif user_command.startswith("/upload "):
+        file_path_str = user_command[8:].strip()
+        yield to_sse(reasoning_step(f"Processing '{file_path_str}'..."))
+
+        # Expand user path and check if file exists
+        file_path = Path(file_path_str).expanduser().resolve()
+
+        if not file_path.exists():
+            yield to_sse(message_chunk(f"❌ File not found: {file_path}"))
+            return
+
+        if not file_path.is_file():
+            yield to_sse(message_chunk(f"❌ Path is not a file: {file_path}"))
+            return
+
+        # Check file size
+        try:
+            file_size = file_path.stat().st_size
+            file_size_mb = file_size / (1024 * 1024)
+
+            yield to_sse(
+                message_chunk(
+                    f"📁 File: {file_path.name}\n" f"📊 Size: {file_size_mb:.1f} MB"
+                )
+            )
+        except Exception as e:
+            yield to_sse(message_chunk(f"⚠️ Cannot read file size: {e}"))
+
+        stage_name = "CORTEX_UPLOADS"
+
+        # Use the user-specific database and schema
+        db_name = "OPENBB_AGENTS"
+        snowflake_user = await run_in_thread(client.get_current_user)
+        sanitized_user = "".join(c if c.isalnum() else "_" for c in snowflake_user)
+        schema_name = f"USER_{sanitized_user}".upper()
+
+        # First ensure the database exists
+        yield to_sse(reasoning_step(f"Ensuring database {db_name} exists..."))
+        try:
+            await run_in_thread(
+                client.execute_statement, f"CREATE DATABASE IF NOT EXISTS {db_name}"
+            )
+        except Exception as e:
+            yield to_sse(message_chunk(f"⚠️ Could not create database: {e}"))
+
+        # Then ensure the schema exists
         yield to_sse(
-            message_chunk(
-                "### Available AI Models\n\n"
-                + "\n".join(f"- `{name}`" for name, _ in models)
+            reasoning_step(f"Ensuring schema {db_name}.{schema_name} exists...")
+        )
+        try:
+            await run_in_thread(
+                client.execute_statement,
+                f"CREATE SCHEMA IF NOT EXISTS {db_name}.{schema_name}",
+            )
+        except Exception as e:
+            yield to_sse(message_chunk(f"⚠️ Could not create schema: {e}"))
+
+        qualified_stage_name = f'"{db_name}"."{schema_name}"."{stage_name}"'
+
+        # Now ensure the stage exists with directory table enabled
+        yield to_sse(
+            reasoning_step(
+                f"Ensuring stage {qualified_stage_name} exists and refreshing directory..."
             )
         )
-        yield to_sse(message_chunk("\n\n💡 Use `/model <name>` to switch models"))
-        return
-
-    elif user_command == "/clear":
         try:
-            messages_before = await run_in_thread(client.get_messages, conv_id)
+            create_stage_query = f"""
+            CREATE STAGE IF NOT EXISTS {qualified_stage_name}
+            DIRECTORY = (ENABLE = TRUE)
+            ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE')
+            """
+            await run_in_thread(client.execute_statement, create_stage_query)
+
+            # Refresh directory table
+            refresh_query = f"ALTER STAGE {qualified_stage_name} REFRESH"
+            await run_in_thread(client.execute_statement, refresh_query)
+        except Exception as e:
+            # Stage might already exist, which is fine, but we still try to refresh.
             yield to_sse(
-                reasoning_step(
-                    f"Found {len(messages_before)} messages to delete...",
-                    event_type="INFO",
+                message_chunk(
+                    f"⚠️ Could not ensure stage {qualified_stage_name} or refresh directory: {str(e)}"
                 )
             )
-            await run_in_thread(client.clear_conversation, conv_id)
-            messages_after = await run_in_thread(client.get_messages, conv_id)
-            if len(messages_after) == 0:
+
+        # Find snow CLI binary
+        snow_cli_binary = find_snow_cli_binary()
+
+        if not snow_cli_binary:
+            yield to_sse(
+                message_chunk(
+                    "❌ **Snowflake CLI not found.**\n\n"
+                    "The `snow` command is required for file uploads. "
+                    "Please install it using pip:\n\n"
+                    "```bash\n"
+                    "pip install snowflake-cli-python\n"
+                    "```\n\n"
+                    "Then, configure your connection:\n"
+                    "```bash\n"
+                    "snow connection add\n"
+                    "```"
+                )
+            )
+            return
+
+        # Use snow if found
+        yield to_sse(message_chunk(f"✅ Found Snowflake CLI at: {snow_cli_binary}"))
+
+        # COPY FILE TO TEMP DIRECTORY TO AVOID MACOS PERMISSION ISSUES
+        yield to_sse(reasoning_step(f"Preparing file for upload..."))
+
+        temp_dir = None
+        temp_file_path = None
+        upload_successful = False
+        # Stage path WITHOUT quotes for storage/display - format: @DB.SCHEMA.STAGE/filename
+        stage_path = f"@{db_name}.{schema_name}.{stage_name}/{file_path.name}"
+
+        try:
+            # Create temp directory
+            temp_dir = tempfile.mkdtemp(prefix="snowflake_upload_")
+            temp_file_path = Path(temp_dir) / file_path.name
+
+            # READ THE FILE AND WRITE TO TEMP - DON'T USE shutil.copy2!
+            try:
+                with open(file_path, "rb") as source_file:
+                    file_contents = source_file.read()
+
+                with open(temp_file_path, "wb") as dest_file:
+                    dest_file.write(file_contents)
+
+                yield to_sse(message_chunk(f"✅ File prepared for upload"))
+            except PermissionError:
+                # If we can't read the file, we need to tell user to move it
                 yield to_sse(
                     message_chunk(
-                        f"✅ Successfully deleted {len(messages_before)} messages. Conversation cleared!"
+                        f"❌ **macOS blocked file access**\n\n"
+                        f"Cannot read file from Documents folder due to macOS security.\n\n"
+                        f"**Solution - Copy file to Desktop first:**\n"
+                        f"```bash\n"
+                        f'cp "{file_path}" ~/Desktop/\n'
+                        f"```\n\n"
+                        f"Then upload from Desktop:\n"
+                        f"```\n"
+                        f"/upload ~/Desktop/{file_path.name}\n"
+                        f"```"
                     )
+                )
+                return
+            except Exception as e:
+                yield to_sse(message_chunk(f"❌ Failed to read file: {str(e)}"))
+                return
+
+            # The snow CLI should pick up connection details from env vars
+            # like SNOWFLAKE_ACCOUNT, SNOWFLAKE_USER, SNOWFLAKE_PASSWORD etc.
+            env = os.environ.copy()
+
+            # Ensure current database and schema are used
+            env["SNOWFLAKE_DATABASE"] = db_name
+            env["SNOWFLAKE_SCHEMA"] = schema_name
+
+            # Build snow command
+            # Note: Database and schema are passed via environment variables
+            # Normalize path separators for Windows to forward slashes as required by PUT command
+            temp_file_str = str(temp_file_path).replace("\\", "/")
+            # Stage path for PUT command - NO QUOTES around segments: @DB.SCHEMA.STAGE
+            unquoted_stage = f"{db_name}.{schema_name}.{stage_name}"
+            put_query = f"PUT 'file://{temp_file_str}' @{stage_name} AUTO_COMPRESS = FALSE OVERWRITE = TRUE"
+
+            snow_cmd = [
+                snow_cli_binary,
+                "sql",
+                "-q",
+                put_query,
+                "--database",
+                db_name,
+                "--schema",
+                schema_name,
+            ]
+
+            yield to_sse(reasoning_step("Auto-compress disabled (enforced)."))
+
+            # Now actually upload the file
+            yield to_sse(
+                reasoning_step(f"Uploading file to Snowflake stage '{stage_name}'...")
+            )
+
+            # Execute snow command
+            result = subprocess.run(
+                snow_cmd,
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=300,  # 300 second timeout for large files
+            )
+
+            # Check for success
+            stdout_lower = (result.stdout or "").lower()
+            stderr_lower = (result.stderr or "").lower()
+
+            if result.returncode == 0 and "error" not in stderr_lower:
+                upload_successful = True
+                yield to_sse(
+                    message_chunk(
+                        f"✅ **File uploaded successfully!**\n\n"
+                        f"📍 Location: `{stage_path}`"
+                    )
+                )
+
+                # Store the stage path for this conversation
+                await run_in_thread(
+                    client.set_conversation_data,
+                    conv_id,
+                    "last_uploaded_file",
+                    stage_path,
                 )
             else:
+                # Upload failed - show output for debugging
                 yield to_sse(
                     message_chunk(
-                        f"❌ ERROR: Failed to clear messages! {len(messages_after)} messages still remain!"
+                        f"❌ **Upload failed**\n\n"
+                        f"Output:\n```\n{result.stdout[:1000]}\n```\n\n"
+                        f"Error:\n```\n{result.stderr[:1000]}\n```"
                     )
                 )
+                return
+
+        except subprocess.TimeoutExpired:
+            yield to_sse(
+                message_chunk(
+                    f"❌ **Upload timed out**\n\n"
+                    f"The file upload is taking too long. This might happen with very large files.\n"
+                    f"Try uploading a smaller file or use the Snowflake Web UI."
+                )
+            )
+            return
         except Exception as e:
-            yield to_sse(message_chunk(f"❌ Failed to clear conversation: {str(e)}"))
+            yield to_sse(message_chunk(f"❌ Unexpected error: {str(e)}"))
+            return
+        finally:
+            # Clean up temp directory
+            if temp_dir and os.path.exists(temp_dir):
+                try:
+                    shutil.rmtree(temp_dir)
+                except:
+                    pass  # Ignore cleanup errors
+
+        # If upload was successful, verify and optionally parse
+        if upload_successful:
+            yield to_sse(reasoning_step("Verifying upload..."))
+
+            # Refresh directory table to ensure file is visible
+            try:
+                refresh_query = f"ALTER STAGE {qualified_stage_name} REFRESH"
+                await run_in_thread(client.execute_statement, refresh_query)
+            except Exception as refresh_err:
+                if os.environ.get("SNOWFLAKE_DEBUG"):
+                    print(f"[DEBUG] Stage refresh warning: {refresh_err}")
+                # Continue anyway - refresh failure is not critical
+
+            # Wait a moment for the file to appear in the stage
+            await asyncio.sleep(2)
+
+            try:
+                # Use raw SQL to verify with qualified stage name
+                list_query = f"LIST {stage_path}"
+                result_json = await run_in_thread(client.execute_statement, list_query)
+                rows = json.loads(result_json) if result_json else []
+                if os.environ.get("SNOWFLAKE_DEBUG"):
+                    print(f"[DEBUG] LIST result: {rows}")
+
+                file_found = False
+                if rows:
+                    for row in rows:
+                        # Robust check: search for filename in ANY column value (usually 'name')
+                        # This handles variations in column casing or unexpected schema
+                        for val in row.values():
+                            if isinstance(val, str) and file_path.name in val:
+                                file_found = True
+                                break
+                        if file_found:
+                            break
+
+                if file_found:
+                    yield to_sse(message_chunk(f"✅ File verified in stage"))
+
+                    parseable_extensions = [
+                        ".pdf",
+                        ".txt",
+                        ".docx",
+                        ".doc",
+                        ".rtf",
+                        ".md",
+                    ]
+                    data_extensions = [".json", ".xml"]
+                    file_extension = file_path.suffix.lower()
+
+                    if file_extension in parseable_extensions:
+                        yield to_sse(
+                            message_chunk(
+                                f"✅ **Upload complete.**\n\n"
+                                f"📄 Received request to process document `{file_path.name}`.\n"
+                                f"Parsing will continue in the background and results will be saved to `DOCUMENT_PARSE_RESULTS`."
+                            )
+                        )
+
+                        # Fire and forget background task - use the KNOWN db_name and schema_name
+                        asyncio.create_task(
+                            process_document_background(
+                                client,
+                                stage_path,
+                                file_path.name,
+                                conv_id,
+                                db_name,
+                                schema_name,
+                            )
+                        )
+                    elif file_extension in data_extensions:
+                        yield to_sse(
+                            reasoning_step(
+                                f"Processing {file_extension} as semi-structured data..."
+                            )
+                        )
+
+                        table_name_raw = file_path.stem
+                        table_name = "".join(
+                            c if c.isalnum() else "_" for c in table_name_raw
+                        ).upper()
+                        file_type = "JSON" if file_extension == ".json" else "XML"
+
+                        # Create table in the current working database/schema context
+                        qualified_table_name = f'"{current_working_db}"."{current_working_schema}"."{table_name}"'
+
+                        try:
+                            # 1. Create file format in the working context
+                            file_format_name = f"FORMAT_{table_name}"
+                            format_qualified = f'"{current_working_db}"."{current_working_schema}"."{file_format_name}"'
+
+                            if file_type == "XML":
+                                create_format_query = f"CREATE OR REPLACE FILE FORMAT {format_qualified} TYPE = {file_type} STRIP_OUTER_ELEMENT = TRUE"
+                            else:
+                                create_format_query = f"CREATE OR REPLACE FILE FORMAT {format_qualified} TYPE = {file_type} STRIP_OUTER_ARRAY = TRUE"
+
+                            await run_in_thread(
+                                client.execute_statement, create_format_query
+                            )
+                            yield to_sse(
+                                reasoning_step(
+                                    f"✅ Ensured file format '{file_format_name}' exists."
+                                )
+                            )
+
+                            # 2. Create table in working context
+                            create_table_query = f"CREATE OR REPLACE TABLE {qualified_table_name} (RAW_DATA VARIANT)"
+                            await run_in_thread(
+                                client.execute_statement, create_table_query
+                            )
+                            yield to_sse(
+                                reasoning_step(
+                                    f"✅ Ensured table '{table_name}' exists in {current_working_db}.{current_working_schema}."
+                                )
+                            )
+
+                            # 3. Copy into table from the stage in OPENBB_AGENTS
+                            copy_into_query = f"COPY INTO {qualified_table_name} FROM '{stage_path}' FILE_FORMAT = (FORMAT_NAME = '{format_qualified}') ON_ERROR = 'CONTINUE'"
+                            await run_in_thread(
+                                client.execute_statement, copy_into_query
+                            )
+                            yield to_sse(
+                                reasoning_step(f"✅ Loading data into '{table_name}'.")
+                            )
+
+                            # 4. Check if data was loaded
+                            count_query = (
+                                f"SELECT COUNT(*) as c FROM {qualified_table_name}"
+                            )
+                            count_result_str = await run_in_thread(
+                                client.execute_query, count_query
+                            )
+                            count_result = json.loads(count_result_str)
+
+                            num_rows = 0
+                            if (
+                                count_result.get("rowData")
+                                and len(count_result["rowData"]) > 0
+                            ):
+                                row = count_result["rowData"][0]
+                                # The column name from COUNT(*) can be "C" or "COUNT(*)"
+                                num_rows = get_row_value(
+                                    row, "C", "COUNT(*)", default=0
+                                )
+
+                            if num_rows > 0:
+                                yield to_sse(
+                                    message_chunk(
+                                        f"✅ **Data loaded into `{table_name}`!**\n\n"
+                                        f"Created table `{qualified_table_name}` with {num_rows} rows from your file.\n\n"
+                                        f"You can now query this semi-structured data. For example:\n"
+                                        f"```sql\n"
+                                        f"SELECT * FROM {qualified_table_name} LIMIT 10;\n"
+                                        f"```"
+                                    )
+                                )
+                            else:
+                                yield to_sse(
+                                    message_chunk(
+                                        f"⚠️ **Data loaded, but table is empty.**\n\n"
+                                        f"The file from `{stage_path}` was processed, but resulted in 0 rows in the `{table_name}` table. "
+                                        f"This can happen if the file format doesn't match the content (e.g., a file of JSON objects vs. an array of objects). "
+                                        f"Check the file structure and try loading manually if needed."
+                                    )
+                                )
+
+                        except Exception as e:
+                            yield to_sse(
+                                message_chunk(
+                                    f"⚠️ **Could not auto-process data file:** {str(e)}\n\n"
+                                    f"The file is available at `{stage_path}`. "
+                                    f"You can try to create a table and load data manually."
+                                )
+                            )
+                    else:
+                        yield to_sse(
+                            message_chunk(
+                                f"ℹ️ File type '{file_extension}' is not automatically processed.\n\n"
+                                f"Automatic parsing is available for documents: `pdf, txt, docx, doc, rtf, md`\n"
+                                f"Automatic data loading is available for: `json, xml`"
+                            )
+                        )
+                else:
+                    yield to_sse(
+                        message_chunk(
+                            f"✅ Upload completed, but file not immediately visible in stage.\n\n"
+                            f"File location: `{stage_path}`\n\n"
+                            f"The file may take a moment to appear. You can try to process it with:\n"
+                            f"```\n/parse {stage_path}\n```"
+                        )
+                    )
+            except Exception as e:
+                # Don't fail, just inform that verification had issues
+                yield to_sse(
+                    message_chunk(
+                        f"✅ Upload completed!\n\n"
+                        f"File location: `{stage_path}`\n\n"
+                        f"Verification had issues but the file should be available.\n"
+                        f"Try: `/parse {stage_path}`"
+                    )
+                )
         return
+
+    elif user_command.startswith("/parse "):
+        stage_path = user_command[7:].strip()
+        yield to_sse(reasoning_step(f"Requesting parsing for '{stage_path}'..."))
+
+        if not stage_path.startswith("@"):
+            yield to_sse(message_chunk("❌ Invalid stage path. Must start with @."))
+            return
+
+        filename = os.path.basename(stage_path)
+
+        # Fire and forget background task with working context
+        asyncio.create_task(
+            process_document_background(
+                client,
+                stage_path,
+                filename,
+                conv_id,
+                current_working_db,
+                current_working_schema,
+            )
+        )
+        yield to_sse(
+            message_chunk(
+                f"✅ **Parsing started.**\n\n"
+                f"Document `{filename}` is being processed in the background.\n"
+                f"Results will be saved to `DOCUMENT_PARSE_RESULTS` table in {current_working_db}.{current_working_schema}."
+            )
+        )
+
+    elif user_command == "/models":
+        yield to_sse(reasoning_step("Fetching available models..."))
+        try:
+            models = await run_in_thread(client.get_available_models)
+            if models:
+                model_list = "**Available Models:**\n\n"
+                for model_name, description in models:
+                    model_list += f"- `{model_name}` - {description}\n"
+                yield to_sse(message_chunk(model_list))
+            else:
+                yield to_sse(
+                    message_chunk("No models found or unable to fetch model list.")
+                )
+        except Exception as e:
+            yield to_sse(message_chunk(f"❌ Error fetching models: {str(e)}"))
+
+    elif user_command == "/clear":
+        yield to_sse(reasoning_step("Clearing conversation history..."))
+        try:
+            if agent:
+                await run_in_thread(agent.reset_conversation)
+            await run_in_thread(client.clear_conversation, conv_id)
+            clear_message_signatures(conv_id)
+            yield to_sse(message_chunk("✅ Conversation history cleared."))
+        except Exception as e:
+            yield to_sse(message_chunk(f"❌ Error clearing history: {str(e)}"))
 
     elif user_command.startswith("/model "):
         model_name = user_command[7:].strip()
-        if model_name:
-            available_models = await run_in_thread(client.get_available_models)
-            if model_name in [name for name, _ in available_models]:
-                model_preferences[conv_id] = model_name
-                await run_in_thread(
-                    client.set_conversation_data,
-                    conv_id,
-                    "model_preference",
-                    model_name,
-                )
-                yield to_sse(
-                    reasoning_step(f"Switched to {model_name}", event_type="INFO")
-                )
-                yield to_sse(
-                    message_chunk(
-                        f"✅ Now using **{model_name}** for this conversation"
-                    )
-                )
-            else:
-                yield to_sse(
-                    message_chunk(f"❌ Model `{model_name}` is not available.")
-                )
-        else:
-            yield to_sse(message_chunk("⚠️ Please specify a model name"))
-        return
+        model_preferences[conv_id] = model_name
+        current_settings = {
+            "model": model_name,
+            "temperature": temperature_preferences.get(conv_id, selected_temperature),
+            "max_tokens": max_tokens_preferences.get(conv_id, selected_max_tokens),
+            "database": await run_in_thread(client.get_current_database),
+            "schema": await run_in_thread(client.get_current_schema),
+            "token_usage": token_usage.get(conv_id, {}),
+        }
+        await run_in_thread(
+            client.update_conversation_settings, conv_id, json.dumps(current_settings)
+        )
+        yield to_sse(message_chunk(f"✅ Model set to: `{model_name}`"))
 
     elif user_command.startswith("/temperature "):
-        temp_str = user_command[13:].strip()
         try:
-            temperature = float(temp_str)
-            if 0.0 <= temperature <= 1.0:
-                temperature_preferences[conv_id] = temperature
+            temp_value = float(user_command[13:].strip())
+            if 0.0 <= temp_value <= 1.0:
+                temperature_preferences[conv_id] = temp_value
+                current_settings = {
+                    "model": model_preferences.get(conv_id, selected_model),
+                    "temperature": temp_value,
+                    "max_tokens": max_tokens_preferences.get(
+                        conv_id, selected_max_tokens
+                    ),
+                    "database": await run_in_thread(client.get_current_database),
+                    "schema": await run_in_thread(client.get_current_schema),
+                    "token_usage": token_usage.get(conv_id, {}),
+                }
                 await run_in_thread(
-                    client.set_conversation_data,
+                    client.update_conversation_settings,
                     conv_id,
-                    "temperature_preference",
-                    str(temperature),
+                    json.dumps(current_settings),
                 )
-                yield to_sse(
-                    reasoning_step(
-                        f"Set temperature to {temperature}", event_type="INFO"
-                    )
-                )
-                yield to_sse(
-                    message_chunk(
-                        f"✅ Temperature set to **{temperature}** for this conversation"
-                    )
-                )
+                yield to_sse(message_chunk(f"✅ Temperature set to: {temp_value}"))
             else:
                 yield to_sse(
-                    message_chunk("❌ Temperature must be between 0.0 and 1.0.")
+                    message_chunk("❌ Temperature must be between 0.0 and 1.0")
                 )
         except ValueError:
             yield to_sse(
                 message_chunk(
-                    "❌ Invalid temperature value. Please provide a number between 0.0 and 1.0."
+                    "❌ Invalid temperature value. Must be a number between 0.0 and 1.0"
                 )
             )
-        return
 
     elif user_command.startswith("/max_tokens "):
-        tokens_str = user_command[12:].strip()
         try:
-            max_tokens = int(tokens_str)
-            if max_tokens > 0:
-                max_tokens_preferences[conv_id] = max_tokens
+            tokens_value = int(user_command[12:].strip())
+            if tokens_value > 0:
+                max_tokens_preferences[conv_id] = tokens_value
+                current_settings = {
+                    "model": model_preferences.get(conv_id, selected_model),
+                    "temperature": temperature_preferences.get(
+                        conv_id, selected_temperature
+                    ),
+                    "max_tokens": tokens_value,
+                    "database": await run_in_thread(client.get_current_database),
+                    "schema": await run_in_thread(client.get_current_schema),
+                    "token_usage": token_usage.get(conv_id, {}),
+                }
                 await run_in_thread(
-                    client.set_conversation_data,
+                    client.update_conversation_settings,
                     conv_id,
-                    "max_tokens_preference",
-                    str(max_tokens),
+                    json.dumps(current_settings),
                 )
-                yield to_sse(
-                    reasoning_step(f"Set max tokens to {max_tokens}", event_type="INFO")
-                )
-                yield to_sse(
-                    message_chunk(
-                        f"✅ Max tokens set to **{max_tokens}** for this conversation"
-                    )
-                )
+                yield to_sse(message_chunk(f"✅ Max tokens set to: {tokens_value}"))
             else:
-                yield to_sse(message_chunk("❌ Max tokens must be a positive integer."))
+                yield to_sse(message_chunk("❌ Max tokens must be a positive integer"))
         except ValueError:
             yield to_sse(
-                message_chunk(
-                    "❌ Invalid max tokens value. Please provide a positive integer."
-                )
+                message_chunk("❌ Invalid max tokens value. Must be a positive integer")
             )
-        return
 
     elif user_command == "/current":
-        # Import token_usage from server
-        from snowflake_ai.server import token_usage
+        current_model = model_preferences.get(conv_id, selected_model)
+        current_temp = temperature_preferences.get(conv_id, selected_temperature)
+        current_tokens = max_tokens_preferences.get(conv_id, selected_max_tokens)
 
-        # Get database context
-        current_database = await run_in_thread(client.get_current_database)
-        current_schema = await run_in_thread(client.get_current_schema)
+        settings_text = f"""**Current Settings:**
 
-        # Handle empty strings properly
-        db_display = current_database if current_database else "(not set)"
-        schema_display = current_schema if current_schema else "(not set)"
+- Model: `{current_model}`
+- Temperature: {current_temp}
+- Max Tokens: {current_tokens}
+- Database: {await run_in_thread(client.get_current_database)}
+- Schema: {await run_in_thread(client.get_current_schema)}"""
 
-        # Get model configuration for this conversation
-        actual_model = model_preferences.get(conv_id, selected_model)
-        actual_temperature = temperature_preferences.get(conv_id, selected_temperature)
-        actual_max_tokens = max_tokens_preferences.get(conv_id, selected_max_tokens)
-
-        # Get conversation statistics
-        messages = await run_in_thread(client.get_messages, conv_id)
-        num_messages = len(messages)
-
-        # Count tool calls (messages that look like tool responses)
-        num_tool_calls = sum(
-            1
-            for _, role, content in messages
-            if role == "user" and "[Tool Result" in content
-        )
-
-        # Get usage statistics from server's token_usage tracking
-        usage = token_usage.get(
-            conv_id,
-            {
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_tokens": 0,
-                "api_requests": 0,
-            },
-        )
-
-        api_requests_str = str(usage.get("api_requests", 0))
-        prompt_tokens_str = f"{usage.get('prompt_tokens', 0):,}"
-        completion_tokens_str = f"{usage.get('completion_tokens', 0):,}"
-        total_tokens_str = f"{usage.get('total_tokens', 0):,}"
-
-        output = f"""### Current Session Information
-
-**📍 Database Context:**
-- **Database:** `{db_display}`
-- **Schema:** `{schema_display}`
-
-**🤖 Model Configuration:**
-- **Model:** `{actual_model}`
-- **Temperature:** `{actual_temperature}`
-- **Max Tokens:** `{actual_max_tokens}`
-
-**📊 Session Statistics:**
-- **Messages:** {num_messages:,}
-- **Tool Calls:** {num_tool_calls}
-- **API Requests:** {api_requests_str}
-
-**💰 Token Usage:**
-- **Prompt Tokens:** {prompt_tokens_str}
-- **Completion Tokens:** {completion_tokens_str}
-- **Total Tokens:** {total_tokens_str}
-
-**🔧 Commands:**
-- `/help` - Show all available commands
-- `/clear` - Clear conversation history"""
-
-        yield to_sse(message_chunk(output))
-        return
+        yield to_sse(message_chunk(settings_text))
 
     elif user_command == "/databases":
-        yield to_sse(reasoning_step("Fetching databases...", event_type="INFO"))
+        yield to_sse(reasoning_step("Fetching databases..."))
         try:
-            databases = await run_in_thread(client.list_databases)
-            current_database = await run_in_thread(client.get_current_database)
-            db_list = []
-            for db in databases:
-                marker = " (current)" if db == current_database else ""
-                db_list.append(f"- `{db}`{marker}")
-            yield to_sse(
-                message_chunk("### Accessible Databases\n\n" + "\n".join(db_list))
+            # Use raw SQL to avoid caching
+            result_json = await run_in_thread(
+                client.execute_statement, "SHOW DATABASES"
             )
+            rows = json.loads(result_json)
+            databases = []
+            for row in rows:
+                name = get_row_value(row, "name")
+                if name:
+                    databases.append(name)
+
+            if databases:
+                db_list = "**Available Databases:**\n\n" + "\n".join(
+                    f"- {db}" for db in databases
+                )
+                yield to_sse(message_chunk(db_list))
+            else:
+                yield to_sse(message_chunk("No databases found."))
         except Exception as e:
-            yield to_sse(message_chunk(f"❌ Failed to list databases: {str(e)}"))
-        return
+            yield to_sse(message_chunk(f"❌ Error listing databases: {str(e)}"))
 
     elif user_command.startswith("/schemas"):
-        yield to_sse(reasoning_step("Fetching schemas...", event_type="INFO"))
-        try:
-            parts = user_command.split(" ", 1)
-            target_db = parts[1].strip() if len(parts) > 1 else None
-            schemas = await run_in_thread(client.list_schemas, target_db)
-            current_schema = await run_in_thread(client.get_current_schema)
-            current_database = await run_in_thread(client.get_current_database)
-            schema_list = []
-            for s in schemas:
-                marker = ""
-                if s == current_schema and (
-                    target_db is None or target_db == current_database
-                ):
-                    marker = " (current)"
-                schema_list.append(f"- `{s}`{marker}")
-            db_name_display = target_db if target_db else current_database
-            yield to_sse(
-                message_chunk(
-                    f"### Schemas in {db_name_display}\n\n" + "\n".join(schema_list)
-                )
+        parts = user_command.split()
+        database = parts[1] if len(parts) > 1 else None
+
+        yield to_sse(
+            reasoning_step(
+                f"Fetching schemas{f' for {database}' if database else ''}..."
             )
+        )
+        try:
+            query = (
+                f"SHOW SCHEMAS IN DATABASE {database}" if database else "SHOW SCHEMAS"
+            )
+            result_json = await run_in_thread(client.execute_statement, query)
+            rows = json.loads(result_json)
+            schemas = []
+            for row in rows:
+                schema_name = get_row_value(row, "name")
+                if schema_name:
+                    schemas.append(schema_name)
+
+            if schemas:
+                schema_list = (
+                    f"**Schemas{f' in {database}' if database else ''}:**\n\n"
+                    + "\n".join(f"- {s}" for s in schemas)
+                )
+                yield to_sse(message_chunk(schema_list))
+            else:
+                yield to_sse(message_chunk("No schemas found."))
         except Exception as e:
-            yield to_sse(message_chunk(f"❌ Failed to list schemas: {str(e)}"))
-        return
+            yield to_sse(message_chunk(f"❌ Error listing schemas: {str(e)}"))
 
     elif user_command == "/warehouses":
-        yield to_sse(reasoning_step("Fetching warehouses...", event_type="INFO"))
+        yield to_sse(reasoning_step("Fetching warehouses..."))
         try:
-            warehouses = await run_in_thread(client.list_warehouses)
-            wh_list = [f"- `{wh}`" for wh in warehouses]
-            yield to_sse(
-                message_chunk("### Accessible Warehouses\n\n" + "\n".join(wh_list))
+            result_json = await run_in_thread(
+                client.execute_statement, "SHOW WAREHOUSES"
             )
+            rows = json.loads(result_json)
+            warehouses = []
+            for row in rows:
+                warehouse = get_row_value(row, "name")
+                if warehouse:
+                    warehouses.append(warehouse)
+
+            if warehouses:
+                wh_list = "**Available Warehouses:**\n\n" + "\n".join(
+                    f"- {wh}" for wh in warehouses
+                )
+                yield to_sse(message_chunk(wh_list))
+            else:
+                yield to_sse(message_chunk("No warehouses found."))
         except Exception as e:
-            yield to_sse(message_chunk(f"❌ Failed to list warehouses: {str(e)}"))
-        return
+            yield to_sse(message_chunk(f"❌ Error listing warehouses: {str(e)}"))
 
     elif user_command == "/tables":
-        yield to_sse(reasoning_step("Fetching tables...", event_type="INFO"))
+        yield to_sse(reasoning_step("Fetching tables..."))
         try:
-            current_database = await run_in_thread(client.get_current_database)
+            current_db = await run_in_thread(client.get_current_database)
             current_schema = await run_in_thread(client.get_current_schema)
-            tables = await run_in_thread(
-                client.list_tables_in, current_database, current_schema
-            )
-            table_list = [f"- `{t}`" for t in tables]
-            yield to_sse(
-                message_chunk(
-                    f"### Tables in {current_database}.{current_schema}\n\n"
-                    + "\n".join(table_list)
+
+            query = f"""
+            SELECT TABLE_NAME 
+            FROM "{current_db}".INFORMATION_SCHEMA.TABLES 
+            WHERE TABLE_SCHEMA = '{current_schema}' 
+            ORDER BY TABLE_NAME
+            """
+            result_json = await run_in_thread(client.execute_statement, query)
+            rows = json.loads(result_json)
+            tables = []
+            for row in rows:
+                table_name = get_row_value(row, "table_name", "TABLE_NAME")
+                if table_name:
+                    tables.append(table_name)
+
+            if tables:
+                table_list = (
+                    f"**Tables in {current_db}.{current_schema}:**\n\n"
+                    + "\n".join(f"- {t}" for t in tables)
                 )
-            )
+                yield to_sse(message_chunk(table_list))
+            else:
+                yield to_sse(message_chunk("No tables found in current schema."))
         except Exception as e:
-            yield to_sse(message_chunk(f"❌ Failed to list tables: {str(e)}"))
-        return
+            yield to_sse(message_chunk(f"❌ Error listing tables: {str(e)}"))
 
     elif user_command == "/stages":
-        yield to_sse(reasoning_step("Fetching stages...", event_type="INFO"))
+        yield to_sse(reasoning_step("Fetching stages..."))
         try:
-            stages = await run_in_thread(client.list_stages)
-            stage_list = [f"- `{s}`" for s in stages]
-            yield to_sse(
-                message_chunk("### Available Stages\n\n" + "\n".join(stage_list))
-            )
+            # Get stages from both contexts
+            result_json = await run_in_thread(client.execute_statement, "SHOW STAGES")
+            rows = json.loads(result_json)
+            stages = []
+
+            for row in rows:
+                name = get_row_value(row, "name")
+                database_name = get_row_value(row, "database_name") or ""
+                schema_name = get_row_value(row, "schema_name") or ""
+
+                if name:
+                    # Show fully qualified name if not in current context
+                    if database_name and schema_name:
+                        if (
+                            database_name != current_working_db
+                            or schema_name != current_working_schema
+                        ):
+                            stages.append(f"{database_name}.{schema_name}.{name}")
+                        else:
+                            stages.append(name)
+                    else:
+                        stages.append(name)
+
+            # Also check OPENBB_AGENTS stages if not already in that context
+            if current_working_db != "OPENBB_AGENTS":
+                snowflake_user = await run_in_thread(client.get_current_user)
+                sanitized_user = "".join(
+                    c if c.isalnum() else "_" for c in snowflake_user
+                )
+                user_schema = f"USER_{sanitized_user}".upper()
+
+                try:
+                    show_user_stages = (
+                        f"SHOW STAGES IN SCHEMA OPENBB_AGENTS.{user_schema}"
+                    )
+                    user_result = await run_in_thread(
+                        client.execute_statement, show_user_stages
+                    )
+                    user_rows = json.loads(user_result)
+                    for row in user_rows:
+                        name = get_row_value(row, "name")
+                        if name:
+                            stages.append(f"OPENBB_AGENTS.{user_schema}.{name}")
+                except:
+                    pass  # Ignore errors accessing user schema
+
+            if stages:
+                stage_list = "**Available Stages:**\n\n" + "\n".join(
+                    f"- {s}" for s in stages
+                )
+                yield to_sse(message_chunk(stage_list))
+            else:
+                yield to_sse(message_chunk("No stages found."))
         except Exception as e:
-            yield to_sse(message_chunk(f"❌ Failed to list stages: {str(e)}"))
-        return
+            yield to_sse(message_chunk(f"❌ Error listing stages: {str(e)}"))
 
     elif user_command.startswith("/stage_files "):
         stage_name = user_command[13:].strip()
-        if stage_name:
-            yield to_sse(
-                reasoning_step(
-                    f"Fetching files in stage {stage_name}...",
-                    event_type="INFO",
+        yield to_sse(reasoning_step(f"Listing files in stage '{stage_name}'..."))
+        try:
+            # Handle both qualified and unqualified stage names
+            if "." in stage_name and not stage_name.startswith("@"):
+                # Fully qualified stage name
+                list_query = f"LIST @{stage_name}"
+            elif stage_name.startswith("@"):
+                # Already has @ prefix
+                list_query = f"LIST {stage_name}"
+            else:
+                # Unqualified - use current context
+                list_query = f"LIST @{stage_name}"
+
+            result_json = await run_in_thread(client.execute_statement, list_query)
+            rows = json.loads(result_json)
+
+            files = []
+            for row in rows:
+                name = get_row_value(row, "name")
+                if name:
+                    # Extract filename from path (logic from engine.rs)
+                    filename = name.split("/")[-1] if "/" in name else name
+                    files.append(filename)
+
+            if files:
+                file_list = f"**Files in {stage_name}:**\n\n" + "\n".join(
+                    f"- {f}" for f in files
                 )
-            )
-            try:
-                files = await run_in_thread(client.list_files_in_stage, stage_name)
-                file_list = [f"- `{f}`" for f in files]
-                yield to_sse(
-                    message_chunk(
-                        f"### Files in Stage {stage_name}\n\n" + "\n".join(file_list)
-                    )
-                )
-            except Exception as e:
-                yield to_sse(
-                    message_chunk(f"❌ Failed to list files in stage: {str(e)}")
-                )
-        else:
-            yield to_sse(message_chunk("❌ Usage: /stage_files <stage_name>"))
-        return
+                yield to_sse(message_chunk(file_list))
+            else:
+                yield to_sse(message_chunk(f"No files found in stage {stage_name}."))
+        except Exception as e:
+            yield to_sse(message_chunk(f"❌ Error listing files: {str(e)}"))
 
     elif user_command.startswith("/use_database "):
         db_name = user_command[14:].strip()
-        if db_name:
-            try:
-                await run_in_thread(client.use_database, db_name)
-                yield to_sse(message_chunk(f"✅ Switched to database: **{db_name}**"))
-            except Exception as e:
-                yield to_sse(message_chunk(f"❌ Failed to switch database: {str(e)}"))
-        else:
-            yield to_sse(message_chunk("❌ Usage: /use_database <database_name>"))
-        return
+        yield to_sse(reasoning_step(f"Switching to database '{db_name}'..."))
+        try:
+            await run_in_thread(client.use_database, db_name)
+            current_settings = {
+                "model": model_preferences.get(conv_id, selected_model),
+                "temperature": temperature_preferences.get(
+                    conv_id, selected_temperature
+                ),
+                "max_tokens": max_tokens_preferences.get(conv_id, selected_max_tokens),
+                "database": db_name,
+                "schema": await run_in_thread(client.get_current_schema),
+                "token_usage": token_usage.get(conv_id, {}),
+            }
+            await run_in_thread(
+                client.update_conversation_settings,
+                conv_id,
+                json.dumps(current_settings),
+            )
+            yield to_sse(message_chunk(f"✅ Switched to database: {db_name}"))
+        except Exception as e:
+            yield to_sse(message_chunk(f"❌ Error switching database: {str(e)}"))
 
     elif user_command.startswith("/use_schema "):
         schema_name = user_command[12:].strip()
-        if schema_name:
-            try:
-                await run_in_thread(client.use_schema, schema_name)
-                yield to_sse(message_chunk(f"✅ Switched to schema: **{schema_name}**"))
-            except Exception as e:
-                yield to_sse(message_chunk(f"❌ Failed to switch schema: {str(e)}"))
-        else:
-            yield to_sse(message_chunk("❌ Usage: /use_schema <schema_name>"))
-        return
+        yield to_sse(reasoning_step(f"Switching to schema '{schema_name}'..."))
+        try:
+            await run_in_thread(client.use_schema, schema_name)
+            current_settings = {
+                "model": model_preferences.get(conv_id, selected_model),
+                "temperature": temperature_preferences.get(
+                    conv_id, selected_temperature
+                ),
+                "max_tokens": max_tokens_preferences.get(conv_id, selected_max_tokens),
+                "database": await run_in_thread(client.get_current_database),
+                "schema": schema_name,
+                "token_usage": token_usage.get(conv_id, {}),
+            }
+            await run_in_thread(
+                client.update_conversation_settings,
+                conv_id,
+                json.dumps(current_settings),
+            )
+            yield to_sse(message_chunk(f"✅ Switched to schema: {schema_name}"))
+        except Exception as e:
+            yield to_sse(message_chunk(f"❌ Error switching schema: {str(e)}"))
 
     elif user_command.startswith("/use_warehouse "):
         warehouse_name = user_command[15:].strip()
-        if warehouse_name:
-            try:
-                await run_in_thread(client.use_warehouse, warehouse_name)
-                yield to_sse(
-                    message_chunk(f"✅ Switched to warehouse: **{warehouse_name}**")
-                )
-            except Exception as e:
-                yield to_sse(message_chunk(f"❌ Failed to switch warehouse: {str(e)}"))
-        else:
-            yield to_sse(message_chunk("❌ Usage: /use_warehouse <warehouse_name>"))
-        return
+        yield to_sse(reasoning_step(f"Switching to warehouse '{warehouse_name}'..."))
+        try:
+            await run_in_thread(client.use_warehouse, warehouse_name)
+            yield to_sse(message_chunk(f"✅ Switched to warehouse: {warehouse_name}"))
+        except Exception as e:
+            yield to_sse(message_chunk(f"❌ Error switching warehouse: {str(e)}"))
 
     elif user_command.startswith("/complete "):
-        from .helpers import cleanup_text
+        prompt = user_command[10:].strip()
+        yield to_sse(reasoning_step("Generating completion..."))
+        try:
+            current_model = model_preferences.get(conv_id, selected_model)
+            current_temp = temperature_preferences.get(conv_id, selected_temperature)
+            current_tokens = max_tokens_preferences.get(conv_id, selected_max_tokens)
 
-        partial_query = user_command[10:].strip()
-        if partial_query:
-            yield to_sse(reasoning_step("Completing SQL query...", event_type="INFO"))
-            try:
-                # Get tool definitions for completion
-                tools = [
-                    client.get_table_sample_data_tool(),
-                    client.get_table_definition_tool(),
-                    client.get_multiple_table_definitions_tool(),
-                    client.list_databases_tool(),
-                    client.list_schemas_tool(),
-                    client.list_tables_in_tool(),
-                    client.validate_query_tool(),
-                    client.execute_query_tool(),
-                ]
-
-                prompt = f"Complete this SQL query: {partial_query}\n\nProvide only the completed SQL query."
-                completion = await run_in_thread(
-                    agent.complete_with_tools,
-                    message=prompt,
-                    use_history=False,
-                    model=selected_model,
-                    temperature=selected_temperature,
-                    max_tokens=selected_max_tokens,
-                    tools=tools,
-                    tool_choice=None,
-                )
-                yield to_sse(
-                    message_chunk(
-                        f"### Completed Query\n\n```sql\n{cleanup_text(completion)}\n```"
-                    )
-                )
-            except Exception as e:
-                yield to_sse(message_chunk(f"❌ Failed to complete query: {str(e)}"))
-        else:
-            yield to_sse(message_chunk("❌ Usage: /complete <partial_query>"))
-        return
+            response = await run_in_thread(
+                client.complete,
+                prompt,
+                current_model,
+                current_temp,
+                current_tokens,
+                None,  # context
+                None,  # tools
+            )
+            yield to_sse(message_chunk(response))
+        except Exception as e:
+            yield to_sse(message_chunk(f"❌ Error generating completion: {str(e)}"))
 
     elif user_command == "/history":
-        yield to_sse(
-            reasoning_step("Fetching conversation history...", event_type="INFO")
-        )
+        yield to_sse(reasoning_step("Fetching conversation history..."))
         try:
             messages = await run_in_thread(client.get_messages, conv_id)
 
-            # Summarize the conversation
-            output = "### Conversation History Summary\n\n"
-            output += f"**Total Messages:** {len(messages)}\n"
+            # Fetch token usage from cache
+            token_usage_str = await run_in_thread(
+                client.get_conversation_data, conv_id, "token_usage"
+            )
+            if os.environ.get("SNOWFLAKE_DEBUG"):
+                print(f"[DEBUG] /history - conv_id: {conv_id}")
+                print(f"[DEBUG] /history - raw token_usage_str: {token_usage_str}")
+            total_tokens = 0
+            if token_usage_str:
+                try:
+                    usage_data = json.loads(token_usage_str)
+                    total_tokens = usage_data.get("total_tokens", 0)
+                except json.JSONDecodeError:
+                    pass
 
-            # Count message types
-            human_msgs = 0
-            assistant_msgs = 0
-            tool_results = []
-            tables_accessed = set()
-            queries_executed = []
+            if messages:
+                total_msgs = len(messages)
+                user_msgs = sum(
+                    1
+                    for _, role, content in messages
+                    if role in ("user", "human")
+                    and not content.startswith("[Tool Result")
+                )
+                ai_msgs = sum(
+                    1 for _, role, _ in messages if role in ("assistant", "ai")
+                )
+                tool_calls = sum(
+                    1
+                    for _, role, content in messages
+                    if role in ("user", "tool")
+                    and (content.startswith("[Tool Result") or role == "tool")
+                )
 
-            for msg_id, role, content in messages:
-                if role in ["human", "user"]:
-                    if "[Tool Result" in content:
-                        # Extract tool name and details
-                        import re
+                history_text = f"**Conversation Statistics:**\n\n"
+                history_text += f"- Total Messages: {total_msgs}\n"
+                history_text += f"- User Messages: {user_msgs}\n"
+                history_text += f"- Assistant Messages: {ai_msgs}\n"
+                history_text += f"- Tool Calls: {tool_calls}\n"
+                history_text += f"- Total Tokens Used: {total_tokens:,}\n\n"
 
-                        match = re.search(r"\[Tool Result from (\w+)\]", content)
-                        if match:
-                            tool_name = match.group(1)
-                            tool_results.append(tool_name)
+                history_text += "**Recent Messages (Last 5):**\n\n"
 
-                            # Track specific operations
-                            if "get_table" in tool_name:
-                                table_match = re.search(
-                                    r"table[_\s]+name[\"']?\s*:\s*[\"']?([A-Z0-9_\.]+)",
-                                    content,
-                                    re.IGNORECASE,
-                                )
-                                if table_match:
-                                    tables_accessed.add(table_match.group(1))
-                            elif tool_name == "execute_query":
-                                query_match = re.search(
-                                    r"SELECT.*?(?:FROM|WHERE|GROUP|ORDER|LIMIT|;)",
-                                    content[:500],
-                                    re.IGNORECASE | re.DOTALL,
-                                )
-                                if query_match:
-                                    queries_executed.append(
-                                        query_match.group(0)[:100] + "..."
-                                    )
-                    else:
-                        human_msgs += 1
-                elif role in ["assistant", "ai"]:
-                    assistant_msgs += 1
+                # Show last 5 messages
+                recent = messages[-5:]
+                for _, role, content in recent:
+                    truncated = content[:150] + "..." if len(content) > 150 else content
+                    # Escape newlines for cleaner display in list
+                    clean_content = truncated.replace("\n", " ")
+                    history_text += f"- **{role.upper()}:** {clean_content}\n"
 
-            output += f"**Message Breakdown:**\n"
-            output += f"- Human messages: {human_msgs}\n"
-            output += f"- Assistant responses: {assistant_msgs}\n"
-            output += f"- Tool results stored: {len(tool_results)}\n\n"
-
-            if tool_results:
-                output += f"**Tools Used:**\n"
-                tool_counts = {}
-                for tool in tool_results:
-                    tool_counts[tool] = tool_counts.get(tool, 0) + 1
-                for tool, count in sorted(tool_counts.items()):
-                    output += f"- `{tool}`: {count} time(s)\n"
-                output += "\n"
-
-            # Show recent conversation snippets
-            output += "**Recent Conversation (last 10 exchanges):**\n"
-            recent_messages = messages[-20:]  # Get last 20 to show exchanges
-
-            for i, (msg_id, role, content) in enumerate(recent_messages):
-                if role in ["human", "user"] and "[Tool Result" not in content:
-                    snippet = content[:150].replace("\n", " ")
-                    if len(content) > 150:
-                        snippet += "..."
-                    output += f"\n👤 **User:** {snippet}  \n"
-
-                elif role in ["assistant", "ai"]:
-                    snippet = content[:150].replace("\n", " ")
-                    if len(content) > 150:
-                        snippet += "..."
-                    output += f"🤖 **Assistant:** {snippet}  \n"
-
-            yield to_sse(message_chunk(output))
+                yield to_sse(message_chunk(history_text))
+            else:
+                yield to_sse(message_chunk("No conversation history found."))
         except Exception as e:
-            yield to_sse(message_chunk(f"❌ Failed to fetch history: {str(e)}"))
-        return
+            yield to_sse(message_chunk(f"❌ Error fetching history: {str(e)}"))
 
     elif user_command == "/context":
-        # New command to show what's currently in the AI's context window
-        yield to_sse(
-            reasoning_step("Checking current context window...", event_type="INFO")
-        )
+        yield to_sse(reasoning_step("Fetching database context..."))
+        try:
+            current_db = await run_in_thread(client.get_current_database)
+            current_schema = await run_in_thread(client.get_current_schema)
 
-        messages = await run_in_thread(client.get_messages, conv_id)
-        total_messages = len(messages)
+            query = f"""
+            SELECT TABLE_NAME 
+            FROM "{current_db}".INFORMATION_SCHEMA.TABLES 
+            WHERE TABLE_SCHEMA = '{current_schema}' 
+            ORDER BY TABLE_NAME
+            """
+            result_json = await run_in_thread(client.execute_statement, query)
+            rows = json.loads(result_json)
+            tables = []
+            for row in rows:
+                table_name = get_row_value(row, "table_name", "TABLE_NAME")
+                if table_name:
+                    tables.append(table_name)
 
-        # Simulate what would be in context (last 20 messages)
-        CONTEXT_WINDOW = 20
-        context_messages = (
-            messages[-CONTEXT_WINDOW:] if len(messages) > CONTEXT_WINDOW else messages
-        )
+            context_text = f"""**Database Context:**
 
-        output = f"""### Current Context Window
-
-**📊 Context Statistics:**
-- **Total conversation history:** {total_messages} messages
-- **Currently in AI context:** {len(context_messages)} messages (most recent)
-- **Context window size:** {CONTEXT_WINDOW} messages
-
-**📝 What's in current context:**
+- Database: {current_db}
+- Schema: {current_schema}
+- Tables: {len(tables) if tables else 0} tables available
 """
-
-        for msg_id, role, content in context_messages:
-            if role in ["human", "user"]:
-                if "[Tool Result" in content:
-                    import re
-
-                    match = re.search(r"\[Tool Result from (\w+)\]", content)
-                    tool_name = match.group(1) if match else "unknown"
-                    output += f"- 🔧 Tool result: `{tool_name}`\n"
-                else:
-                    snippet = (
-                        content[:50].replace("\n", " ") + "..."
-                        if len(content) > 50
-                        else content
-                    )
-                    output += f"- 👤 User: {snippet}\n"
-            elif role in ["assistant", "ai"]:
-                snippet = (
-                    content[:50].replace("\n", " ") + "..."
-                    if len(content) > 50
-                    else content
+            if tables and len(tables) <= 10:
+                context_text += "\n\n**Tables:**\n\n" + "\n".join(
+                    f"  - {t}" for t in tables[:10]
                 )
-                output += f"- 🤖 Assistant: {snippet}\n"
+            elif tables:
+                context_text += f"\n**Tables:** {', '.join(tables[:5])} ... and {len(tables)-5} more"
 
-        output += """
-
-**💡 Context Management:**
-- Recent messages and tool results are automatically included
-- When you reference earlier data, more context is loaded
-- Use specific references like "the EXTRACTS table" or "the query we ran earlier"
-- The AI intelligently expands context based on your questions"""
-
-        yield to_sse(message_chunk(output))
-        return
+            yield to_sse(message_chunk(context_text))
+        except Exception as e:
+            yield to_sse(message_chunk(f"❌ Error fetching context: {str(e)}"))
 
     else:
-        # Unknown slash command
-        cmd = user_command.split()[0]
+        # Command not recognized
         yield to_sse(
             message_chunk(
-                f"❌ Unknown command: `{cmd}`\n\n"
-                f"Type `/help` to see available commands."
+                f"❌ Unknown command: {user_command}\nUse /help to see available commands."
             )
         )
-        return
+
+
+async def process_document_background(
+    client: SnowflakeAI,
+    stage_path: str,
+    filename: str,
+    conv_id: str,
+    target_database: str,
+    target_schema: str,
+):
+    """Background task to parse document and save results to the working database context."""
+    try:
+        if os.environ.get("SNOWFLAKE_DEBUG"):
+            print(f"[DEBUG] Starting background parsing for {filename}")
+            print(f"[DEBUG] Target location: {target_database}.{target_schema}")
+
+        # 1. Parse document
+        content = await run_in_thread(client.parse_document, stage_path)
+
+        # 2. Ensure results table exists in the working database/schema context
+        qualified_table = (
+            f'"{target_database}"."{target_schema}"."DOCUMENT_PARSE_RESULTS"'
+        )
+        create_table_query = f"""
+        CREATE TABLE IF NOT EXISTS {qualified_table} (
+            FILE_NAME STRING,
+            STAGE_PATH STRING,
+            PAGE_NUMBER INTEGER,
+            PAGE_CONTENT STRING,
+            METADATA VARIANT,
+            PARSED_AT TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP()
+        )
+        """
+        await run_in_thread(client.execute_statement, create_table_query)
+
+        # 3. Process and Insert Data using single SQL statement
+        doc_name = os.path.splitext(filename)[0]
+
+        # Extract stage name and relative file path from stage_path (e.g. @STAGE/path/to/file.pdf)
+        clean_path = stage_path.lstrip("@")
+        if "/" in clean_path:
+            parts = clean_path.split("/", 1)
+            # Check if it's a fully qualified stage
+            if "." in parts[0]:
+                stage_name_extracted = f"@{parts[0]}"
+            else:
+                stage_name_extracted = f"@{parts[0]}"
+            relative_file_path = parts[1]
+        else:
+            # Fallback if path is weird, though upload ensures @STAGE/file
+            stage_name_extracted = f"@{clean_path}"
+            relative_file_path = filename
+
+        # Perform parsing and insertion in a single query to avoid client timeout and data transfer
+        insert_query = f"""
+        INSERT INTO {qualified_table} (FILE_NAME, STAGE_PATH, PAGE_NUMBER, PAGE_CONTENT, METADATA)
+        WITH DOC AS (
+          SELECT AI_PARSE_DOCUMENT(TO_FILE('{stage_name_extracted}', '{relative_file_path}'), {{'mode': 'LAYOUT', 'page_split': true}}) AS RAW
+        )
+        SELECT 
+            '{filename}', 
+            '{stage_path}', 
+            INDEX + 1,
+            GET(VALUE, 'content')::STRING,
+            GET(DOC.RAW, 'metadata')
+        FROM DOC, TABLE(FLATTEN(input => COALESCE(GET(DOC.RAW, 'pages'), DOC.RAW)))
+        """
+        await run_in_thread(client.execute_statement, insert_query)
+
+        # Update cache with page count
+        count_query = f"SELECT COUNT(*) as cnt FROM {qualified_table} WHERE FILE_NAME = '{filename}' AND STAGE_PATH = '{stage_path}'"
+        count_result_json = await run_in_thread(client.execute_statement, count_query)
+        count_rows = json.loads(count_result_json)
+        if count_rows:
+            num_pages = count_rows[0].get("CNT", count_rows[0].get("cnt", 0))
+
+            await run_in_thread(
+                client.set_conversation_data,
+                conv_id,
+                f"doc_{doc_name}_page_count",
+                str(num_pages),
+            )
+
+        if os.environ.get("SNOWFLAKE_DEBUG"):
+            print(f"[DEBUG] Background parsing complete for {filename}")
+            print(f"[DEBUG] Results stored in {qualified_table}")
+
+    except Exception as e:
+        if os.environ.get("SNOWFLAKE_DEBUG"):
+            print(f"[ERROR] Background parsing failed for {filename}: {e}")
