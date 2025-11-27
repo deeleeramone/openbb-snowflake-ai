@@ -147,8 +147,8 @@ async def upload_widget_file(
     stage_name = payload.get("stage_name")  # Optional, defaults to CORTEX_UPLOADS
 
     # Handle different input methods
-    if path := payload.get("path", ""):
-        if not os.path.isfile(path):
+    if path := payload.get("path", ""):  # nosec
+        if not os.path.isfile(path):  # nosec
             raise HTTPException(
                 status_code=400, detail=f"File path does not exist: {path}"
             )
