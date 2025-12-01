@@ -77,6 +77,20 @@
                         "description": "URL to the file."
                     },
                     {
+                        "paramName": "file_name",
+                        "type": "text",
+                        "value": null,
+                        "label": "File Name",
+                        "description": "Optional name to rename the uploaded file as (excluding file suffix)."
+                    },
+                    {
+                        "paramName": "embed_images",
+                        "type": "boolean",
+                        "value": false,
+                        "label": "Embed Images",
+                        "description": "Whether to extract and embed images within the document."
+                    },
+                    {
                         "paramName": "document",
                         "description": "Document(s) to remove.",
                         "type": "endpoint",
@@ -96,6 +110,7 @@
                 ]
             }
         ],
-        "source": ["Snowflake"]
+        "source": ["Snowflake"],
+        "refetchInterval": false
     }
 }

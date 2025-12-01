@@ -4,12 +4,15 @@ mod lsp;
 
 use crate::engine::SnowflakeEngine;
 
-use chrono::TimeZone;
 use clap::{Parser, Subcommand};
 use futures::StreamExt;
-use serde_json::json;
+use serde_json::{json, Value};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use tokio::io::{self, AsyncBufReadExt};
+use uuid::Uuid;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -116,148 +119,18 @@ enum Commands {
         schema: String,
         #[arg(short = 'm', long)]
         semantic_model: Option<PathBuf>,
-        #[arg(short = 'e', long)]
-        env_file: Option<PathBuf>,
-    },
-    /// Interactive AI_COMPLETE session with configurable parameters
-    AiComplete {
-        #[arg(short, long, env = "SNOWFLAKE_USER")]
-        user: String,
-        #[arg(short, long, env = "SNOWFLAKE_PASSWORD")]
-        password: String,
-        #[arg(short, long, env = "SNOWFLAKE_ACCOUNT")]
-        account: String,
-        #[arg(short, long, env = "SNOWFLAKE_ROLE")]
-        role: String,
-        #[arg(short, long, env = "SNOWFLAKE_WAREHOUSE")]
-        warehouse: String,
-        #[arg(short, long, env = "SNOWFLAKE_DATABASE")]
-        database: String,
-        #[arg(short = 's', long, env = "SNOWFLAKE_SCHEMA")]
-        schema: String,
-
-        #[arg(short = 'm', long, default_value = "llama3.1-70b")]
-        model: String,
-
-        #[arg(short = 't', long)]
+        #[arg(long)]
+        conversation_id: Option<String>,
+        #[arg(long)]
+        conversation_label: Option<String>,
+        #[arg(long)]
+        list_conversations: bool,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
         temperature: Option<f32>,
-
         #[arg(long)]
         max_tokens: Option<i32>,
-
-        #[arg(short = 'c', long)]
-        context_file: Option<PathBuf>,
-
-        #[arg(short = 'e', long)]
-        env_file: Option<PathBuf>,
-    },
-    /// Interactive AI agent with streaming responses
-    Agent {
-        #[arg(short, long, env = "SNOWFLAKE_USER")]
-        user: String,
-        #[arg(short, long, env = "SNOWFLAKE_PASSWORD")]
-        password: String,
-        #[arg(short, long, env = "SNOWFLAKE_ACCOUNT")]
-        account: String,
-        #[arg(short, long, env = "SNOWFLAKE_ROLE")]
-        role: String,
-        #[arg(short, long, env = "SNOWFLAKE_WAREHOUSE")]
-        warehouse: String,
-        #[arg(short, long, env = "SNOWFLAKE_DATABASE")]
-        database: String,
-        #[arg(short = 's', long, env = "SNOWFLAKE_SCHEMA")]
-        schema: String,
-
-        #[arg(short = 'm', long, default_value = "llama3.1-70b")]
-        model: String,
-
-        #[arg(short = 't', long)]
-        temperature: Option<f32>,
-
-        #[arg(long)]
-        max_tokens: Option<i32>,
-
-        #[arg(short = 'e', long)]
-        env_file: Option<PathBuf>,
-
-        #[arg(long, default_value = "true")]
-        stream: bool,
-    },
-    /// List all accessible databases
-    ListDatabases {
-        #[arg(short, long, env = "SNOWFLAKE_USER")]
-        user: String,
-        #[arg(short, long, env = "SNOWFLAKE_PASSWORD")]
-        password: String,
-        #[arg(short, long, env = "SNOWFLAKE_ACCOUNT")]
-        account: String,
-        #[arg(short, long, env = "SNOWFLAKE_ROLE")]
-        role: String,
-        #[arg(short, long, env = "SNOWFLAKE_WAREHOUSE")]
-        warehouse: String,
-        #[arg(short, long, env = "SNOWFLAKE_DATABASE")]
-        database: String,
-        #[arg(short = 's', long, env = "SNOWFLAKE_SCHEMA")]
-        schema: String,
-        #[arg(short = 'e', long)]
-        env_file: Option<PathBuf>,
-    },
-    /// List all schemas in a database
-    ListSchemas {
-        #[arg(short, long, env = "SNOWFLAKE_USER")]
-        user: String,
-        #[arg(short, long, env = "SNOWFLAKE_PASSWORD")]
-        password: String,
-        #[arg(short, long, env = "SNOWFLAKE_ACCOUNT")]
-        account: String,
-        #[arg(short, long, env = "SNOWFLAKE_ROLE")]
-        role: String,
-        #[arg(short, long, env = "SNOWFLAKE_WAREHOUSE")]
-        warehouse: String,
-        #[arg(short, long, env = "SNOWFLAKE_DATABASE")]
-        database: String,
-        #[arg(short = 's', long, env = "SNOWFLAKE_SCHEMA")]
-        schema: String,
-        #[arg(long)]
-        target_database: Option<String>,
-        #[arg(short = 'e', long)]
-        env_file: Option<PathBuf>,
-    },
-    /// List all accessible warehouses
-    ListWarehouses {
-        #[arg(short, long, env = "SNOWFLAKE_USER")]
-        user: String,
-        #[arg(short, long, env = "SNOWFLAKE_PASSWORD")]
-        password: String,
-        #[arg(short, long, env = "SNOWFLAKE_ACCOUNT")]
-        account: String,
-        #[arg(short, long, env = "SNOWFLAKE_ROLE")]
-        role: String,
-        #[arg(short, long, env = "SNOWFLAKE_WAREHOUSE")]
-        warehouse: String,
-        #[arg(short, long, env = "SNOWFLAKE_DATABASE")]
-        database: String,
-        #[arg(short = 's', long, env = "SNOWFLAKE_SCHEMA")]
-        schema: String,
-        #[arg(short = 'e', long)]
-        env_file: Option<PathBuf>,
-    },
-    /// List all tables across all accessible databases and schemas
-    ListAllTables {
-        #[arg(short, long, env = "SNOWFLAKE_USER")]
-        user: String,
-        #[arg(short, long, env = "SNOWFLAKE_PASSWORD")]
-        password: String,
-        #[arg(short, long, env = "SNOWFLAKE_ACCOUNT")]
-        account: String,
-        #[arg(short, long, env = "SNOWFLAKE_ROLE")]
-        role: String,
-        #[arg(short, long, env = "SNOWFLAKE_WAREHOUSE")]
-        warehouse: String,
-        #[arg(short, long, env = "SNOWFLAKE_DATABASE")]
-        database: String,
-        #[arg(short = 's', long, env = "SNOWFLAKE_SCHEMA")]
-        schema: String,
         #[arg(short = 'e', long)]
         env_file: Option<PathBuf>,
     },
@@ -268,9 +141,14 @@ fn print_chat_help() {
     println!("  /help                     - Show this command menu");
     println!("  /reset                    - Clear conversation history");
     println!("  /history                  - Show conversation history");
-    println!("  /execute                  - Execute the last generated SQL query");
-    println!("  /stage                    - Set semantic model stage");
-    println!("  /model                    - Set semantic model file");
+    println!("  /conversations            - List stored conversations");
+    println!("  /use_conversation <id>    - Switch to an existing conversation by ID or label");
+    println!("  /label [value]            - Set or clear the active conversation label");
+    println!("  /model <name>             - Override the active model");
+    println!("  /temperature <val>        - Set sampling temperature (0.0-1.0)");
+    println!("  /max_tokens <val>         - Set a max token budget");
+    println!("  /models                   - List available Cortex models");
+    println!("  /execute [sql]            - Run SQL inline or enter multiline prompt");
     println!("  /databases                - List all accessible databases");
     println!("  /schemas [db]             - List schemas in current/specified database");
     println!("  /warehouses               - List all accessible warehouses");
@@ -281,6 +159,12 @@ fn print_chat_help() {
     println!(
         "  /suggest_query <natural_language_query> - Suggest a SQL query from natural language"
     );
+    println!("  /upload <file_path>       - Upload a local file to CORTEX_UPLOADS");
+    println!("  /stages                   - List all available stages");
+    println!("  /stage_files <stage>      - List files within a stage");
+    println!("  /parse <@stage/file>      - Parse a staged document via AI_PARSE_DOCUMENT");
+    println!("  /documents                - List parsed Cortex documents");
+    println!("  /download_document <name> - Download a Cortex document as base64");
     println!("  /use_database <db_name>   - Switch to a different database");
     println!("  /use_schema <schema_name> - Switch to a different schema");
     println!("  /use_warehouse <wh_name>  - Switch to a different warehouse");
@@ -289,101 +173,47 @@ fn print_chat_help() {
     println!();
 }
 
-fn print_ai_complete_help() {
-    println!("Commands:");
-    println!("  /help                     - Show this command menu");
-    println!("  /execute                  - Execute a SQL query");
-    println!("  /models                   - List available models");
-    println!("  /model <name>             - Change AI model");
-    println!("  /temperature <val>        - Set temperature (0.0-1.0)");
-    println!("  /max_tokens <val>         - Set max tokens");
-    println!("  /context <file>           - Load context from file");
-    println!("  /clear_context            - Clear loaded context");
-    println!("  /show_context             - Show current context");
-    println!("  /history                  - Show conversation history");
-    println!("  /reset                    - Clear conversation history");
-    println!("  /settings                 - Show current settings");
-    println!("  /databases                - List all accessible databases");
-    println!("  /schemas [db]             - List schemas in current/specified database");
-    println!("  /warehouses               - List all accessible warehouses");
-    println!("  /tables                   - List tables in current database/schema");
-    println!("  /all_tables               - List all tables across all databases");
-    println!("  /describe <table_name>    - Describe a table");
-    println!("  /complete <partial_query> - Complete a SQL query using AI");
-    println!(
-        "  /suggest_query <natural_language_query> - Suggest a SQL query from natural language"
-    );
-    println!("  /use_database <db_name>   - Switch to a different database");
-    println!("  /use_schema <schema_name> - Switch to a different schema");
-    println!("  /use_warehouse <wh_name>  - Switch to a different warehouse");
-    println!("  /current                  - Show current database/schema");
-    println!("  /exit                     - Exit session");
-    println!();
+async fn current_database_name(engine: &SnowflakeEngine) -> String {
+    engine
+        .get_database()
+        .await
+        .unwrap_or_else(|_| "UNKNOWN".to_string())
 }
 
-fn print_agent_help() {
-    println!("Commands:");
-    println!("  /help                     - Show this command menu");
-    println!("  /execute                  - Execute a SQL query");
-    println!("  /model <name>             - Change AI model");
-    println!("  /models                   - List available models");
-    println!("  /temperature <val>        - Set temperature (0.0-1.0)");
-    println!("  /max_tokens <val>         - Set max tokens");
-    println!("  /databases                - List all accessible databases");
-    println!("  /schemas [db]             - List schemas in current/specified database");
-    println!("  /warehouses               - List all accessible warehouses");
-    println!("  /tables                   - List tables in current database/schema");
-    println!("  /all_tables               - List all tables across all databases");
-    println!("  /describe <table_name>    - Describe a table");
-    println!("  /complete <partial_query> - Complete a SQL query using AI");
-    println!(
-        "  /suggest_query <natural_language_query> - Suggest a SQL query from natural language"
-    );
-    println!("  /use_database <db_name>   - Switch to a different database");
-    println!("  /use_schema <schema_name> - Switch to a different schema");
-    println!("  /use_warehouse <wh_name>  - Switch to a different warehouse");
-    println!("  /current                  - Show current database/schema");
-    println!("  /agents                   - List all agents");
-    println!("  /sessions                 - List sessions for an agent");
-    println!("  /create_agent             - Create a new agent");
-    println!("  /create_agent_from_file   - Create agent from JSON file");
-    println!("  /create_session           - Create a new session");
-    println!("  /get_agent <id>           - Get agent by ID");
-    println!("  /get_session <id>         - Get session by ID");
-    println!("  /update_agent <id>        - Update an agent");
-    println!("  /delete_agent <id>        - Delete an agent");
-    println!("  /delete_session <id>      - Delete a session");
-    println!("  /send_to_session          - Send message to a session");
-    println!("  /list_messages <id>       - List messages in a session");
-    println!("  /get_message              - Get a specific message");
-    println!("  /usage                    - Show API usage statistics");
-    println!("  /reset                    - Clear conversation history");
-    println!("  /exit                     - Exit session");
-    println!("  /tools                    - Use function calling");
-    println!("  /system                   - Add system message");
-    println!();
+async fn current_schema_name(engine: &SnowflakeEngine) -> String {
+    engine
+        .get_schema()
+        .await
+        .unwrap_or_else(|_| "UNKNOWN".to_string())
+}
+
+async fn current_user_name(engine: &SnowflakeEngine) -> String {
+    engine
+        .get_user()
+        .await
+        .unwrap_or_else(|_| "UNKNOWN".to_string())
 }
 
 async fn handle_common_slash_commands(input: &str, engine: &mut SnowflakeEngine) -> bool {
     if input == "/current" {
+        let user = current_user_name(&*engine).await;
+        let database = current_database_name(&*engine).await;
+        let schema = current_schema_name(&*engine).await;
         println!("\n📍 Current Context:");
-        println!("  Account: {}", engine.get_current_account());
-        println!("  Database: {}", engine.get_current_database());
-        println!("  Schema: {}", engine.get_current_schema());
+        println!("  User: {}", user);
+        println!("  Database: {}", database);
+        println!("  Schema: {}", schema);
         println!();
         return true;
     }
 
     if input == "/databases" {
+        let current_db = current_database_name(&*engine).await;
         match engine.list_databases().await {
             Ok(databases) => {
                 println!("\n📚 Accessible Databases:");
                 for db in databases {
-                    let marker = if db == engine.get_current_database() {
-                        " (current)"
-                    } else {
-                        ""
-                    };
+                    let marker = if db == current_db { " (current)" } else { "" };
                     println!("  - {}{}", db, marker);
                 }
                 println!();
@@ -400,12 +230,15 @@ async fn handle_common_slash_commands(input: &str, engine: &mut SnowflakeEngine)
             None
         };
 
+        let fallback_db = current_database_name(&*engine).await;
+        let current_schema = current_schema_name(&*engine).await;
+
         match engine.list_schemas(target_db).await {
             Ok(schemas) => {
-                let db_name = target_db.unwrap_or(engine.get_current_database());
+                let db_name = target_db.unwrap_or(&fallback_db);
                 println!("\n📂 Schemas in {}:", db_name);
                 for s in schemas {
-                    let marker = if s == engine.get_current_schema() && target_db.is_none() {
+                    let marker = if s == current_schema && target_db.is_none() {
                         " (current)"
                     } else {
                         ""
@@ -434,13 +267,11 @@ async fn handle_common_slash_commands(input: &str, engine: &mut SnowflakeEngine)
     }
 
     if input == "/tables" {
+        let current_db = current_database_name(&*engine).await;
+        let current_schema = current_schema_name(&*engine).await;
         match engine.get_table_list().await {
             Ok(tables) => {
-                println!(
-                    "\n📋 Tables in {}.{}:",
-                    engine.get_current_database(),
-                    engine.get_current_schema()
-                );
+                println!("\n📋 Tables in {}.{}:", current_db, current_schema);
                 for table in tables {
                     println!("  - {}", table);
                 }
@@ -479,14 +310,11 @@ async fn handle_common_slash_commands(input: &str, engine: &mut SnowflakeEngine)
     if input.starts_with("/describe ") {
         let table_name = input.strip_prefix("/describe ").unwrap().trim();
         if !table_name.is_empty() {
+            let current_db = current_database_name(&*engine).await;
+            let current_schema = current_schema_name(&*engine).await;
             match engine.get_table_info(table_name).await {
                 Ok(columns) => {
-                    println!(
-                        "Table: {}.{}.{}",
-                        engine.get_current_database(),
-                        engine.get_current_schema(),
-                        table_name
-                    );
+                    println!("Table: {}.{}.{}", current_db, current_schema, table_name);
                     println!("{:<30} {:<20} {:<10}", "Column", "Type", "Nullable");
                     println!("{:-<62}", "");
                     let table_info: serde_json::Value = match serde_json::from_str(&columns) {
@@ -502,12 +330,7 @@ async fn handle_common_slash_commands(input: &str, engine: &mut SnowflakeEngine)
                         return true; // Indicate that the command was handled, but with an error
                     };
 
-                    println!(
-                        "Table: {}.{}.{}",
-                        engine.get_current_database(),
-                        engine.get_current_schema(),
-                        table_name
-                    );
+                    println!("Table: {}.{}.{}", current_db, current_schema, table_name);
                     println!("{:<30} {:<20} {:<10}", "Column", "Type", "Nullable");
                     println!("{:-<62}", "");
                     for col in cols_to_print {
@@ -529,20 +352,19 @@ async fn handle_common_slash_commands(input: &str, engine: &mut SnowflakeEngine)
         let partial_query = input.strip_prefix("/complete ").unwrap().trim();
         if !partial_query.is_empty() {
             println!("🤖 Completing query (without full context for speed)...");
-            // Use ai_complete directly without expensive context
-            match engine
-                .ai_complete_raw(
-                    "llama3.1-70b",
-                    &format!("Complete this SQL query: {}", partial_query),
-                    None,
-                    None,
-                )
-                .await
-            {
-                Ok(completion) => {
-                    println!("\n🤖 Completed Query:\n```sql\n{}\n```", completion);
+            match engine.get_query_suggestions(partial_query).await {
+                Ok(suggestions) => {
+                    if suggestions.is_empty() {
+                        println!("✗ No suggestions returned.\n");
+                    } else {
+                        println!("\n🤖 Suggested Query:\n```sql");
+                        for suggestion in suggestions {
+                            println!("{}", suggestion);
+                        }
+                        println!("```");
+                    }
                 }
-                Err(e) => println!("✗ Failed to complete query: {}\n", e),
+                Err(e) => println!("✗ Failed to get suggestions: {}\n", e),
             }
         } else {
             println!("✗ Usage: /complete <partial_query>\n");
@@ -609,6 +431,749 @@ async fn handle_common_slash_commands(input: &str, engine: &mut SnowflakeEngine)
     false
 }
 
+#[derive(Debug, Clone)]
+struct ConversationSummary {
+    id: String,
+    label: Option<String>,
+    message_count: usize,
+    updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ConversationConfig {
+    label: Option<String>,
+    model: String,
+    temperature: Option<f32>,
+    max_tokens: Option<i32>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct ConversationOverrides {
+    label: bool,
+    model: bool,
+    temperature: bool,
+    max_tokens: bool,
+}
+
+impl ConversationConfig {
+    fn to_metadata(&self) -> Value {
+        json!({
+            "label": self.label,
+            "model": self.model,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens
+        })
+    }
+
+    fn absorb_metadata(&mut self, metadata: &Value, overrides: &ConversationOverrides) {
+        if !overrides.label {
+            if let Some(label) = metadata.get("label").and_then(|v| v.as_str()) {
+                self.label = Some(label.to_string());
+            }
+        }
+
+        if !overrides.model {
+            if let Some(model) = metadata.get("model").and_then(|v| v.as_str()) {
+                self.model = model.to_string();
+            }
+        }
+
+        if !overrides.temperature {
+            if let Some(temp) = metadata.get("temperature").and_then(|v| v.as_f64()) {
+                self.temperature = Some(temp as f32);
+            }
+        }
+
+        if !overrides.max_tokens {
+            if let Some(tokens) = metadata.get("max_tokens").and_then(|v| v.as_i64()) {
+                self.max_tokens = Some(tokens as i32);
+            }
+        }
+    }
+}
+
+const MODEL_PREFERENCE_KEY: &str = "model_preference";
+const TEMPERATURE_PREFERENCE_KEY: &str = "temperature_preference";
+const MAX_TOKENS_PREFERENCE_KEY: &str = "max_tokens_preference";
+const LABEL_PREFERENCE_KEY: &str = "conversation_label";
+
+fn normalize_context_string(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("null") {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn to_context_payload(value: &str) -> String {
+    if serde_json::from_str::<Value>(value).is_ok() {
+        value.replace("$$", "$ $")
+    } else {
+        json!({ "value": value }).to_string().replace("$$", "$ $")
+    }
+}
+
+async fn fetch_context_map(
+    engine: &SnowflakeEngine,
+    conversation_id: &str,
+) -> Result<HashMap<String, String>, String> {
+    let user_name = engine.get_user().await?;
+    engine.setup_user_resources(&user_name).await?;
+    let schema = engine.user_schema_name();
+    let escaped_id = sanitize_sql_string(conversation_id);
+    let query = format!(
+        "SELECT OBJECT_KEY, COALESCE(OBJECT_VALUE:value::STRING, TO_JSON(OBJECT_VALUE)::STRING) AS VALUE \
+         FROM OPENBB_AGENTS.{schema}.AGENTS_CONTEXT_OBJECTS \
+         WHERE CONVERSATION_ID = '{escaped_id}'"
+    );
+    let rows = engine.execute_statement(&query).await?;
+    let mut map = HashMap::new();
+    if let Some(array) = rows.as_array() {
+        for row in array {
+            if let Some(key) = row
+                .get("OBJECT_KEY")
+                .or_else(|| row.get("object_key"))
+                .and_then(|v| v.as_str())
+            {
+                if let Some(value) = row
+                    .get("VALUE")
+                    .or_else(|| row.get("value"))
+                    .and_then(|v| v.as_str())
+                {
+                    if let Some(normalized) = normalize_context_string(value) {
+                        map.insert(key.to_string(), normalized);
+                    }
+                }
+            }
+        }
+    }
+    Ok(map)
+}
+
+async fn apply_context_preferences(
+    engine: &SnowflakeEngine,
+    conversation_id: &str,
+    config: &mut ConversationConfig,
+    overrides: &ConversationOverrides,
+) -> Result<(), String> {
+    let context_map = fetch_context_map(engine, conversation_id).await?;
+
+    if !overrides.model {
+        if let Some(model) = context_map.get(MODEL_PREFERENCE_KEY) {
+            if !model.trim().is_empty() {
+                config.model = model.to_string();
+            }
+        }
+    }
+
+    if !overrides.temperature {
+        if let Some(temp_str) = context_map.get(TEMPERATURE_PREFERENCE_KEY) {
+            if let Ok(value) = temp_str.parse::<f32>() {
+                config.temperature = Some(value);
+            }
+        }
+    }
+
+    if !overrides.max_tokens {
+        if let Some(tokens_str) = context_map.get(MAX_TOKENS_PREFERENCE_KEY) {
+            if let Ok(value) = tokens_str.parse::<i32>() {
+                config.max_tokens = Some(value);
+            }
+        }
+    }
+
+    if !overrides.label {
+        if let Some(label) = context_map.get(LABEL_PREFERENCE_KEY) {
+            if !label.trim().is_empty() {
+                config.label = Some(label.to_string());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn set_context_value(
+    engine: &SnowflakeEngine,
+    conversation_id: &str,
+    key: &str,
+    value: &str,
+) -> Result<(), String> {
+    let user_name = engine.get_user().await?;
+    engine.setup_user_resources(&user_name).await?;
+    let schema = engine.user_schema_name();
+    let object_id = format!("{}_{}", conversation_id, key);
+    let escaped_object_id = sanitize_sql_string(&object_id);
+    let escaped_conv = sanitize_sql_string(conversation_id);
+    let escaped_key = sanitize_sql_string(key);
+    let payload = to_context_payload(value);
+    let query = format!(
+        "MERGE INTO OPENBB_AGENTS.{schema}.AGENTS_CONTEXT_OBJECTS AS target \
+         USING (SELECT 1) AS source \
+         ON target.OBJECT_ID = '{escaped_object_id}' \
+         WHEN MATCHED THEN UPDATE SET OBJECT_VALUE = PARSE_JSON($${payload}$$) \
+         WHEN NOT MATCHED THEN INSERT (OBJECT_ID, CONVERSATION_ID, OBJECT_TYPE, OBJECT_KEY, OBJECT_VALUE) \
+         VALUES ('{escaped_object_id}', '{escaped_conv}', 'context', '{escaped_key}', PARSE_JSON($${payload}$$))"
+    );
+    engine.execute_statement(&query).await.map(|_| ())
+}
+
+async fn delete_context_value(
+    engine: &SnowflakeEngine,
+    conversation_id: &str,
+    key: &str,
+) -> Result<(), String> {
+    let user_name = engine.get_user().await?;
+    engine.setup_user_resources(&user_name).await?;
+    let schema = engine.user_schema_name();
+    let object_id = format!("{}_{}", conversation_id, key);
+    let escaped_object_id = sanitize_sql_string(&object_id);
+    let query = format!(
+        "DELETE FROM OPENBB_AGENTS.{schema}.AGENTS_CONTEXT_OBJECTS WHERE OBJECT_ID = '{escaped_object_id}'"
+    );
+    engine.execute_statement(&query).await.map(|_| ())
+}
+
+async fn persist_context_preferences(
+    engine: &SnowflakeEngine,
+    conversation_id: &str,
+    config: &ConversationConfig,
+) -> Result<(), String> {
+    set_context_value(engine, conversation_id, MODEL_PREFERENCE_KEY, &config.model).await?;
+
+    if let Some(temp) = config.temperature {
+        set_context_value(
+            engine,
+            conversation_id,
+            TEMPERATURE_PREFERENCE_KEY,
+            &temp.to_string(),
+        )
+        .await?;
+    } else {
+        let _ = delete_context_value(engine, conversation_id, TEMPERATURE_PREFERENCE_KEY).await;
+    }
+
+    if let Some(tokens) = config.max_tokens {
+        set_context_value(
+            engine,
+            conversation_id,
+            MAX_TOKENS_PREFERENCE_KEY,
+            &tokens.to_string(),
+        )
+        .await?;
+    } else {
+        let _ = delete_context_value(engine, conversation_id, MAX_TOKENS_PREFERENCE_KEY).await;
+    }
+
+    match config.label.as_ref().map(|label| label.trim()).filter(|s| !s.is_empty()) {
+        Some(label) => {
+            set_context_value(engine, conversation_id, LABEL_PREFERENCE_KEY, label).await?;
+        }
+        None => {
+            let _ = delete_context_value(engine, conversation_id, LABEL_PREFERENCE_KEY).await;
+        }
+    }
+
+    Ok(())
+}
+
+fn sanitize_sql_string(input: &str) -> String {
+    input.replace('\'', "''")
+}
+
+async fn print_available_models(engine: &SnowflakeEngine) {
+    println!("\n📊 Available Models:");
+    match engine.get_available_models().await {
+        Ok(models) => {
+            for (name, desc) in models {
+                println!("- {:<25} {}", name, desc);
+            }
+            println!("  (Use /model <name> to switch)\n");
+        }
+        Err(err) => {
+            println!("✗ Failed to fetch available models: {}\n", err);
+        }
+    }
+}
+
+type StdinLines = tokio::io::Lines<tokio::io::BufReader<tokio::io::Stdin>>;
+
+fn expand_path(path: &str) -> PathBuf {
+    if let Some(stripped) = path.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return Path::new(&home).join(stripped);
+        }
+    }
+    if path == "~" {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home);
+        }
+    }
+    PathBuf::from(path)
+}
+
+fn get_value_case_insensitive(row: &Value, key: &str) -> Option<String> {
+    if let Value::Object(map) = row {
+        if let Some(val) = map.get(key) {
+            return val.as_str().map(|s| s.to_string());
+        }
+        let upper = key.to_uppercase();
+        if let Some(val) = map.get(&upper) {
+            return val.as_str().map(|s| s.to_string());
+        }
+        let lower = key.to_lowercase();
+        if let Some(val) = map.get(&lower) {
+            return val.as_str().map(|s| s.to_string());
+        }
+    }
+    None
+}
+
+fn extract_last_sql_snippet(text: &str) -> Option<String> {
+    let marker = "```sql";
+    let start = text.rfind(marker)?;
+    let after_marker = &text[start + marker.len()..];
+    let end_offset = after_marker.find("```")?;
+    let snippet = after_marker[..end_offset].trim();
+    if snippet.is_empty() {
+        None
+    } else {
+        Some(snippet.to_string())
+    }
+}
+
+async fn prompt_for_sql_input(lines: &mut StdinLines) -> Option<String> {
+    println!("Enter SQL (terminate with ';' and an empty line):");
+    let mut buffer = String::new();
+    loop {
+        print!("sql> ");
+        let _ = std::io::stdout().flush();
+        match lines.next_line().await {
+            Ok(Some(line)) => {
+                let trimmed = line.trim_end().to_string();
+                if trimmed.is_empty() && buffer.trim_end().ends_with(';') {
+                    break;
+                }
+                buffer.push_str(&trimmed);
+                buffer.push('\n');
+            }
+            Ok(None) => break,
+            Err(_) => return None,
+        }
+    }
+    let cleaned = buffer.trim().trim_end_matches(';').trim().to_string();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+async fn handle_document_commands(input: &str, engine: &mut SnowflakeEngine) -> bool {
+    if input == "/stages" {
+        match engine.execute_statement("SHOW STAGES").await {
+            Ok(rows) => {
+                let mut stages = BTreeSet::new();
+                if let Some(array) = rows.as_array() {
+                    let current_db = current_database_name(engine).await;
+                    let current_schema = current_schema_name(engine).await;
+                    for row in array {
+                        let name = get_value_case_insensitive(row, "NAME");
+                        let db =
+                            get_value_case_insensitive(row, "DATABASE_NAME").unwrap_or_default();
+                        let schema =
+                            get_value_case_insensitive(row, "SCHEMA_NAME").unwrap_or_default();
+                        if let Some(stage_name) = name {
+                            if db.is_empty() || schema.is_empty() {
+                                stages.insert(stage_name);
+                            } else if db == current_db && schema == current_schema {
+                                stages.insert(stage_name);
+                            } else {
+                                stages.insert(format!("{}.{}.{}", db, schema, stage_name));
+                            }
+                        }
+                    }
+                }
+
+                if let Ok(user) = engine.get_user().await {
+                    let sanitized: String = user
+                        .chars()
+                        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                        .collect();
+                    let user_schema = format!("USER_{}", sanitized).to_uppercase();
+                    if !stages.iter().any(|s| s.contains(&user_schema)) {
+                        let query = format!("SHOW STAGES IN SCHEMA OPENBB_AGENTS.{}", user_schema);
+                        if let Ok(user_rows) = engine.execute_statement(&query).await {
+                            if let Some(array) = user_rows.as_array() {
+                                for row in array {
+                                    if let Some(name) = get_value_case_insensitive(row, "NAME") {
+                                        stages.insert(format!(
+                                            "OPENBB_AGENTS.{}.{}",
+                                            user_schema, name
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if stages.is_empty() {
+                    println!("No stages found.\n");
+                } else {
+                    println!("\n📁 Available Stages:");
+                    for stage in stages {
+                        println!("- {}", stage);
+                    }
+                    println!();
+                }
+            }
+            Err(err) => println!("✗ Failed to list stages: {}\n", err),
+        }
+        return true;
+    }
+
+    if let Some(stage_name) = input.strip_prefix("/stage_files ") {
+        let stage_name = stage_name.trim();
+        if stage_name.is_empty() {
+            println!("✗ Usage: /stage_files <stage_name>\n");
+            return true;
+        }
+
+        let list_target = if stage_name.starts_with('@') {
+            format!("LIST {}", stage_name)
+        } else if stage_name.contains('.') {
+            format!("LIST @{}", stage_name)
+        } else {
+            format!("LIST @{}", stage_name)
+        };
+
+        match engine.execute_statement(&list_target).await {
+            Ok(rows) => {
+                if let Some(array) = rows.as_array() {
+                    if array.is_empty() {
+                        println!("No files found in stage {}.\n", stage_name);
+                    } else {
+                        println!("\n📄 Files in {}:", stage_name);
+                        for row in array {
+                            if let Some(name) = get_value_case_insensitive(row, "NAME") {
+                                let filename = name.split('/').last().unwrap_or(&name).to_string();
+                                println!("- {}", filename);
+                            }
+                        }
+                        println!();
+                    }
+                }
+            }
+            Err(err) => println!("✗ Failed to list files: {}\n", err),
+        }
+        return true;
+    }
+
+    if let Some(path_str) = input.strip_prefix("/upload ") {
+        let trimmed = path_str.trim();
+        if trimmed.is_empty() {
+            println!("✗ Usage: /upload <file_path>\n");
+            return true;
+        }
+        let path = expand_path(trimmed);
+        if !path.exists() || !path.is_file() {
+            println!("✗ File not found: {}\n", path.display());
+            return true;
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("upload.bin");
+        match fs::read(&path) {
+            Ok(bytes) => match engine.upload_bytes_to_stage(&bytes, file_name, None).await {
+                Ok(stage_path) => {
+                    println!("✓ Uploaded {} to {}\n", file_name, stage_path);
+                }
+                Err(err) => println!("✗ Upload failed: {}\n", err),
+            },
+            Err(err) => println!("✗ Failed to read file: {}\n", err),
+        }
+        return true;
+    }
+
+    if let Some(stage_path) = input.strip_prefix("/parse ") {
+        let stage_path = stage_path.trim();
+        if stage_path.is_empty() {
+            println!("✗ Usage: /parse <stage_path>\n");
+            return true;
+        }
+        match engine.ai_parse_document(stage_path, Some("LAYOUT")).await {
+            Ok(result) => {
+                println!(
+                    "✓ Parsed document. Result preview (first 500 chars):\n{}\n",
+                    &result.chars().take(500).collect::<String>()
+                );
+            }
+            Err(err) => println!("✗ Document parsing failed: {}\n", err),
+        }
+        return true;
+    }
+
+    if input == "/documents" {
+        match engine.list_cortex_documents().await {
+            Ok(documents) => {
+                if documents.is_empty() {
+                    println!("No Cortex documents found.\n");
+                } else {
+                    println!("\n📚 Cortex Documents:");
+                    for (file_name, stage_path, parsed, page_count) in documents {
+                        println!(
+                            "- {} (stage: {}, parsed: {}, pages: {})",
+                            file_name, stage_path, parsed, page_count
+                        );
+                    }
+                    println!();
+                }
+            }
+            Err(err) => println!("✗ Failed to list documents: {}\n", err),
+        }
+        return true;
+    }
+
+    if let Some(doc_name) = input.strip_prefix("/download_document ") {
+        let doc_name = doc_name.trim();
+        if doc_name.is_empty() {
+            println!("✗ Usage: /download_document <file_name>\n");
+            return true;
+        }
+        match engine.download_cortex_document(doc_name).await {
+            Ok(content) => {
+                println!(
+                    "✓ Downloaded document {} ({} bytes base64).\n",
+                    doc_name,
+                    content.len()
+                );
+            }
+            Err(err) => println!("✗ Failed to download document: {}\n", err),
+        }
+        return true;
+    }
+
+    false
+}
+
+async fn fetch_conversation_summaries(
+    engine: &SnowflakeEngine,
+) -> Result<Vec<ConversationSummary>, String> {
+    let user_name = engine.get_user().await?;
+    engine.setup_user_resources(&user_name).await?;
+    let schema = engine.user_schema_name();
+    let query = format!(
+        "SELECT CONVERSATION_ID, \
+                COALESCE(TO_CHAR(LAST_UPDATED_AT, 'YYYY-MM-DD HH24:MI:SS'), \
+                         TO_CHAR(CREATED_AT, 'YYYY-MM-DD HH24:MI:SS')) AS UPDATED_AT, \
+                METADATA:label::STRING AS LABEL, \
+                COALESCE((SELECT COUNT(*) FROM OPENBB_AGENTS.{schema}.AGENTS_MESSAGES m \
+                          WHERE m.CONVERSATION_ID = c.CONVERSATION_ID), 0) AS MESSAGE_COUNT \
+         FROM OPENBB_AGENTS.{schema}.AGENTS_CONVERSATIONS c \
+         ORDER BY COALESCE(LAST_UPDATED_AT, CREATED_AT) DESC"
+    );
+
+    let rows = engine.execute_statement(&query).await?;
+    let mut summaries = Vec::new();
+    let mut seen_ids = HashSet::new();
+    if let Some(array) = rows.as_array() {
+        for row in array {
+            let conversation_id = row
+                .get("CONVERSATION_ID")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            if conversation_id.is_empty() {
+                continue;
+            }
+
+            if !seen_ids.insert(conversation_id.clone()) {
+                continue;
+            }
+
+            let label = row
+                .get("LABEL")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let updated_at = row
+                .get("UPDATED_AT")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let message_count = row
+                .get("MESSAGE_COUNT")
+                .map(|value| match value {
+                    Value::Number(num) => num.as_u64().unwrap_or(0) as usize,
+                    Value::String(text) => text.parse::<usize>().unwrap_or(0),
+                    _ => 0,
+                })
+                .unwrap_or(0);
+
+            summaries.push(ConversationSummary {
+                id: conversation_id,
+                label,
+                updated_at,
+                message_count,
+            });
+        }
+    }
+
+    Ok(summaries)
+}
+
+fn print_conversation_summaries(summaries: &[ConversationSummary]) {
+    if summaries.is_empty() {
+        println!("No stored conversations found.\n");
+        return;
+    }
+
+    println!("\n📂 Conversations:");
+    println!(
+        "{:<40} {:<20} {:<10} {}",
+        "Conversation ID", "Last Updated", "Messages", "Label"
+    );
+
+    for summary in summaries {
+        println!(
+            "{:<40} {:<20} {:<10} {}",
+            summary.id,
+            summary.updated_at.as_deref().unwrap_or("-"),
+            summary.message_count,
+            summary.label.as_deref().unwrap_or("(unlabeled)")
+        );
+    }
+    println!();
+}
+
+async fn refresh_conversation_history(
+    engine: &SnowflakeEngine,
+    conversation_id: &str,
+) -> Result<Vec<agents::Message>, String> {
+    let user_name = engine.get_user().await?;
+    engine.setup_user_resources(&user_name).await?;
+    let schema = engine.user_schema_name();
+    let escaped_id = sanitize_sql_string(conversation_id);
+    let query = format!(
+        "SELECT ROLE, CONTENT FROM OPENBB_AGENTS.{schema}.AGENTS_MESSAGES \
+         WHERE CONVERSATION_ID = '{escaped_id}' \
+         ORDER BY TIMESTAMP ASC"
+    );
+    let rows = engine.execute_statement(&query).await?;
+    let mut history = Vec::new();
+    if let Some(array) = rows.as_array() {
+        for row in array {
+            let role = row
+                .get("ROLE")
+                .and_then(|v| v.as_str())
+                .unwrap_or("assistant")
+                .to_string();
+            let content = row
+                .get("CONTENT")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            let message = match role.as_str() {
+                "system" => agents::Message::new_system(content),
+                "assistant" => agents::Message::new_assistant(content),
+                _ => agents::Message::new_user(content),
+            };
+            history.push(message);
+        }
+    }
+    Ok(history)
+}
+
+async fn persist_conversation_message(
+    engine: &SnowflakeEngine,
+    conversation_id: &str,
+    role: &str,
+    content: &str,
+) -> Result<(), String> {
+    let user_name = engine.get_user().await?;
+    engine.setup_user_resources(&user_name).await?;
+    let schema = engine.user_schema_name();
+    let escaped_id = sanitize_sql_string(conversation_id);
+    let escaped_content = sanitize_sql_string(content);
+    let escaped_role = sanitize_sql_string(role);
+    let message_id = Uuid::new_v4().to_string();
+    let query = format!(
+        "INSERT INTO OPENBB_AGENTS.{schema}.AGENTS_MESSAGES \
+         (MESSAGE_ID, CONVERSATION_ID, ROLE, CONTENT) \
+         VALUES ('{message_id}', '{escaped_id}', '{escaped_role}', '{escaped_content}')"
+    );
+    engine.execute_statement(&query).await?;
+
+    let touch_query = format!(
+        "UPDATE OPENBB_AGENTS.{schema}.AGENTS_CONVERSATIONS \
+         SET LAST_UPDATED_AT = CURRENT_TIMESTAMP() \
+         WHERE CONVERSATION_ID = '{escaped_id}'"
+    );
+    engine.execute_statement(&touch_query).await?;
+    Ok(())
+}
+
+async fn clear_conversation_messages(
+    engine: &SnowflakeEngine,
+    conversation_id: &str,
+) -> Result<(), String> {
+    let user_name = engine.get_user().await?;
+    engine.setup_user_resources(&user_name).await?;
+    let schema = engine.user_schema_name();
+    let escaped_id = sanitize_sql_string(conversation_id);
+    let delete_messages = format!(
+        "DELETE FROM OPENBB_AGENTS.{schema}.AGENTS_MESSAGES WHERE CONVERSATION_ID = '{escaped_id}'"
+    );
+    engine.execute_statement(&delete_messages).await?;
+
+    let delete_context = format!(
+        "DELETE FROM OPENBB_AGENTS.{schema}.AGENTS_CONTEXT_OBJECTS WHERE CONVERSATION_ID = '{escaped_id}'"
+    );
+    engine.execute_statement(&delete_context).await?;
+
+    let refresh_convo = format!(
+        "UPDATE OPENBB_AGENTS.{schema}.AGENTS_CONVERSATIONS \
+         SET LAST_UPDATED_AT = CURRENT_TIMESTAMP(), SUMMARY = NULL \
+         WHERE CONVERSATION_ID = '{escaped_id}'"
+    );
+    engine.execute_statement(&refresh_convo).await?;
+    Ok(())
+}
+
+async fn sync_conversation_metadata(
+    engine: &SnowflakeEngine,
+    conversation_id: &str,
+    config: &ConversationConfig,
+) -> Result<(), String> {
+    engine
+        .update_conversation_settings(conversation_id, config.to_metadata())
+        .await?;
+    persist_context_preferences(engine, conversation_id, config).await
+}
+
+async fn build_system_prompt(engine: &SnowflakeEngine) -> String {
+    let database = engine
+        .get_database()
+        .await
+        .unwrap_or_else(|_| "UNKNOWN".to_string());
+    let schema = engine
+        .get_schema()
+        .await
+        .unwrap_or_else(|_| "UNKNOWN".to_string());
+    let user_schema = engine.user_schema_name();
+
+    format!(
+        "You are the OpenBB Cortex Analyst acting against the Snowflake environment. \
+Database context: {database}.{schema}. \
+Conversations, context objects, and attachments must be stored in OPENBB_AGENTS.{user_schema}.AGENTS_CONVERSATIONS, \
+OPENBB_AGENTS.{user_schema}.AGENTS_MESSAGES, and OPENBB_AGENTS.{user_schema}.AGENTS_CONTEXT_OBJECTS. \
+Only reference documents available via DOCUMENT_PARSE_RESULTS, CORTEX_UPLOADS, or AGENTS_CONTEXT_OBJECTS. \
+Always provide concise, accurate answers grounded in Snowflake data."
+    )
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -627,10 +1192,11 @@ async fn main() {
     }
 
     if !env_file_provided {
-        let default_path_str = "/Users/darrenlee/.openbb_platform/.env";
-        let default_path = Path::new(default_path_str);
-        if default_path.exists() {
-            dotenvy::from_path(default_path).expect("Failed to load default .env file");
+        if let Ok(home) = std::env::var("HOME") {
+            let default_path = Path::new(&home).join(".openbb_platform/.env");
+            if default_path.exists() {
+                dotenvy::from_path(&default_path).expect("Failed to load default .env file");
+            }
         }
     }
 
@@ -747,6 +1313,12 @@ async fn main() {
             database,
             schema,
             semantic_model,
+            conversation_id,
+            conversation_label,
+            list_conversations,
+            model,
+            temperature,
+            max_tokens,
             ..
         } => {
             match SnowflakeEngine::new(
@@ -755,6 +1327,25 @@ async fn main() {
             .await
             {
                 Ok(mut engine) => {
+                    if list_conversations {
+                        let current_user = match engine.get_user().await {
+                            Ok(name) => name,
+                            Err(err) => {
+                                println!("✗ Failed to resolve user: {}", err);
+                                return;
+                            }
+                        };
+                        if let Err(err) = engine.setup_user_resources(&current_user).await {
+                            println!("✗ Failed to load conversations: {}", err);
+                        } else {
+                            match fetch_conversation_summaries(&engine).await {
+                                Ok(summaries) => print_conversation_summaries(&summaries),
+                                Err(err) => println!("✗ Failed to list conversations: {}", err),
+                            }
+                        }
+                        return;
+                    }
+
                     engine.configure_from_env().await;
 
                     if let Some(model_path) = semantic_model {
@@ -770,1800 +1361,526 @@ async fn main() {
                         }
                     }
 
-                    if !engine.has_semantic_model_stage() {
-                        println!("✗ No semantic model configured.");
-                        println!("Please either:");
-                        println!(
-                            "  1. Set SNOWFLAKE_FILE and SNOWFLAKE_STAGE environment variables"
-                        );
-                        println!("  2. Use the -m/--semantic-model flag to specify a semantic model file");
-                        return;
-                    }
-
-                    if !engine.is_cortex_enabled() {
-                        println!("✗ Cortex is not enabled. Check your SNOWFLAKE_PASSWORD (PAT).");
-                        return;
-                    }
-
-                    println!("🤖 Cortex Analyst Interactive Chat");
-                    print_chat_help();
-                    let mut lines = io::BufReader::new(io::stdin()).lines();
-                    let mut last_sql: Option<String> = None;
-
-                    loop {
-                        print!("You: ");
-                        use std::io::Write;
-                        std::io::stdout().flush().unwrap();
-
-                        if let Ok(Some(input)) = lines.next_line().await {
-                            let input = input.trim();
-
-                            if input.is_empty() {
-                                continue;
-                            }
-
-                            if handle_common_slash_commands(input, &mut engine).await {
-                                continue;
-                            }
-
-                            match input {
-                                "/exit" => {
-                                    println!("Goodbye!");
-                                    break;
-                                }
-                                "/help" => {
-                                    print_chat_help();
-                                    continue;
-                                }
-                                "/reset" => {
-                                    engine.reset_conversation();
-                                    last_sql = None;
-                                    println!("✓ Conversation history cleared.\n");
-                                    continue;
-                                }
-                                "/history" => {
-                                    let history = engine.get_conversation_history();
-                                    if history.is_empty() {
-                                        println!("No conversation history.\n");
-                                    } else {
-                                        println!("\n📜 Conversation History:");
-                                        for (i, msg) in history.iter().enumerate() {
-                                            println!("{}. {}: {:?}", i + 1, msg.role, msg.content);
-                                        }
-                                        println!();
-                                    }
-                                    continue;
-                                }
-                                "/execute" => {
-                                    if let Some(sql) = &last_sql {
-                                        println!("\n⚡ Executing SQL...\n");
-
-                                        let cleaned_sql = sql
-                                            .lines()
-                                            .filter(|line| !line.trim().starts_with("--"))
-                                            .collect::<Vec<_>>()
-                                            .join("\n")
-                                            .trim()
-                                            .trim_end_matches(';')
-                                            .to_string();
-
-                                        match engine
-                                            .execute_query(&cleaned_sql, None, None, None)
-                                            .await
-                                        {
-                                            Ok(results) => {
-                                                println!(
-                                                    "{}\n",
-                                                    serde_json::to_string_pretty(&results).unwrap()
-                                                );
-                                            }
-                                            Err(e) => println!("✗ Query execution failed: {}\n", e),
-                                        }
-                                    } else {
-                                        println!(
-                                            "✗ No SQL query to execute. Ask a question first.\n"
-                                        );
-                                    }
-                                    continue;
-                                }
-                                "/stage" => {
-                                    let (current_stage, current_file) =
-                                        engine.get_semantic_model_config();
-
-                                    let stage_name = if let Some(stage_path) = current_stage {
-                                        stage_path
-                                            .trim_start_matches('@')
-                                            .split('/')
-                                            .next()
-                                            .and_then(|s| s.split('.').nth(2))
-                                            .unwrap_or("")
-                                    } else {
-                                        ""
-                                    };
-
-                                    let file_name = if let Some(file) = current_file {
-                                        file
-                                    } else if let Some(stage_path) = current_stage {
-                                        stage_path.split('/').nth(1).unwrap_or("")
-                                    } else {
-                                        ""
-                                    };
-
-                                    println!();
-                                    if !stage_name.is_empty() {
-                                        println!("Current stage: {}", stage_name);
-                                    }
-                                    if !file_name.is_empty() {
-                                        println!("Current model: {}", file_name);
-                                    }
-
-                                    match engine.list_stages().await {
-                                        Ok(stages) if !stages.is_empty() => {
-                                            println!("\nAvailable stages:");
-                                            for stage in &stages {
-                                                println!("  - {}", stage);
-                                            }
-                                        }
-                                        _ => {}
-                                    }
-
-                                    println!();
-                                    print!("Enter stage name (e.g., SEMANTIC_MODELS): ");
-                                    std::io::stdout().flush().unwrap();
-
-                                    if let Ok(Some(stage_input)) = lines.next_line().await {
-                                        let stage_input = stage_input.trim();
-
-                                        if stage_input.is_empty() {
-                                            println!("Cancelled.\n");
-                                            continue;
-                                        }
-
-                                        let file = current_file.unwrap_or("semantic_model.yaml");
-                                        engine.switch_semantic_model(
-                                            stage_input.to_string(),
-                                            file.to_string(),
-                                        );
-                                        engine.reset_conversation();
-                                        last_sql = None;
-
-                                        println!("✓ Stage set to: {}", stage_input);
-                                        println!("✓ Conversation history cleared.\n");
-                                    }
-                                    continue;
-                                }
-                                _ => {}
-                            }
-
-                            if input.starts_with("/stage ") {
-                                let (current_stage, current_file) =
-                                    engine.get_semantic_model_config();
-
-                                let stage_name = if let Some(stage_path) = current_stage {
-                                    stage_path
-                                        .trim_start_matches('@')
-                                        .split('/')
-                                        .next()
-                                        .and_then(|s| s.split('.').nth(2))
-                                        .unwrap_or("")
-                                } else {
-                                    ""
-                                };
-
-                                let file_name = if let Some(file) = current_file {
-                                    file
-                                } else if let Some(stage_path) = current_stage {
-                                    stage_path.split('/').nth(1).unwrap_or("")
-                                } else {
-                                    ""
-                                };
-
-                                println!();
-                                if !stage_name.is_empty() {
-                                    println!("Current stage: {}", stage_name);
-                                }
-                                if !file_name.is_empty() {
-                                    println!("Current model: {}", file_name);
-                                }
-
-                                if !stage_name.is_empty() {
-                                    if let Ok(files) = engine.list_files_in_stage(stage_name, false).await {
-                                        let yaml_files: Vec<_> = files
-                                            .iter()
-                                            .filter(|f| {
-                                                f.ends_with(".yaml") || f.ends_with(".yml")
-                                            })
-                                            .collect();
-
-                                        if !yaml_files.is_empty() {
-                                            println!("\nAvailable models in {}:", stage_name);
-                                            for file in &yaml_files {
-                                                println!("  - {}", file);
-                                            }
-                                        }
-                                    }
-                                }
-
-                                println!();
-                                print!("Enter file name (e.g., cybersyn.yaml): ");
-                                std::io::stdout().flush().unwrap();
-
-                                if let Ok(Some(file_input)) = lines.next_line().await {
-                                    let file_input = file_input.trim();
-
-                                    if file_input.is_empty() {
-                                        println!("Cancelled.\n");
-                                        continue;
-                                    }
-
-                                    let stage = if !stage_name.is_empty() {
-                                        stage_name.to_string()
-                                    } else {
-                                        "SEMANTIC_MODELS".to_string()
-                                    };
-
-                                    engine.switch_semantic_model(stage, file_input.to_string());
-                                    engine.reset_conversation();
-                                    last_sql = None;
-
-                                    println!("✓ Model set to: {}", file_input);
-                                    println!("✓ Conversation history cleared.\n");
-                                }
-                                continue;
-                            }
-
-                            if input.starts_with('/') {
-                                println!("✗ Unrecognized command: {}", input);
-                                println!("Type /help to see the list of available commands.\n");
-                                continue;
-                            }
-
-                            match engine.chat_with_analyst(input, true).await {
-                                Ok(response) => {
-                                    println!("\n🤖 Assistant:");
-
-                                    let mut found_sql = false;
-                                    for content in &response.message.content {
-                                        match content {
-                                            engine::CortexResponseContent::Text { text } => {
-                                                println!("{}", text);
-                                            }
-                                            engine::CortexResponseContent::Sql { statement } => {
-                                                println!("\n📝 SQL:\n```sql\n{}\n```", statement);
-                                                last_sql = Some(statement.clone());
-                                                found_sql = true;
-                                            }
-                                            engine::CortexResponseContent::Suggestions {
-                                                suggestions,
-                                            } => {
-                                                println!("\n💡 Suggestions:");
-                                                for (i, suggestion) in
-                                                    suggestions.iter().enumerate()
-                                                {
-                                                    println!("  {}. {}", i + 1, suggestion);
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    if found_sql {
-                                        println!("\n💡 Tip: Type /execute to run this query");
-                                    }
-                                    println!();
-                                }
-                                Err(e) => println!("✗ Error: {}\n", e),
-                            }
-                        }
-                    }
-                }
-                Err(e) => println!("Failed to connect: {}", e),
-            }
-        }
-        Commands::AiComplete {
-            user,
-            password,
-            account,
-            role,
-            warehouse,
-            database,
-            schema,
-            model,
-            temperature,
-            max_tokens,
-            context_file,
-            ..
-        } => {
-            match SnowflakeEngine::new(
-                &user, &password, &account, &role, &warehouse, &database, &schema,
-            )
-            .await
-            {
-                Ok(mut engine) => {
-                    let mut current_model = model;
-                    let mut current_temperature = temperature;
-                    let mut current_max_tokens = max_tokens;
-                    let mut context_text = String::new();
-
-                    // Load context file if provided
-                    if let Some(context_path) = context_file {
-                        match std::fs::read_to_string(&context_path) {
-                            Ok(content) => {
-                                context_text = content;
-                                println!("✓ Loaded context from: {}", context_path.display());
-                            }
-                            Err(e) => {
-                                println!("✗ Failed to load context file: {}", e);
-                                return;
-                            }
-                        }
-                    }
-
-                    println!("🤖 AI_COMPLETE Interactive Session");
-                    println!("Current settings:");
-                    println!("  Model: {}", current_model);
-                    if let Some(temp) = current_temperature {
-                        println!("  Temperature: {}", temp);
-                    } else {
-                        println!("  Temperature: 0.7 (default)");
-                    }
-                    if let Some(max) = current_max_tokens {
-                        println!("  Max tokens: {}", max);
-                    } else {
-                        println!("  Max tokens: 4096 (default)");
-                    }
-                    print_ai_complete_help();
-                    let mut lines = io::BufReader::new(io::stdin()).lines();
-                    let mut conversation_history: Vec<(String, String)> = Vec::new();
-
-                    loop {
-                        print!("Prompt: ");
-                        use std::io::Write;
-                        std::io::stdout().flush().unwrap();
-
-                        if let Ok(Some(input)) = lines.next_line().await {
-                            let input = input.trim();
-
-                            if input.is_empty() {
-                                continue;
-                            }
-
-                            if handle_common_slash_commands(input, &mut engine).await {
-                                continue;
-                            }
-
-                            if input == "/exit" {
-                                println!("Goodbye!");
-                                break;
-                            }
-
-                            if input == "/help" {
-                                print_ai_complete_help();
-                                continue;
-                            }
-
-                            if input == "/reset" {
-                                conversation_history.clear();
-                                println!("✓ Conversation history cleared\n");
-                                continue;
-                            }
-
-                            if input == "/execute" {
-                                println!(
-                                    "Enter SQL query to execute (end with ';' and an empty line):"
-                                );
-                                let mut query_buffer = String::new();
-                                loop {
-                                    match lines.next_line().await {
-                                        Ok(Some(line)) => {
-                                            if line.is_empty() && query_buffer.trim().ends_with(';')
-                                            {
-                                                let query =
-                                                    query_buffer.trim().trim_end_matches(';');
-                                                if !query.trim().is_empty() {
-                                                    println!("\n⚡ Executing SQL...\n");
-                                                    match engine
-                                                        .execute_query(query, None, None, None)
-                                                        .await
-                                                    {
-                                                        Ok(results) => {
-                                                            println!(
-                                                                "{}\n",
-                                                                serde_json::to_string_pretty(
-                                                                    &results
-                                                                )
-                                                                .unwrap()
-                                                            );
-                                                        }
-                                                        Err(e) => println!(
-                                                            "✗ Query execution failed: {}\n",
-                                                            e
-                                                        ),
-                                                    }
-                                                }
-                                                break;
-                                            }
-                                            query_buffer.push_str(&line);
-                                            query_buffer.push('\n');
-                                        }
-                                        Err(_) | Ok(None) => {
-                                            println!("\n✗ Input stream closed. Aborting.");
-                                            break;
-                                        }
-                                    }
-                                }
-                                print!("Prompt: ");
-                                std::io::stdout().flush().unwrap();
-                                continue;
-                            }
-
-                            if input == "/history" {
-                                if conversation_history.is_empty() {
-                                    println!("✗ No conversation history\n");
-                                } else {
-                                    println!("\n📜 Conversation History:");
-                                    for (i, (user_msg, ai_msg)) in
-                                        conversation_history.iter().enumerate()
-                                    {
-                                        println!("\n{}. You: {}", i + 1, user_msg);
-                                        println!("   AI: {}", ai_msg);
-                                    }
-                                    println!();
-                                }
-                                continue;
-                            }
-
-                            if input == "/models" {
-                                println!("\n📋 Querying available models...\n");
-                                match engine.get_available_models().await {
-                                    Ok(models) => {
-                                        println!("Available models:");
-                                        for (name, desc) in models {
-                                            println!("  • {}: {}", name, desc);
-                                        }
-                                    }
-                                    Err(e) => {
-                                        println!("✗ Failed to fetch models: {}", e);
-                                    }
-                                }
-                                println!();
-                                continue;
-                            }
-
-                            if input == "/settings" {
-                                println!("\nCurrent settings:");
-                                println!("  Model: {}", current_model);
-                                if let Some(temp) = current_temperature {
-                                    println!("  Temperature: {}", temp);
-                                } else {
-                                    println!("  Temperature: 0.7 (default)");
-                                }
-                                if let Some(max) = current_max_tokens {
-                                    println!("  Max tokens: {}", max);
-                                } else {
-                                    println!("  Max tokens: 4096 (default)");
-                                }
-                                if !context_text.is_empty() {
-                                    println!("  Context: {} characters loaded", context_text.len());
-                                } else {
-                                    println!("  Context: none");
-                                }
-                                println!();
-                                continue;
-                            }
-
-                            if input == "/show_context" {
-                                if context_text.is_empty() {
-                                    println!("✗ No context loaded\n");
-                                } else {
-                                    println!(
-                                        "\n📄 Current Context ({} chars):",
-                                        context_text.len()
-                                    );
-                                    println!("{}", context_text);
-                                    println!();
-                                }
-                                continue;
-                            }
-
-                            if input == "/clear_context" {
-                                context_text.clear();
-                                println!("✓ Context cleared\n");
-                                continue;
-                            }
-
-                            // Handle slash commands with arguments - AiComplete mode
-                            if input.starts_with("/context ") {
-                                let file_path = input.strip_prefix("/context ").unwrap().trim();
-                                match std::fs::read_to_string(file_path) {
-                                    Ok(content) => {
-                                        context_text = content;
-                                        println!(
-                                            "✓ Loaded context from: {} ({} chars)\n",
-                                            file_path,
-                                            context_text.len()
-                                        );
-                                    }
-                                    Err(e) => {
-                                        println!("✗ Failed to load context file: {}", e);
-                                    }
-                                }
-                                continue;
-                            }
-
-                            if input.starts_with("/model ") {
-                                let new_model = input.strip_prefix("/model ").unwrap().trim();
-                                if !new_model.is_empty() {
-                                    current_model = new_model.to_string();
-                                    println!("✓ Model set to: {}\n", current_model);
-                                } else {
-                                    println!("✗ Invalid model name\n");
-                                }
-                                continue;
-                            }
-
-                            if input.starts_with("/temperature ") {
-                                let temp_str = input.strip_prefix("/temperature ").unwrap().trim();
-                                match temp_str.parse::<f32>() {
-                                    Ok(temp) if (0.0..=1.0).contains(&temp) => {
-                                        current_temperature = Some(temp);
-                                        println!("✓ Temperature set to: {}\n", temp);
-                                    }
-                                    _ => println!("✗ Invalid temperature (must be 0.0-1.0)\n"),
-                                }
-                                continue;
-                            }
-
-                            if input.starts_with("/max_tokens ") {
-                                let tokens_str = input.strip_prefix("/max_tokens ").unwrap().trim();
-                                match tokens_str.parse::<i32>() {
-                                    Ok(tokens) if tokens > 0 => {
-                                        current_max_tokens = Some(tokens);
-                                        println!("✓ Max tokens set to: {}\n", tokens);
-                                    }
-                                    _ => println!(
-                                        "✗ Invalid max_tokens (must be positive integer)\n"
-                                    ),
-                                }
-                                continue;
-                            }
-
-                            if input.starts_with('/') {
-                                println!("✗ Unrecognized command: {}", input);
-                                println!("Type /help to see the list of available commands.\n");
-                                continue;
-                            }
-
-                            // Build conversation context from history
-                            let mut full_prompt = String::new();
-
-                            // Add document context if available
-                            if !context_text.is_empty() {
-                                full_prompt.push_str("DOCUMENT CONTEXT:\n");
-                                full_prompt.push_str(&context_text);
-                                full_prompt.push_str("\n\n");
-                            }
-
-                            // Add conversation history
-                            if !conversation_history.is_empty() {
-                                full_prompt.push_str("CONVERSATION HISTORY:\n");
-                                for (user_msg, ai_msg) in &conversation_history {
-                                    full_prompt.push_str(&format!(
-                                        "User: {}\nAssistant: {}\n\n",
-                                        user_msg, ai_msg
-                                    ));
-                                }
-                            }
-
-                            // Add current question
-                            if !context_text.is_empty() || !conversation_history.is_empty() {
-                                full_prompt.push_str("CURRENT QUESTION:\n");
-                            }
-                            full_prompt.push_str(input);
-
-                            // Build options with higher defaults for long context
-                            let options = {
-                                let mut opts = serde_json::Map::new();
-
-                                // Use higher defaults when context is loaded
-                                let default_max_tokens =
-                                    if !context_text.is_empty() { 4096 } else { 2048 };
-
-                                opts.insert(
-                                    "temperature".to_string(),
-                                    json!(current_temperature.unwrap_or(0.7)),
-                                );
-                                opts.insert(
-                                    "max_tokens".to_string(),
-                                    json!(current_max_tokens.unwrap_or(default_max_tokens)),
-                                );
-
-                                Some(serde_json::Value::Object(opts))
-                            };
-
-                            match engine
-                                .ai_complete(&current_model, &full_prompt, options, None)
-                                .await
-                            {
-                                Ok(response) => {
-                                    println!("\n🤖 Response:\n{}\n", response);
-
-                                    // Add to conversation history
-                                    conversation_history.push((input.to_string(), response));
-
-                                    // Keep only last 10 exchanges to avoid context overflow
-                                    if conversation_history.len() > 10 {
-                                        conversation_history.remove(0);
-                                    }
-                                }
-                                Err(e) => println!("✗ AI_COMPLETE failed: {}\n", e),
-                            }
-                        }
-                    }
-                }
-                Err(e) => println!("Failed to connect: {}", e),
-            }
-        }
-        Commands::Agent {
-            user,
-            password,
-            account,
-            role,
-            warehouse,
-            database,
-            schema,
-            model,
-            temperature,
-            max_tokens,
-            stream,
-            ..
-        } => {
-            match SnowflakeEngine::new(
-                &user, &password, &account, &role, &warehouse, &database, &schema,
-            )
-            .await
-            {
-                Ok(mut engine) => {
-                    let mut agent_client = match engine.create_agents_client() {
-                        Ok(client) => client,
-                        Err(e) => {
-                            println!("✗ Failed to create agents client: {}", e);
+                    let current_user = match engine.get_user().await {
+                        Ok(name) => name,
+                        Err(err) => {
+                            println!("✗ Failed to resolve user: {}", err);
                             return;
                         }
                     };
 
-                    let mut current_model = model;
-                    let mut current_temperature = temperature;
-                    let mut current_max_tokens = max_tokens;
-                    let use_streaming = stream;
+                    if let Err(err) = engine.setup_user_resources(&current_user).await {
+                        println!("✗ Failed to prepare Snowflake resources: {}", err);
+                        return;
+                    }
 
-                    println!("🤖 Cortex Agent Interactive Session");
-                    println!("Current settings:");
-                    println!("  Model: {}", current_model);
-                    println!(
-                        "  Streaming: {}",
-                        if use_streaming { "enabled" } else { "disabled" }
+                    let mut agent_client = agents::AgentsClient::new(
+                        account.clone(),
+                        password.clone(),
+                        database.clone(),
+                        schema.clone(),
                     );
-                    if let Some(temp) = current_temperature {
-                        println!("  Temperature: {}", temp);
+
+                    let mut active_conversation_id = conversation_id
+                        .and_then(|value| {
+                            let trimmed = value.trim().to_string();
+                            if trimmed.is_empty() {
+                                None
+                            } else {
+                                Some(trimmed)
+                            }
+                        })
+                        .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+                    let trimmed_label = conversation_label.and_then(|value| {
+                        let trimmed = value.trim().to_string();
+                        if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed)
+                        }
+                    });
+
+                    let model_supplied = model.is_some();
+                    let initial_model = model.unwrap_or_else(|| "llama3.1-70b".to_string());
+                    let temperature_override = temperature.is_some();
+                    let max_tokens_override = max_tokens.is_some();
+                    let label_override = trimmed_label.is_some();
+
+                    let mut config = ConversationConfig {
+                        label: trimmed_label,
+                        model: initial_model,
+                        temperature,
+                        max_tokens,
+                    };
+
+                    let overrides = ConversationOverrides {
+                        label: label_override,
+                        model: model_supplied,
+                        temperature: temperature_override,
+                        max_tokens: max_tokens_override,
+                    };
+
+                    let metadata_value = config.to_metadata();
+                    let stored_metadata = engine
+                        .get_or_create_conversation(&active_conversation_id, metadata_value)
+                        .await
+                        .unwrap_or_else(|_| config.to_metadata());
+
+                    config.absorb_metadata(&stored_metadata, &overrides);
+                    if let Err(err) = apply_context_preferences(
+                        &engine,
+                        &active_conversation_id,
+                        &mut config,
+                        &overrides,
+                    )
+                    .await
+                    {
+                        println!("✗ Failed to load conversation preferences: {}", err);
                     }
-                    if let Some(max) = current_max_tokens {
-                        println!("  Max tokens: {}", max);
+                    if let Err(err) =
+                        sync_conversation_metadata(&engine, &active_conversation_id, &config).await
+                    {
+                        println!("✗ Failed to sync conversation metadata: {}", err);
                     }
-                    print_agent_help();
+
+                    let history = match refresh_conversation_history(
+                        &engine,
+                        &active_conversation_id,
+                    )
+                    .await
+                    {
+                        Ok(history) => history,
+                        Err(err) => {
+                            println!("✗ Failed to load conversation history: {}", err);
+                            Vec::new()
+                        }
+                    };
+                    agent_client.set_conversation_history(history);
+
+                    if agent_client.get_conversation_history().is_empty() {
+                        let system_prompt = build_system_prompt(&engine).await;
+                        agent_client.add_system_message(&system_prompt);
+                    }
+
+                    println!("🤖 Cortex Chat");
+                    println!("Active conversation: {}", active_conversation_id);
+                    if let Some(label) = &config.label {
+                        println!("Label: {}", label);
+                    }
+                    println!("Model: {}", config.model);
+                    print_chat_help();
+
                     let mut lines = io::BufReader::new(io::stdin()).lines();
+                    let mut last_sql_snippet: Option<String> = None;
 
                     loop {
-                        print!("You: ");
-                        use std::io::Write;
+                        let prompt_label =
+                            config.label.as_deref().unwrap_or(&active_conversation_id);
+                        print!("You ({}): ", prompt_label);
                         std::io::stdout().flush().unwrap();
 
-                        if let Ok(Some(input)) = lines.next_line().await {
-                            let input = input.trim();
+                        let input = match lines.next_line().await {
+                            Ok(Some(line)) => line.trim().to_string(),
+                            _ => break,
+                        };
 
-                            if input.is_empty() {
-                                continue;
-                            }
+                        if input.is_empty() {
+                            continue;
+                        }
 
-                            if handle_common_slash_commands(input, &mut engine).await {
-                                continue;
-                            }
+                        if handle_document_commands(&input, &mut engine).await {
+                            continue;
+                        }
 
-                            if input == "/exit" {
-                                println!("Goodbye!");
-                                break;
-                            }
+                        if handle_common_slash_commands(&input, &mut engine).await {
+                            continue;
+                        }
 
-                            if input == "/help" {
-                                print_agent_help();
-                                continue;
-                            }
+                        if input == "/exit" {
+                            println!("Goodbye!");
+                            break;
+                        }
 
-                            if input == "/reset" {
-                                agent_client.reset_conversation();
-                                println!("✓ Conversation history cleared\n");
-                                continue;
-                            }
+                        if input == "/help" {
+                            print_chat_help();
+                            continue;
+                        }
 
-                            if input == "/execute" {
-                                println!(
-                                    "Enter SQL query to execute (end with ';' and an empty line):"
-                                );
-                                let mut query_buffer = String::new();
-                                loop {
-                                    match lines.next_line().await {
-                                        Ok(Some(line)) => {
-                                            if line.is_empty() && query_buffer.trim().ends_with(';')
-                                            {
-                                                let query =
-                                                    query_buffer.trim().trim_end_matches(';');
-                                                if !query.trim().is_empty() {
-                                                    println!("\n⚡ Executing SQL...\n");
-                                                    match engine
-                                                        .execute_query(query, None, None, None)
-                                                        .await
-                                                    {
-                                                        Ok(results) => {
-                                                            println!(
-                                                                "{}\n",
-                                                                serde_json::to_string_pretty(
-                                                                    &results
-                                                                )
-                                                                .unwrap()
-                                                            );
-                                                        }
-                                                        Err(e) => println!(
-                                                            "✗ Query execution failed: {}\n",
-                                                            e
-                                                        ),
-                                                    }
-                                                }
-                                                break;
-                                            }
-                                            query_buffer.push_str(&line);
-                                            query_buffer.push('\n');
+                        if input == "/history" {
+                            match refresh_conversation_history(&engine, &active_conversation_id)
+                                .await
+                            {
+                                Ok(history) => {
+                                    if history.is_empty() {
+                                        println!("No conversation history.\n");
+                                    } else {
+                                        println!("\n📜 Conversation History:");
+                                        for (idx, message) in history.iter().enumerate() {
+                                            let role = message.role.as_deref().unwrap_or("unknown");
+                                            println!(
+                                                "{}. {}: {}",
+                                                idx + 1,
+                                                role,
+                                                message.get_content()
+                                            );
                                         }
-                                        Err(_) | Ok(None) => {
-                                            println!("\n✗ Input stream closed. Aborting.");
+                                        println!();
+                                    }
+                                }
+                                Err(err) => println!("✗ Failed to fetch history: {}\n", err),
+                            }
+                            continue;
+                        }
+
+                        if input == "/execute" {
+                            if let Some(sql) = &last_sql_snippet {
+                                match engine.execute_query(sql, None, None, None).await {
+                                    Ok(results) => {
+                                        println!(
+                                            "{}\n",
+                                            serde_json::to_string_pretty(&results).unwrap_or_else(
+                                                |_| "<unprintable result>".to_string()
+                                            )
+                                        );
+                                    }
+                                    Err(err) => println!("✗ Query execution failed: {}\n", err),
+                                }
+                            } else if let Some(sql) = prompt_for_sql_input(&mut lines).await {
+                                match engine.execute_query(&sql, None, None, None).await {
+                                    Ok(results) => println!(
+                                        "{}\n",
+                                        serde_json::to_string_pretty(&results)
+                                            .unwrap_or_else(|_| "<unprintable result>".to_string())
+                                    ),
+                                    Err(err) => println!("✗ Query execution failed: {}\n", err),
+                                }
+                            } else {
+                                println!("✗ No SQL to execute. Provide input or ask the assistant for SQL first.\n");
+                            }
+                            continue;
+                        }
+
+                        if let Some(sql_inline) = input.strip_prefix("/execute ") {
+                            let trimmed = sql_inline.trim();
+                            if trimmed.is_empty() {
+                                println!("✗ Usage: /execute <sql>\n");
+                            } else {
+                                match engine.execute_query(trimmed, None, None, None).await {
+                                    Ok(results) => println!(
+                                        "{}\n",
+                                        serde_json::to_string_pretty(&results)
+                                            .unwrap_or_else(|_| "<unprintable result>".to_string())
+                                    ),
+                                    Err(err) => println!("✗ Query execution failed: {}\n", err),
+                                }
+                            }
+                            continue;
+                        }
+
+                        if input == "/reset" {
+                            match clear_conversation_messages(&engine, &active_conversation_id)
+                                .await
+                            {
+                                Ok(_) => {
+                                    agent_client.reset_conversation();
+                                    let system_prompt = build_system_prompt(&engine).await;
+                                    agent_client.add_system_message(&system_prompt);
+                                    println!("✓ Conversation history cleared.\n");
+                                }
+                                Err(err) => println!("✗ Failed to clear conversation: {}\n", err),
+                            }
+                            continue;
+                        }
+
+                        if input == "/conversations" {
+                            match fetch_conversation_summaries(&engine).await {
+                                Ok(summaries) => print_conversation_summaries(&summaries),
+                                Err(err) => println!("✗ Failed to list conversations: {}\n", err),
+                            }
+                            continue;
+                        }
+
+                        if input == "/models" {
+                            print_available_models(&engine).await;
+                            continue;
+                        }
+
+                        if input == "/model" {
+                            println!(
+                                "Current model: {}\nUse /model <name> to switch.\n",
+                                config.model
+                            );
+                            print_available_models(&engine).await;
+                            continue;
+                        }
+
+                        if let Some(target) = input.strip_prefix("/use_conversation ") {
+                            let trimmed = target.trim();
+                            if trimmed.is_empty() {
+                                println!("✗ Usage: /use_conversation <id or label>\n");
+                                continue;
+                            }
+
+                            match fetch_conversation_summaries(&engine).await {
+                                Ok(summaries) => {
+                                    if let Some(summary) = summaries.iter().find(|summary| {
+                                        summary.id == trimmed
+                                            || summary
+                                                .label
+                                                .as_deref()
+                                                .map(|label| label.eq_ignore_ascii_case(trimmed))
+                                                .unwrap_or(false)
+                                    }) {
+                                        active_conversation_id = summary.id.clone();
+                                        config.label = summary.label.clone();
+                                        let metadata = engine
+                                            .get_or_create_conversation(
+                                                &active_conversation_id,
+                                                config.to_metadata(),
+                                            )
+                                            .await
+                                            .unwrap_or_else(|_| config.to_metadata());
+                                        config.absorb_metadata(
+                                            &metadata,
+                                            &ConversationOverrides::default(),
+                                        );
+                                        if let Err(err) = apply_context_preferences(
+                                            &engine,
+                                            &active_conversation_id,
+                                            &mut config,
+                                            &ConversationOverrides::default(),
+                                        )
+                                        .await
+                                        {
+                                            println!(
+                                                "✗ Failed to load conversation preferences: {}",
+                                                err
+                                            );
+                                        }
+                                        if let Err(err) = sync_conversation_metadata(
+                                            &engine,
+                                            &active_conversation_id,
+                                            &config,
+                                        )
+                                        .await
+                                        {
+                                            println!(
+                                                "✗ Failed to sync conversation metadata: {}",
+                                                err
+                                            );
+                                        }
+
+                                        match refresh_conversation_history(
+                                            &engine,
+                                            &active_conversation_id,
+                                        )
+                                        .await
+                                        {
+                                            Ok(history) => {
+                                                agent_client.set_conversation_history(history)
+                                            }
+                                            Err(err) => {
+                                                println!(
+                                                    "✗ Failed to load conversation history: {}",
+                                                    err
+                                                );
+                                                agent_client.reset_conversation();
+                                            }
+                                        }
+
+                                        if agent_client.get_conversation_history().is_empty() {
+                                            let system_prompt = build_system_prompt(&engine).await;
+                                            agent_client.add_system_message(&system_prompt);
+                                        }
+
+                                        println!(
+                                            "✓ Switched to conversation {}",
+                                            active_conversation_id
+                                        );
+                                    } else {
+                                        println!("✗ Conversation not found: {}\n", trimmed);
+                                    }
+                                }
+                                Err(err) => println!("✗ Failed to list conversations: {}\n", err),
+                            }
+                            continue;
+                        }
+
+                        if let Some(label_value) = input.strip_prefix("/label ") {
+                            let trimmed = label_value.trim();
+                            if trimmed.is_empty() {
+                                config.label = None;
+                                println!("✓ Cleared conversation label.\n");
+                            } else {
+                                config.label = Some(trimmed.to_string());
+                                println!("✓ Updated conversation label to '{}'.\n", trimmed);
+                            }
+                            if let Err(err) = sync_conversation_metadata(
+                                &engine,
+                                &active_conversation_id,
+                                &config,
+                            )
+                            .await
+                            {
+                                println!("✗ Failed to update metadata: {}", err);
+                            }
+                            continue;
+                        }
+
+                        if let Some(model_value) = input.strip_prefix("/model ") {
+                            let trimmed = model_value.trim();
+                            if trimmed.is_empty() {
+                                println!("✗ Usage: /model <name>\n");
+                            } else {
+                                config.model = trimmed.to_string();
+                                println!("✓ Model set to {}\n", trimmed);
+                                if let Err(err) = sync_conversation_metadata(
+                                    &engine,
+                                    &active_conversation_id,
+                                    &config,
+                                )
+                                .await
+                                {
+                                    println!("✗ Failed to update metadata: {}", err);
+                                }
+                            }
+                            continue;
+                        }
+
+                        if let Some(temp_value) = input.strip_prefix("/temperature ") {
+                            let trimmed = temp_value.trim();
+                            match trimmed.parse::<f32>() {
+                                Ok(value) if (0.0..=1.0).contains(&value) => {
+                                    config.temperature = Some(value);
+                                    println!("✓ Temperature set to {}\n", value);
+                                    if let Err(err) = sync_conversation_metadata(
+                                        &engine,
+                                        &active_conversation_id,
+                                        &config,
+                                    )
+                                    .await
+                                    {
+                                        println!("✗ Failed to update metadata: {}", err);
+                                    }
+                                }
+                                _ => {
+                                    println!("✗ Temperature must be a number between 0.0 and 1.0\n")
+                                }
+                            }
+                            continue;
+                        }
+
+                        if let Some(token_value) = input.strip_prefix("/max_tokens ") {
+                            let trimmed = token_value.trim();
+                            match trimmed.parse::<i32>() {
+                                Ok(value) if value > 0 => {
+                                    config.max_tokens = Some(value);
+                                    println!("✓ Max tokens set to {}\n", value);
+                                    if let Err(err) = sync_conversation_metadata(
+                                        &engine,
+                                        &active_conversation_id,
+                                        &config,
+                                    )
+                                    .await
+                                    {
+                                        println!("✗ Failed to update metadata: {}", err);
+                                    }
+                                }
+                                _ => println!("✗ max_tokens must be a positive integer\n"),
+                            }
+                            continue;
+                        }
+
+                        if input.starts_with('/') {
+                            println!("✗ Unrecognized command: {}", input);
+                            println!("Type /help to see the list of available commands.\n");
+                            continue;
+                        }
+
+                        let user_message = input.clone();
+                        let mut request_messages = agent_client.get_conversation_history();
+                        request_messages.push(agents::Message::new_user(user_message.clone()));
+                        agent_client.set_conversation_history(request_messages.clone());
+                        if let Err(err) = persist_conversation_message(
+                            &engine,
+                            &active_conversation_id,
+                            "user",
+                            &user_message,
+                        )
+                        .await
+                        {
+                            println!("✗ Failed to record user message: {}", err);
+                        }
+
+                        print!("\n🤖 Assistant: ");
+                        std::io::stdout().flush().unwrap();
+
+                        match agent_client
+                            .stream_complete(
+                                &config.model,
+                                request_messages,
+                                config.temperature,
+                                None,
+                                config.max_tokens,
+                                None,
+                            )
+                            .await
+                        {
+                            Ok((mut stream, metadata)) => {
+                                let mut full_response = String::new();
+                                while let Some(chunk_result) = stream.next().await {
+                                    match chunk_result {
+                                        Ok(chunk) => {
+                                            for choice in chunk.choices {
+                                                if let Some(content) = &choice.delta.text {
+                                                    print!("{}", content);
+                                                    std::io::stdout().flush().unwrap();
+                                                    full_response.push_str(content);
+                                                }
+                                            }
+                                        }
+                                        Err(err) => {
+                                            println!("\n✗ Stream error: {}", err);
                                             break;
                                         }
                                     }
                                 }
-                                print!("You: ");
-                                std::io::stdout().flush().unwrap();
-                                continue;
-                            }
-
-                            if input == "/history" {
-                                let history = agent_client.get_conversation_history();
-                                if history.is_empty() {
-                                    println!("✗ No conversation history\n");
-                                } else {
-                                    println!("\n📜 Conversation History:");
-                                    for (i, msg) in history.iter().enumerate() {
-                                        let role = msg
-                                            .role.as_deref()
-                                            .unwrap_or("unknown");
-                                        println!("\n{}. {}: {}", i + 1, role, msg.get_content());
-                                    }
-                                    println!();
-                                }
-                                continue;
-                            }
-
-                            if input == "/models" {
-                                println!("\n📋 Querying available models...\n");
-                                match engine.get_available_models().await {
-                                    Ok(models) => {
-                                        println!("Available models:");
-                                        for (name, desc) in models {
-                                            println!("  • {}: {}", name, desc);
-                                        }
-                                    }
-                                    Err(e) => {
-                                        println!("✗ Failed to fetch models: {}", e);
-                                    }
-                                }
-                                println!();
-                                continue;
-                            }
-
-                            if input.starts_with("/model ") {
-                                let new_model = input.strip_prefix("/model ").unwrap().trim();
-                                if !new_model.is_empty() {
-                                    current_model = new_model.to_string();
-                                    println!("✓ Model set to: {}\n", current_model);
-                                } else {
-                                    println!("✗ Invalid model name\n");
-                                }
-                                continue;
-                            }
-
-                            if input.starts_with("/temperature ") {
-                                let temp_str = input.strip_prefix("/temperature ").unwrap().trim();
-                                match temp_str.parse::<f32>() {
-                                    Ok(temp) if (0.0..=1.0).contains(&temp) => {
-                                        current_temperature = Some(temp);
-                                        println!("✓ Temperature set to: {}\n", temp);
-                                    }
-                                    _ => println!("✗ Invalid temperature (must be 0.0-1.0)\n"),
-                                }
-                                continue;
-                            }
-
-                            if input.starts_with("/max_tokens ") {
-                                let tokens_str = input.strip_prefix("/max_tokens ").unwrap().trim();
-                                match tokens_str.parse::<i32>() {
-                                    Ok(tokens) if tokens > 0 => {
-                                        current_max_tokens = Some(tokens);
-                                        println!("✓ Max tokens set to: {}\n", tokens);
-                                    }
-                                    _ => println!(
-                                        "✗ Invalid max_tokens (must be positive integer)\n"
-                                    ),
-                                }
-                                continue;
-                            }
-
-                            if input == "/agents" {
-                                match agent_client.list_agents(None, None, None).await {
-                                    Ok(agents) => {
-                                        println!("\n👥 Available Agents:");
-                                        if agents.is_empty() {
-                                            println!("  No agents found.");
-                                        } else {
-                                            for agent in agents {
-                                                println!(
-                                                    "  - ID: {}",
-                                                    agent.id.unwrap_or_default()
-                                                );
-                                                println!("    Name: {}", agent.name);
-                                                println!(
-                                                    "    Description: {}",
-                                                    agent
-                                                        .comment
-                                                        .unwrap_or_else(|| "N/A".to_string())
-                                                );
-                                                println!("    Model: {}", agent.models.model);
-                                                println!(
-                                                    "    Created: {}",
-                                                    agent
-                                                        .created_on
-                                                        .map(|ts| chrono::Local
-                                                            .timestamp_opt(ts, 0)
-                                                            .unwrap()
-                                                            .to_string())
-                                                        .unwrap_or_else(|| "N/A".to_string())
-                                                );
-                                                println!();
-                                            }
-                                        }
-                                    }
-                                    Err(e) => println!("✗ Failed to list agents: {}\n", e),
-                                }
-                                continue;
-                            }
-
-                            if input == "/sessions" {
-                                print!("Enter agent ID: ");
-                                std::io::stdout().flush().unwrap();
-                                if let Ok(Some(agent_id_input)) = lines.next_line().await {
-                                    let agent_id = agent_id_input.trim();
-                                    if agent_id.is_empty() {
-                                        println!("✗ Agent ID cannot be empty.\n");
-                                        continue;
-                                    }
-
-                                    match agent_client.list_sessions(agent_id).await {
-                                        Ok(sessions) => {
-                                            println!("\n💬 Sessions:");
-                                            if sessions.is_empty() {
-                                                println!(
-                                                    "  No sessions found for agent {}.",
-                                                    agent_id
-                                                );
-                                            } else {
-                                                for session in sessions {
-                                                    println!(
-                                                        "  - ID: {}",
-                                                        session.id.unwrap_or_default()
-                                                    );
-                                                    println!("    Agent ID: {}", session.agent_id);
-                                                    println!(
-                                                        "    Created: {}",
-                                                        session
-                                                            .created_on
-                                                            .map(|ts| chrono::Local
-                                                                .timestamp_opt(ts, 0)
-                                                                .unwrap()
-                                                                .to_string())
-                                                            .unwrap_or_else(|| "N/A".to_string())
-                                                    );
-                                                    println!();
-                                                }
-                                            }
-                                        }
-                                        Err(e) => println!("✗ Failed to list sessions: {}\n", e),
-                                    }
-                                }
-                                continue;
-                            }
-
-                            if input.starts_with("/get_agent ") {
-                                let agent_id = input.strip_prefix("/get_agent ").unwrap().trim();
-                                if !agent_id.is_empty() {
-                                    match agent_client.get_agent(agent_id).await {
-                                        Ok(agent) => {
-                                            println!("\n👥 Agent Details:");
-                                            println!("  ID: {}", agent.id.unwrap_or_default());
-                                            println!("  Name: {}", agent.name);
-                                            println!(
-                                                "  Description: {}",
-                                                agent.comment.unwrap_or_else(|| "N/A".to_string())
-                                            );
-                                            println!("  Model: {}", agent.models.model);
-                                            println!(
-                                                "  Created: {}",
-                                                agent
-                                                    .created_on
-                                                    .map(|ts| chrono::Local
-                                                        .timestamp_opt(ts, 0)
-                                                        .unwrap()
-                                                        .to_string())
-                                                    .unwrap_or_else(|| "N/A".to_string())
-                                            );
-                                            println!();
-                                        }
-                                        Err(e) => println!("✗ Failed to get agent: {}\n", e),
-                                    }
-                                } else {
-                                    println!("✗ Usage: /get_agent <id>\n");
-                                }
-                                continue;
-                            }
-
-                            if input.starts_with("/delete_agent ") {
-                                let agent_id = input.strip_prefix("/delete_agent ").unwrap().trim();
-                                if !agent_id.is_empty() {
-                                    match agent_client.delete_agent(agent_id, None).await {
-                                        Ok(_) => println!("✓ Agent {} deleted.\n", agent_id),
-                                        Err(e) => println!("✗ Failed to delete agent: {}\n", e),
-                                    }
-                                } else {
-                                    println!("✗ Usage: /delete_agent <id>\n");
-                                }
-                                continue;
-                            }
-
-                            if input == "/create_agent" {
-                                println!("\n➕ Creating new agent:");
-                                print!("  Agent Name: ");
-                                std::io::stdout().flush().unwrap();
-                                let name = if let Ok(Some(n)) = lines.next_line().await {
-                                    n.trim().to_string()
-                                } else {
-                                    "".to_string()
-                                };
-
-                                print!("  Agent Description (optional): ");
-                                std::io::stdout().flush().unwrap();
-                                let description = if let Ok(Some(d)) = lines.next_line().await {
-                                    let d_trim = d.trim();
-                                    if d_trim.is_empty() {
-                                        None
-                                    } else {
-                                        Some(d_trim.to_string())
-                                    }
-                                } else {
-                                    None
-                                };
-
-                                print!("  Agent Model (default: {}): ", current_model);
-                                std::io::stdout().flush().unwrap();
-                                let model = if let Ok(Some(m)) = lines.next_line().await {
-                                    let m_trim = m.trim();
-                                    if m_trim.is_empty() {
-                                        current_model.clone()
-                                    } else {
-                                        m_trim.to_string()
-                                    }
-                                } else {
-                                    current_model.clone()
-                                };
-
-                                if name.is_empty() {
-                                    println!("✗ Agent name cannot be empty. Cancelled.\n");
-                                    continue;
-                                }
-
-                                let model_config = agents::ModelConfig {
-                                    model: model.clone(),
-                                    temperature: current_temperature,
-                                    top_p: None,
-                                    max_tokens: current_max_tokens,
-                                };
-
-                                let instructions = agents::AgentInstructions {
-                                    response: "You are a helpful assistant.".to_string(), // Default instruction
-                                    orchestration: None,
-                                    system: None,
-                                    sample_questions: None,
-                                };
-
-                                let create_req = agents::CreateAgentRequest {
-                                    name: name.clone(),
-                                    comment: description,
-                                    profile: None, // No profile input for now
-                                    models: model_config,
-                                    instructions,
-                                    orchestration: None,
-                                    tools: None,
-                                    tool_resources: None,
-                                };
-
-                                match agent_client.create_agent(create_req, None).await {
-                                    Ok(agent) => println!(
-                                        "✓ Agent created with ID: {}\n",
-                                        agent.id.unwrap_or_default()
-                                    ),
-                                    Err(e) => println!("✗ Failed to create agent: {}\n", e),
-                                }
-                                continue;
-                            }
-
-                            if input.starts_with("/create_agent_from_file ") {
-                                let file_path = input
-                                    .strip_prefix("/create_agent_from_file ")
-                                    .unwrap()
-                                    .trim();
-                                if !file_path.is_empty() {
-                                    match agent_client.create_agent_from_file(file_path, None).await
+                                println!("\n");
+                                agent_client.update_metadata_and_stats(metadata);
+                                if !full_response.is_empty() {
+                                    agent_client.add_assistant_response(full_response.clone());
+                                    if let Err(err) = persist_conversation_message(
+                                        &engine,
+                                        &active_conversation_id,
+                                        "assistant",
+                                        &full_response,
+                                    )
+                                    .await
                                     {
-                                        Ok(agent) => println!(
-                                            "✓ Agent created from file with ID: {}\n",
-                                            agent.id.unwrap_or_default()
-                                        ),
-                                        Err(e) => {
-                                            println!("✗ Failed to create agent from file: {}\n", e)
-                                        }
+                                        println!("✗ Failed to record assistant message: {}", err);
                                     }
-                                } else {
-                                    println!("✗ Usage: /create_agent_from_file <file_path>\n");
-                                }
-                                continue;
-                            }
-
-                            if input.starts_with("/update_agent ") {
-                                let parts: Vec<&str> = input.splitn(2, ' ').collect();
-                                if parts.len() == 2 {
-                                    let agent_id = parts[1].trim();
-                                    println!("\n✏️ Updating agent {}:", agent_id);
-
-                                    print!("  New Name (press Enter to keep current): ");
-                                    std::io::stdout().flush().unwrap();
-                                    let name = if let Ok(Some(n)) = lines.next_line().await {
-                                        let n_trim = n.trim();
-                                        if n_trim.is_empty() {
-                                            None
-                                        } else {
-                                            Some(n_trim.to_string())
-                                        }
-                                    } else {
-                                        None
-                                    };
-
-                                    print!("  New Description (press Enter to keep current): ");
-                                    std::io::stdout().flush().unwrap();
-                                    let description = if let Ok(Some(d)) = lines.next_line().await {
-                                        let d_trim = d.trim();
-                                        if d_trim.is_empty() {
-                                            None
-                                        } else {
-                                            Some(d_trim.to_string())
-                                        }
-                                    } else {
-                                        None
-                                    };
-
-                                    print!("  New Model (press Enter to keep current): ");
-                                    std::io::stdout().flush().unwrap();
-                                    let model = if let Ok(Some(m)) = lines.next_line().await {
-                                        let m_trim = m.trim();
-                                        if m_trim.is_empty() {
-                                            None
-                                        } else {
-                                            Some(m_trim.to_string())
-                                        }
-                                    } else {
-                                        None
-                                    };
-
-                                    let mut update_req = agents::UpdateAgentRequest {
-                                        name,
-                                        comment: description,
-                                        profile: None,
-                                        models: None,
-                                        instructions: None,
-                                        orchestration: None,
-                                        tools: None,
-                                        tool_resources: None,
-                                    };
-
-                                    if let Some(m) = model {
-                                        update_req.models = Some(agents::ModelConfig {
-                                            model: m,
-                                            temperature: current_temperature,
-                                            top_p: None,
-                                            max_tokens: current_max_tokens,
-                                        });
-                                    }
-
-                                    match agent_client.update_agent(agent_id, update_req).await {
-                                        Ok(agent) => println!(
-                                            "✓ Agent {} updated.\n",
-                                            agent.id.unwrap_or_default()
-                                        ),
-                                        Err(e) => println!("✗ Failed to update agent: {}\n", e),
-                                    }
-                                } else {
-                                    println!("✗ Usage: /update_agent <id>\n");
-                                }
-                                continue;
-                            }
-
-                            if input == "/sessions" {
-                                print!("Enter agent ID (press Enter for default agent): ");
-                                std::io::stdout().flush().unwrap();
-                                if let Ok(Some(agent_id_input)) = lines.next_line().await {
-                                    let agent_id = if agent_id_input.trim().is_empty() {
-                                        None
-                                    } else {
-                                        Some(agent_id_input.trim().to_string())
-                                    };
-
-                                    match agent_client.list_sessions(&agent_id.unwrap()).await {
-                                        Ok(sessions) => {
-                                            println!("\n💬 Sessions:");
-                                            if sessions.is_empty() {
-                                                println!("  No sessions found.");
-                                            } else {
-                                                for session in sessions {
-                                                    println!("  - ID: {}", session.id.unwrap());
-                                                    println!("    Agent ID: {}", session.agent_id);
-                                                    println!(
-                                                        "    Created: {}",
-                                                        session.created_on.unwrap()
-                                                    );
-                                                    println!();
-                                                }
-                                            }
-                                        }
-                                        Err(e) => println!("✗ Failed to list sessions: {}\n", e),
-                                    }
-                                }
-                                continue;
-                            }
-
-                            if input.starts_with("/get_session ") {
-                                let session_id =
-                                    input.strip_prefix("/get_session ").unwrap().trim();
-                                if !session_id.is_empty() {
-                                    match agent_client.get_session(session_id).await {
-                                        Ok(session) => {
-                                            println!("\n💬 Session Details:");
-                                            println!("  ID: {}", session.id.unwrap().trim());
-                                            println!("  Agent ID: {}", session.agent_id);
-                                            println!("  Created: {}", session.created_on.unwrap());
-                                            println!();
-                                        }
-                                        Err(e) => println!("✗ Failed to get session: {}\n", e),
-                                    }
-                                } else {
-                                    println!("✗ Usage: /get_session <id>\n");
-                                }
-                                continue;
-                            }
-
-                            if input.starts_with("/delete_session ") {
-                                let session_id =
-                                    input.strip_prefix("/delete_session ").unwrap().trim();
-                                if !session_id.is_empty() {
-                                    match agent_client.delete_session(session_id).await {
-                                        Ok(_) => println!("✓ Session {} deleted.\n", session_id),
-                                        Err(e) => println!("✗ Failed to delete session: {}\n", e),
-                                    }
-                                } else {
-                                    println!("✗ Usage: /delete_session <id>\n");
-                                }
-                                continue;
-                            }
-
-                            if input == "/create_session" {
-                                println!("\n➕ Creating new session:");
-                                print!("  Agent ID: ");
-                                std::io::stdout().flush().unwrap();
-                                let agent_id_input = if let Ok(Some(id)) = lines.next_line().await {
-                                    id.trim().to_string()
-                                } else {
-                                    "".to_string()
-                                };
-
-                                if agent_id_input.is_empty() {
-                                    println!("✗ Agent ID cannot be empty. Cancelled.\n");
-                                    continue;
-                                }
-
-                                match agent_client.create_session(&agent_id_input, None).await {
-                                    Ok(session) => println!(
-                                        "✓ Session created with ID: {}\n",
-                                        session.id.unwrap_or_default()
-                                    ),
-                                    Err(e) => println!("✗ Failed to create session: {}\n", e),
-                                }
-                                continue;
-                            }
-
-                            if input.starts_with("/send_to_session ") {
-                                let parts: Vec<&str> = input.splitn(2, ' ').collect();
-                                if parts.len() == 2 {
-                                    let session_id = parts[1].trim();
-                                    print!("Message: ");
-                                    std::io::stdout().flush().unwrap();
-                                    if let Ok(Some(message)) = lines.next_line().await {
-                                        let message_trim = message.trim();
-                                        if !message_trim.is_empty() {
-                                            match agent_client
-                                                .send_message(session_id, message_trim)
-                                                .await
-                                            {
-                                                Ok(_) => println!(
-                                                    "✓ Message sent to session {}.\n",
-                                                    session_id
-                                                ),
-                                                Err(e) => {
-                                                    println!("✗ Failed to send message: {}\n", e)
-                                                }
-                                            }
-                                        } else {
-                                            println!("✗ Message cannot be empty. Cancelled.\n");
-                                        }
-                                    }
-                                } else {
-                                    println!("✗ Usage: /send_to_session <session_id>\n");
-                                }
-                                continue;
-                            }
-
-                            if input.starts_with("/list_messages ") {
-                                let session_id =
-                                    input.strip_prefix("/list_messages ").unwrap().trim();
-                                if !session_id.is_empty() {
-                                    match agent_client.list_messages(session_id).await {
-                                        Ok(messages) => {
-                                            println!("\n✉️ Messages in session {}:", session_id);
-                                            if messages.is_empty() {
-                                                println!("  No messages found.");
-                                            } else {
-                                                for msg in messages {
-                                                    let role = msg.role;
-                                                    println!("  - {}: {:?}", role, msg.content);
-                                                }
-                                            }
-                                            println!();
-                                        }
-                                        Err(e) => println!("✗ Failed to list messages: {}\n", e),
-                                    }
-                                } else {
-                                    println!("✗ Usage: /list_messages <session_id>\n");
-                                }
-                                continue;
-                            }
-
-                            if input.starts_with("/get_message ") {
-                                let parts: Vec<&str> = input
-                                    .strip_prefix("/get_message ")
-                                    .unwrap()
-                                    .splitn(1, ' ')
-                                    .collect();
-                                if parts.len() == 1 {
-                                    let session_id = parts[0].trim();
-                                    print!("Message ID: ");
-                                    std::io::stdout().flush().unwrap();
-                                    let message_id = if let Ok(Some(id)) = lines.next_line().await {
-                                        id.trim().to_string()
-                                    } else {
-                                        "".to_string()
-                                    };
-
-                                    if message_id.is_empty() {
-                                        println!("✗ Message ID cannot be empty. Cancelled.\n");
-                                        continue;
-                                    }
-
-                                    match agent_client.get_message(session_id, &message_id).await {
-                                        Ok(msg) => {
-                                            println!("\n✉️ Message Details:");
-                                            println!("  ID: {}", msg.id.unwrap_or_default());
-                                            println!("  Session ID: {}", msg.session_id);
-                                            println!("  Role: {}", msg.role);
-                                            println!("  Content: {:?}", msg.content);
-                                            println!(
-                                                "  Created: {}",
-                                                msg.created_on
-                                                    .map(|ts| chrono::Local
-                                                        .timestamp_opt(ts, 0)
-                                                        .unwrap()
-                                                        .to_string())
-                                                    .unwrap_or_else(|| "N/A".to_string())
-                                            );
-                                            println!();
-                                        }
-                                        Err(e) => println!("✗ Failed to get message: {}\n", e),
-                                    }
-                                } else {
-                                    println!("✗ Usage: /get_message <session_id>\n");
-                                }
-                                continue;
-                            }
-
-                            if input == "/usage" {
-                                println!(
-                                    "\n📊 API Usage Statistics:\n{}",
-                                    agent_client.get_usage_report()
-                                );
-                                continue;
-                            }
-
-                            if input == "/tools" {
-                                println!("\n🔧 Function Calling Tools: (Not yet implemented)\n");
-                                continue;
-                            }
-
-                            if input.starts_with("/system ") {
-                                let system_message = input.strip_prefix("/system ").unwrap().trim();
-                                if !system_message.is_empty() {
-                                    agent_client.add_system_message(system_message);
-                                    println!("✓ System message added.\n");
-                                } else {
-                                    println!("✗ Usage: /system <message>\n");
-                                }
-                                continue;
-                            }
-
-                            if input == "/current" {
-                                println!("\n📍 Current Context:");
-                                println!("  Account: {}", engine.get_current_account());
-                                println!("  Database: {}", engine.get_current_database());
-                                println!("  Schema: {}", engine.get_current_schema());
-                                println!();
-                                continue;
-                            }
-
-                            if input == "/databases" {
-                                match engine.list_databases().await {
-                                    Ok(databases) => {
-                                        println!("\n📚 Accessible Databases:");
-                                        for db in databases {
-                                            let marker = if db == engine.get_current_database() {
-                                                " (current)"
-                                            } else {
-                                                ""
-                                            };
-                                            println!("  - {}{}", db, marker);
-                                        }
-                                        println!();
-                                    }
-                                    Err(e) => println!("✗ Failed to list databases: {}\n", e),
-                                }
-                                continue;
-                            }
-
-                            if input == "/schemas" {
-                                print!("Database name (press Enter for current): ");
-                                std::io::stdout().flush().unwrap();
-                                if let Ok(Some(db_input)) = lines.next_line().await {
-                                    let db = if db_input.trim().is_empty() {
-                                        None
-                                    } else {
-                                        Some(db_input.trim())
-                                    };
-                                    match engine.list_schemas(db).await {
-                                        Ok(schemas) => {
-                                            let db_name =
-                                                db.unwrap_or(engine.get_current_database());
-                                            println!("\n📂 Schemas in {}:", db_name);
-                                            for s in schemas {
-                                                let marker = if s == engine.get_current_schema()
-                                                    && db.is_none()
-                                                {
-                                                    " (current)"
-                                                } else {
-                                                    ""
-                                                };
-                                                println!("  - {}{}", s, marker);
-                                            }
-                                            println!();
-                                        }
-                                        Err(e) => println!("✗ Failed to list schemas: {}\n", e),
-                                    }
-                                }
-                                continue;
-                            }
-
-                            if input == "/warehouses" {
-                                match engine.list_warehouses().await {
-                                    Ok(warehouses) => {
-                                        println!("\n🏢 Accessible Warehouses:");
-                                        for wh in warehouses {
-                                            println!("  - {}", wh);
-                                        }
-                                        println!();
-                                    }
-                                    Err(e) => println!("✗ Failed to list warehouses: {}\n", e),
-                                }
-                                continue;
-                            }
-
-                            if input == "/tables" {
-                                match engine.get_table_list().await {
-                                    Ok(tables) => {
-                                        println!(
-                                            "\n📋 Tables in {}.{}:",
-                                            engine.get_current_database(),
-                                            engine.get_current_schema()
-                                        );
-                                        for table in tables {
-                                            println!("  - {}", table);
-                                        }
-                                        println!();
-                                    }
-                                    Err(e) => println!("✗ Failed to list tables: {}\n", e),
-                                }
-                                continue;
-                            }
-
-                            if input == "/all_tables" {
-                                println!("\n🔍 Fetching all accessible tables (this may take a moment)...\n");
-                                match engine.list_all_tables().await {
-                                    Ok(tables) => {
-                                        let mut current_db = String::new();
-                                        let mut current_schema = String::new();
-                                        for (db, schema, table) in tables {
-                                            if db != current_db {
-                                                current_db = db.clone();
-                                                current_schema.clear();
-                                                println!("\n{}:", db);
-                                            }
-                                            if schema != current_schema {
-                                                current_schema = schema.clone();
-                                                println!("  {}:", schema);
-                                            }
-                                            println!("    - {}", table);
-                                        }
-                                        println!();
-                                    }
-                                    Err(e) => println!("✗ Failed to list all tables: {}\n", e),
-                                }
-                                continue;
-                            }
-
-                            if input.starts_with("/use_database ") {
-                                let db_name = input.strip_prefix("/use_database ").unwrap().trim();
-                                if !db_name.is_empty() {
-                                    match engine.use_database(db_name).await {
-                                        Ok(_) => println!("✓ Switched to database: {}\n", db_name),
-                                        Err(e) => println!("✗ Failed to switch database: {}\n", e),
-                                    }
-                                }
-                                continue;
-                            }
-
-                            if input.starts_with("/use_warehouse ") {
-                                let wh_name = input.strip_prefix("/use_warehouse ").unwrap().trim();
-                                if !wh_name.is_empty() {
-                                    match engine.use_warehouse(wh_name).await {
-                                        Ok(_) => println!("✓ Switched to warehouse: {}\n", wh_name),
-                                        Err(e) => println!("✗ Failed to switch warehouse: {}\n", e),
-                                    }
-                                }
-                                continue;
-                            }
-
-                            if input.starts_with("/use_schema ") {
-                                let schema_name =
-                                    input.strip_prefix("/use_schema ").unwrap().trim();
-                                if !schema_name.is_empty() {
-                                    match engine.use_schema(schema_name).await {
-                                        Ok(_) => {
-                                            println!("✓ Switched to schema: {}\n", schema_name)
-                                        }
-                                        Err(e) => println!("✗ Failed to switch schema: {}\n", e),
-                                    }
-                                }
-                                continue;
-                            }
-
-                            if input.starts_with('/') {
-                                println!("✗ Unrecognized command: {}", input);
-                                println!("Type /help to see the list of available commands.\n");
-                                continue;
-                            }
-                            // Process user message
-                            if use_streaming {
-                                print!("\n🤖 Assistant: ");
-                                std::io::stdout().flush().unwrap();
-
-                                match agent_client
-                                    .stream_complete(
-                                        &current_model,
-                                        vec![agents::Message::new_user(input.to_string())],
-                                        current_temperature,
-                                        None, // top_p
-                                        current_max_tokens,
-                                        None, // tools
+                                    if let Err(err) = sync_conversation_metadata(
+                                        &engine,
+                                        &active_conversation_id,
+                                        &config,
                                     )
                                     .await
-                                {
-                                    Ok((mut stream, mut metadata)) => {
-                                        let mut full_response = String::new();
-                                        let mut last_chunk_had_usage = false;
-
-                                        while let Some(chunk_result) = stream.next().await {
-                                            match chunk_result {
-                                                Ok(chunk) => {
-                                                    // Update metadata with actual values from chunk
-                                                    if metadata.request_id.is_empty()
-                                                        && !chunk.id.is_empty()
-                                                    {
-                                                        metadata.request_id = chunk.id.clone();
-                                                        metadata.model = chunk.model.clone();
-                                                    }
-
-                                                    // Capture usage from last chunk
-                                                    if let Some(usage) = chunk.usage {
-                                                        metadata.usage = Some(usage);
-                                                        last_chunk_had_usage = true;
-                                                    }
-
-                                                    for choice in chunk.choices {
-                                                        // The role is not streamed in the delta, it's part of the initial message.
-                                                        // If we need to display the role, it should be handled before the streaming loop
-                                                        // or derived from the overall conversation context.
-                                                        // For now, remove the attempt to access choice.delta.role.
-
-                                                        if let Some(content) = &choice.delta.text {
-                                                            // Changed from .content to .text
-                                                            print!("{}", content);
-                                                            std::io::stdout().flush().unwrap();
-                                                            full_response.push_str(content);
-                                                        }
-
-                                                        // Check for finish reason
-                                                        if let Some(finish_reason) =
-                                                            &choice.finish_reason
-                                                        {
-                                                            println!(
-                                                                "\n[Finished: {}]",
-                                                                finish_reason
-                                                            );
-                                                        }
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    println!("\n✗ Stream error: {}", e);
-                                                    break;
-                                                }
-                                            }
-                                        }
-
-                                        // Add assistant response to history after streaming completes
-                                        if !full_response.is_empty() {
-                                            agent_client.add_assistant_response(full_response);
-                                        }
-
-                                        // Update usage stats if we got usage data
-                                        if last_chunk_had_usage {
-                                            agent_client.update_metadata_and_stats(metadata);
-                                        }
-
-                                        println!("\n");
+                                    {
+                                        println!("✗ Failed to update metadata: {}", err);
                                     }
-                                    Err(e) => println!("\n✗ Error: {}\n", e),
-                                }
-                            } else {
-                                match agent_client
-                                    .complete(
-                                        &current_model,
-                                        input,
-                                        true,
-                                        current_temperature,
-                                        None,
-                                        current_max_tokens,
-                                    )
-                                    .await
-                                {
-                                    Ok(response) => {
-                                        if let Some(choice) = response.choices.first() {
-                                            let content = choice.message.get_content();
-
-                                            println!("\n🤖 Assistant: {}\n", content);
-
-                                            // Display tool calls if present
-                                            if let Some(tool_calls) = &choice.tool_calls {
-                                                println!("🔧 Tool Calls:");
-                                                for call in tool_calls {
-                                                    println!("  ID: {}", call.id);
-                                                    println!("  Type: {}", call.tool_type);
-                                                    println!("  Function: {}", call.function.name);
-                                                    println!(
-                                                        "  Arguments: {}",
-                                                        call.function.arguments
-                                                    );
-                                                }
-                                                println!();
-                                            }
-
-                                            // Get and display metadata
-                                            if let Some(metadata) = agent_client.get_last_metadata()
-                                            {
-                                                println!("ℹ️  Metadata:");
-                                                println!("   ID: {}", metadata.request_id);
-                                                println!("   Model: {}", metadata.model);
-                                                println!("   Created: {}", metadata.created);
-                                                println!("   Object: {}", metadata.object);
-                                                println!("   Choice Index: {}", choice.index);
-                                                if let Some(finish_reason) = &choice.finish_reason {
-                                                    println!("   Finish Reason: {}", finish_reason);
-                                                }
-                                                if let Some(usage) = &metadata.usage {
-                                                    println!("   Tokens: {} prompt + {} completion = {} total",
-                                                        usage.prompt_tokens, usage.completion_tokens, usage.total_tokens);
-                                                }
-                                            }
-                                            println!();
-                                        }
+                                    if let Some(snippet) = extract_last_sql_snippet(&full_response)
+                                    {
+                                        last_sql_snippet = Some(snippet);
                                     }
-                                    Err(e) => println!("\n✗ Error: {}\n", e),
                                 }
                             }
+                            Err(err) => println!("\n✗ Error: {}\n", err),
                         }
                     }
                 }
                 Err(e) => println!("Failed to connect: {}", e),
             }
-        }
-        Commands::ListDatabases {
-            user,
-            password,
-            account,
-            role,
-            warehouse,
-            database,
-            schema,
-            ..
-        } => {
-            match SnowflakeEngine::new(
-                &user, &password, &account, &role, &warehouse, &database, &schema,
-            )
-            .await
-            {
-                Ok(engine) => match engine.list_databases().await {
-                    Ok(databases) => {
-                        println!("Accessible databases:");
-                        for db in databases {
-                            println!("  - {}", db);
-                        }
-                    }
-                    Err(e) => println!("Failed to list databases: {}", e),
-                },
-                Err(e) => println!("Failed to connect: {}", e),
-            }
-        }
-        Commands::ListSchemas {
-            user,
-            password,
-            account,
-            role,
-            warehouse,
-            database,
-            schema,
-            target_database,
-            ..
-        } => {
-            match SnowflakeEngine::new(
-                &user, &password, &account, &role, &warehouse, &database, &schema,
-            )
-            .await
-            {
-                Ok(engine) => match engine.list_schemas(target_database.as_deref()).await {
-                    Ok(schemas) => {
-                        let db_name = target_database.as_ref().unwrap_or(&database);
-                        println!("Schemas in {}:", db_name);
-                        for s in schemas {
-                            println!("  - {}", s);
-                        }
-                    }
-                    Err(e) => println!("Failed to list schemas: {}", e),
-                },
-                Err(e) => println!("Failed to connect: {}", e),
-            }
-        }
-        Commands::ListWarehouses {
-            user,
-            password,
-            account,
-            role,
-            warehouse,
-            database,
-            schema,
-            ..
-        } => {
-            match SnowflakeEngine::new(
-                &user, &password, &account, &role, &warehouse, &database, &schema,
-            )
-            .await
-            {
-                Ok(engine) => match engine.list_warehouses().await {
-                    Ok(warehouses) => {
-                        println!("Accessible warehouses:");
-                        for wh in warehouses {
-                            println!("  - {}", wh);
-                        }
-                    }
-                    Err(e) => println!("Failed to list warehouses: {}", e),
-                },
-                Err(e) => println!("Failed to connect: {}", e),
-            }
-        }
-        Commands::ListAllTables {
-            user,
-            password,
-            account,
-            role,
-            warehouse,
-            database,
-            schema,
-            ..
-        } => {
-            match SnowflakeEngine::new(
-                &user, &password, &account, &role, &warehouse, &database, &schema,
-            )
-            .await
-            {
-                Ok(engine) => {
-                    println!("Fetching all accessible tables... (this may take a moment)");
-                    match engine.list_all_tables().await {
-                        Ok(tables) => {
-                            println!("\nAll accessible tables:");
-                            let mut current_db = String::new();
-                            let mut current_schema = String::new();
-
-                            for (db, schema, table) in tables {
-                                if db != current_db {
-                                    current_db = db.clone();
-                                    current_schema.clear();
-                                    println!("\n{}:", db);
-                                }
-                                if schema != current_schema {
-                                    current_schema = schema.clone();
-                                    println!("  {}:", schema);
-                                }
-                                println!("    - {}", table);
-                            }
-                        }
-                        Err(e) => println!("Failed to list all tables: {}", e),
-                    }
-                }
-                Err(e) => println!("Failed to connect: {}", e),
-            }
-        }
-    }
-
-    // After all commands have potentially run and the engine has been used,
-    // attempt to close the cache connection if it was initialized.
-    if let Some(cache_arc_mutex) = engine::CACHE_DB.get() {
-        let mut cache_guard = cache_arc_mutex.lock().await;
-        if let Err(e) = cache_guard.close().await {
-            eprintln!("Error closing cache connection: {}", e);
         }
     }
 }

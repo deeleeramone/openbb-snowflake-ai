@@ -134,7 +134,7 @@ impl Tool {
     fn new(tool_spec: ToolSpec) -> Self {
         Tool { tool_spec }
     }
-    
+
     /// Create a Tool from a JSON string
     #[staticmethod]
     fn from_json(json_str: &str) -> PyResult<Self> {
@@ -161,8 +161,18 @@ pub struct ToolSpec {
 impl ToolSpec {
     #[new]
     #[pyo3(signature = (name, description, input_schema, tool_type="function".to_string()))]
-    fn new(name: String, description: String, input_schema: ToolInputSchema, tool_type: String) -> Self {
-        ToolSpec { tool_type, name, description, input_schema }
+    fn new(
+        name: String,
+        description: String,
+        input_schema: ToolInputSchema,
+        tool_type: String,
+    ) -> Self {
+        ToolSpec {
+            tool_type,
+            name,
+            description,
+            input_schema,
+        }
     }
 }
 
@@ -188,10 +198,14 @@ pub struct ToolInputSchema {
 impl ToolInputSchema {
     #[new]
     #[pyo3(signature = (schema_type="object".to_string(), description=None, required=None))]
-    fn new(schema_type: String, description: Option<String>, required: Option<Vec<String>>) -> Self {
-        ToolInputSchema { 
-            schema_type, 
-            description, 
+    fn new(
+        schema_type: String,
+        description: Option<String>,
+        required: Option<Vec<String>>,
+    ) -> Self {
+        ToolInputSchema {
+            schema_type,
+            description,
             properties: None,
             items: None,
             required,
@@ -681,62 +695,6 @@ pub struct ListMessagesResponse {
 }
 
 // ============================================================================
-// Cache-related Types
-// ============================================================================
-
-#[pyclass]
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct CachedMessage {
-    #[pyo3(get, set)]
-    pub role: String,
-    #[pyo3(get, set)]
-    pub content: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub details: Option<serde_json::Value>,
-}
-
-#[pymethods]
-impl CachedMessage {
-    #[new]
-    fn new(role: String, content: String, details_str: Option<String>) -> PyResult<Self> {
-        let details = match details_str {
-            Some(s) => Some(
-                serde_json::from_str(&s)
-                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?,
-            ),
-            None => None,
-        };
-        Ok(Self {
-            role,
-            content,
-            details,
-        })
-    }
-
-    #[getter]
-    fn get_details(&self) -> PyResult<Option<String>> {
-        match &self.details {
-            Some(v) => Ok(Some(serde_json::to_string(v).map_err(|e| {
-                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
-            })?)),
-            None => Ok(None),
-        }
-    }
-
-    #[setter]
-    fn set_details(&mut self, details_str: Option<String>) -> PyResult<()> {
-        self.details = match details_str {
-            Some(s) => Some(
-                serde_json::from_str(&s)
-                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?,
-            ),
-            None => None,
-        };
-        Ok(())
-    }
-}
-
-// ============================================================================
 // Client Implementation
 // ============================================================================
 
@@ -783,6 +741,10 @@ impl AgentsClient {
 
     pub fn get_conversation_history(&self) -> Vec<Message> {
         self.conversation_history.clone()
+    }
+
+    pub fn set_conversation_history(&mut self, history: Vec<Message>) {
+        self.conversation_history = history;
     }
 
     pub fn add_system_message(&mut self, content: &str) {

@@ -52,7 +52,7 @@ impl SnowflakeAI {
     fn create_agent(&self) -> PyResult<SnowflakeAgent> {
         let engine = Arc::clone(&self.engine);
         let runtime = Arc::clone(&self.runtime);
-        
+
         let (account, database, schema, token) = runtime.block_on(async {
             let engine = engine.lock().await;
             let account = std::env::var("SNOWFLAKE_ACCOUNT").unwrap_or_default();
@@ -61,9 +61,9 @@ impl SnowflakeAI {
             let token = std::env::var("SNOWFLAKE_PASSWORD").unwrap_or_default();
             (account, database, schema, token)
         });
-        
+
         let client = agents::AgentsClient::new(account, token, database, schema);
-        
+
         Ok(SnowflakeAgent {
             client: Arc::new(tokio::sync::Mutex::new(client)),
             runtime,
@@ -91,7 +91,9 @@ impl SnowflakeAI {
         let engine = Arc::clone(&self.engine);
         let result = self.runtime.block_on(async {
             let engine = engine.lock().await;
-            engine.add_message(conversation_id, message_id, role, content).await
+            engine
+                .add_message(conversation_id, message_id, role, content)
+                .await
         });
         result.map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
     }
@@ -105,12 +107,14 @@ impl SnowflakeAI {
         let engine = Arc::clone(&self.engine);
         let settings_json: serde_json::Value = serde_json::from_str(&settings)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
-        
+
         let result = self.runtime.block_on(async {
             let engine = engine.lock().await;
-            engine.get_or_create_conversation(&conversation_id, settings_json).await
+            engine
+                .get_or_create_conversation(&conversation_id, settings_json)
+                .await
         });
-        
+
         result
             .and_then(|v| serde_json::to_string(&v).map_err(|e| e.to_string()))
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
@@ -125,12 +129,14 @@ impl SnowflakeAI {
         let engine = Arc::clone(&self.engine);
         let settings_json: serde_json::Value = serde_json::from_str(&settings)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
-        
+
         let result = self.runtime.block_on(async {
             let engine = engine.lock().await;
-            engine.update_conversation_settings(&conversation_id, settings_json).await
+            engine
+                .update_conversation_settings(&conversation_id, settings_json)
+                .await
         });
-        
+
         result.map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
     }
 
@@ -147,7 +153,7 @@ impl SnowflakeAI {
         let engine = Arc::clone(&self.engine);
         let runtime = Arc::clone(&self.runtime);
         let model = model.to_string();
-        
+
         // Create an agent client and use it for completion
         let (account, database, schema, token) = runtime.block_on(async {
             let engine = engine.lock().await;
@@ -157,33 +163,37 @@ impl SnowflakeAI {
             let token = std::env::var("SNOWFLAKE_PASSWORD").unwrap_or_default();
             (account, database, schema, token)
         });
-        
+
         let mut client = agents::AgentsClient::new(account, token, database, schema);
-        
+
         // Add context as system message if provided
         if let Some(ctx) = context {
             client.add_system_message(&ctx);
         }
-        
+
         let result = runtime.block_on(async {
-            client.complete_with_tools(
-                &model,
-                &prompt,
-                false, // don't use history for single completion
-                Some(temperature),
-                None, // top_p
-                Some(max_tokens),
-                tools, // Pass tools to the completion
-                None,  // tool_choice
-            ).await
+            client
+                .complete_with_tools(
+                    &model,
+                    &prompt,
+                    false, // don't use history for single completion
+                    Some(temperature),
+                    None, // top_p
+                    Some(max_tokens),
+                    tools, // Pass tools to the completion
+                    None,  // tool_choice
+                )
+                .await
         });
-        
+
         match result {
             Ok(response) => {
                 if let Some(choice) = response.choices.first() {
                     Ok(choice.message.get_content())
                 } else {
-                    Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("No response from model"))
+                    Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                        "No response from model",
+                    ))
                 }
             }
             Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e)),
@@ -203,7 +213,7 @@ impl SnowflakeAI {
         let engine = Arc::clone(&self.engine);
         let runtime = Arc::clone(&self.runtime);
         let model = model.to_string();
-        
+
         let (account, database, schema, token) = runtime.block_on(async {
             let engine = engine.lock().await;
             let account = std::env::var("SNOWFLAKE_ACCOUNT").unwrap_or_default();
@@ -212,39 +222,41 @@ impl SnowflakeAI {
             let token = std::env::var("SNOWFLAKE_PASSWORD").unwrap_or_default();
             (account, database, schema, token)
         });
-        
+
         let mut client = agents::AgentsClient::new(account, token, database, schema);
-        
+
         // Add context as system message if provided
         if let Some(ctx) = context {
             client.add_system_message(&ctx);
         }
-        
+
         // Convert messages to Message structs and add to history
         let mut formatted_messages: Vec<Message> = messages
             .iter()
-            .map(|(role, content)| {
-                Message {
-                    role: Some(role.clone()),
-                    content: Some(content.clone()),
-                    content_list: None,
-                }
+            .map(|(role, content)| Message {
+                role: Some(role.clone()),
+                content: Some(content.clone()),
+                content_list: None,
             })
             .collect();
-        
+
         // Get the last user message for the completion
-        let last_message = formatted_messages.pop()
-            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>("No messages provided"))?;
-        
-        let last_content = last_message.content
-            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>("Last message has no content"))?;
-        
+        let last_message = formatted_messages.pop().ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>("No messages provided")
+        })?;
+
+        let last_content = last_message.content.ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>("Last message has no content")
+        })?;
+
         // Add previous messages to conversation history
         for msg in formatted_messages {
             if let (Some(role), Some(content)) = (&msg.role, &msg.content) {
                 match role.as_str() {
                     "user" | "human" => {
-                        client.conversation_history.push(Message::new_user(content.clone()));
+                        client
+                            .conversation_history
+                            .push(Message::new_user(content.clone()));
                     }
                     "assistant" | "ai" => {
                         client.add_assistant_response(content.clone());
@@ -256,26 +268,30 @@ impl SnowflakeAI {
                 }
             }
         }
-        
+
         let result = runtime.block_on(async {
-            client.complete_with_tools(
-                &model,
-                &last_content,
-                true, // use history
-                Some(temperature),
-                None, // top_p
-                Some(max_tokens),
-                tools,
-                None, // tool_choice
-            ).await
+            client
+                .complete_with_tools(
+                    &model,
+                    &last_content,
+                    true, // use history
+                    Some(temperature),
+                    None, // top_p
+                    Some(max_tokens),
+                    tools,
+                    None, // tool_choice
+                )
+                .await
         });
-        
+
         match result {
             Ok(response) => {
                 if let Some(choice) = response.choices.first() {
                     Ok(choice.message.get_content())
                 } else {
-                    Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("No response from model"))
+                    Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                        "No response from model",
+                    ))
                 }
             }
             Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e)),
@@ -295,7 +311,7 @@ impl SnowflakeAI {
         let engine = Arc::clone(&self.engine);
         let runtime = Arc::clone(&self.runtime);
         let model = model.to_string();
-        
+
         let (account, database, schema, token) = runtime.block_on(async {
             let engine = engine.lock().await;
             let account = std::env::var("SNOWFLAKE_ACCOUNT").unwrap_or_default();
@@ -304,37 +320,37 @@ impl SnowflakeAI {
             let token = std::env::var("SNOWFLAKE_PASSWORD").unwrap_or_default();
             (account, database, schema, token)
         });
-        
+
         let mut client = agents::AgentsClient::new(account, token, database, schema);
-        
+
         // Add context as system message if provided
         if let Some(ctx) = context {
             client.add_system_message(&ctx);
         }
-        
+
         // Convert messages to Message structs
         let formatted_messages: Vec<Message> = messages
             .iter()
-            .map(|(role, content)| {
-                Message {
-                    role: Some(role.clone()),
-                    content: Some(content.clone()),
-                    content_list: None,
-                }
+            .map(|(role, content)| Message {
+                role: Some(role.clone()),
+                content: Some(content.clone()),
+                content_list: None,
             })
             .collect();
-        
+
         let result = runtime.block_on(async {
-            client.stream_complete(
-                &model,
-                formatted_messages,
-                Some(temperature),
-                None, // top_p
-                Some(max_tokens),
-                tools,
-            ).await
+            client
+                .stream_complete(
+                    &model,
+                    formatted_messages,
+                    Some(temperature),
+                    None, // top_p
+                    Some(max_tokens),
+                    tools,
+                )
+                .await
         });
-        
+
         match result {
             Ok((stream, _metadata)) => Ok(PyStream {
                 stream: std::sync::Mutex::new(stream),
@@ -385,12 +401,13 @@ impl SnowflakeAI {
 
     /// Get list of available AI models
     fn get_available_models(&self) -> PyResult<Vec<(String, String)>> {
-        // Return hardcoded list for Cortex models
-        Ok(vec![
-            ("openai-gpt-5-chat".to_string(), "Meta Llama 3.1 70B".to_string()),
-            ("llama3.1-8b".to_string(), "Meta Llama 3.1 8B".to_string()),
-            ("mistral-large2".to_string(), "Mistral Large 2".to_string()),
-        ])
+        let engine = Arc::clone(&self.engine);
+        let result = self.runtime.block_on(async move {
+            let engine = engine.lock().await;
+            engine.get_available_models().await
+        });
+
+        result.map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
     }
 
     /// Close the connection
@@ -653,26 +670,27 @@ impl SnowflakeAI {
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
     }
 
-    /// Get tool definition for extract_answer
+    /// Get tool definition for extract_answer (uses AI_EXTRACT SQL function)
     fn extract_answer_tool(&self) -> PyResult<String> {
         let tool_def = serde_json::json!({
             "type": "function",
             "function": {
                 "name": "extract_answer",
-                "description": "Extract an answer to a question from a text document using Cortex.",
+                "description": "Extract specific data points from a document using AI_EXTRACT. ONLY use for discrete facts like 'What is the salary?', 'What is the date?', 'How many shares?'. DO NOT use for summaries, explanations, or open-ended questions - use semantic search via execute_query on DOCUMENT_EMBEDDINGS for those instead.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "question": {
+                        "file_path": {
                             "type": "string",
-                            "description": "The question to answer"
+                            "description": "The stage path to the document (e.g., '@DATABASE.SCHEMA.STAGE/file.pdf')"
                         },
-                        "document": {
-                            "type": "string",
-                            "description": "The document text or stage path"
+                        "questions": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Array of SHORT, SPECIFIC questions to extract discrete answers for (e.g., 'What is the base salary?', 'What is the start date?'). NOT for summaries or explanations."
                         }
                     },
-                    "required": ["question", "document"]
+                    "required": ["file_path", "questions"]
                 }
             }
         });
@@ -1030,14 +1048,10 @@ impl SnowflakeAI {
 
     /// Parse a document from a Snowflake stage.
     #[pyo3(signature = (stage_file_path, mode=None))]
-    fn parse_document(
-        &self,
-        stage_file_path: String,
-        mode: Option<String>,
-    ) -> PyResult<String> {
+    fn parse_document(&self, stage_file_path: String, mode: Option<String>) -> PyResult<String> {
         let engine = self.engine.clone();
         let mode_ref = mode.as_deref();
-        
+
         self.runtime.block_on(async move {
             let engine_lock = engine.lock().await;
             engine_lock
@@ -1061,13 +1075,13 @@ impl SnowflakeAI {
             let user = engine.get_user().await.map_err(|e| e.to_string())?;
             let schema_name = format!("USER_{}", user.chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect::<String>().to_uppercase());
             let table_name = format!("OPENBB_AGENTS.{}.AGENTS_CONTEXT_OBJECTS", schema_name);
-            
+
             // Use MERGE to insert or update
             let object_id = format!("{}_{}", conversation_id, key);
             let escaped_object_id = object_id.replace("'", "''");
             let escaped_conv_id = conversation_id.replace("'", "''");
             let escaped_key = key.replace("'", "''");
-            
+
             // Check if value is already valid JSON - if so, store it directly
             // If not, wrap it in {"value": "..."} 
             let json_value = if serde_json::from_str::<serde_json::Value>(&value).is_ok() {
@@ -1085,7 +1099,7 @@ impl SnowflakeAI {
                     .replace("$$", "$ $");
                 format!("{{\"value\": \"{}\"}}", escaped)
             };
-            
+
             let query = format!(
                 "MERGE INTO {} AS target
                  USING (SELECT '{}' AS OBJECT_ID) AS source
@@ -1114,7 +1128,7 @@ impl SnowflakeAI {
             let user = engine.get_user().await.map_err(|e| e.to_string())?;
             let schema_name = format!("USER_{}", user.chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect::<String>().to_uppercase());
             let table_name = format!("OPENBB_AGENTS.{}.AGENTS_CONTEXT_OBJECTS", schema_name);
-            
+
             let object_id = format!("{}_{}", conversation_id, key);
             // Try to get either the wrapped value or the raw JSON
             // COALESCE handles both formats: {"value": "..."} and raw JSON objects
@@ -1122,17 +1136,17 @@ impl SnowflakeAI {
                 "SELECT COALESCE(OBJECT_VALUE:value::STRING, TO_JSON(OBJECT_VALUE)::STRING) AS value FROM {} WHERE OBJECT_ID = '{}'",
                 table_name, object_id
             );
-            
+
             if debug_enabled {
                 eprintln!("[DEBUG] get_conversation_data query: {}", query);
             }
-            
+
             let result = engine.execute_statement(&query).await?;
-            
+
             if debug_enabled {
                 eprintln!("[DEBUG] get_conversation_data result: {:?}", result);
             }
-            
+
             // Parse the JSON result
             if let Some(rows) = result.as_array() {
                 if let Some(first_row) = rows.first() {
@@ -1165,11 +1179,20 @@ impl SnowflakeAI {
         let result = self.runtime.block_on(async {
             let engine = engine.lock().await;
             let user = engine.get_user().await.map_err(|e| e.to_string())?;
-            let schema_name = format!("USER_{}", user.chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect::<String>().to_uppercase());
+            let schema_name = format!(
+                "USER_{}",
+                user.chars()
+                    .map(|c| if c.is_alphanumeric() { c } else { '_' })
+                    .collect::<String>()
+                    .to_uppercase()
+            );
             let table_name = format!("OPENBB_AGENTS.{}.AGENTS_CONTEXT_OBJECTS", schema_name);
-            
+
             let object_id = format!("{}_{}", conversation_id, key);
-            let query = format!("DELETE FROM {} WHERE OBJECT_ID = '{}'", table_name, object_id);
+            let query = format!(
+                "DELETE FROM {} WHERE OBJECT_ID = '{}'",
+                table_name, object_id
+            );
             engine.execute_statement(&query).await.map(|_| ())
         });
         result.map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
@@ -1184,13 +1207,13 @@ impl SnowflakeAI {
             let user = engine.get_user().await.map_err(|e| e.to_string())?;
             let schema_name = format!("USER_{}", user.chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect::<String>().to_uppercase());
             let table_name = format!("OPENBB_AGENTS.{}.AGENTS_CONTEXT_OBJECTS", schema_name);
-            
+
             let query = format!(
-                "SELECT OBJECT_KEY, OBJECT_VALUE:value::STRING AS value FROM {} WHERE CONVERSATION_ID = '{}'",
+                "SELECT OBJECT_KEY, COALESCE(OBJECT_VALUE:value::STRING, TO_JSON(OBJECT_VALUE)::STRING) AS value FROM {} WHERE CONVERSATION_ID = '{}'",
                 table_name, conversation_id
             );
             let result = engine.execute_statement(&query).await?;
-            
+
             let mut data = Vec::new();
             if let Some(rows) = result.as_array() {
                 for row in rows {
@@ -1223,9 +1246,18 @@ impl SnowflakeAI {
                 let engine = engine.lock().await;
                 // Clear from Snowflake tables - use getter method for user
                 let user = engine.get_user().await.map_err(|e| e.to_string())?;
-                let schema_name = format!("USER_{}", user.chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect::<String>().to_uppercase());
+                let schema_name = format!(
+                    "USER_{}",
+                    user.chars()
+                        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+                        .collect::<String>()
+                        .to_uppercase()
+                );
                 let table_name = format!("OPENBB_AGENTS.{}.AGENTS_MESSAGES", schema_name);
-                let query = format!("DELETE FROM {} WHERE CONVERSATION_ID = '{}'", table_name, conversation_id);
+                let query = format!(
+                    "DELETE FROM {} WHERE CONVERSATION_ID = '{}'",
+                    table_name, conversation_id
+                );
                 engine.execute_statement(&query).await
             })
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
@@ -2112,6 +2144,5 @@ fn _snowflake_ai(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<agents::CompleteResponse>()?;
     m.add_class::<agents::Choice>()?;
     m.add_class::<agents::FunctionName>()?;
-    m.add_class::<agents::CachedMessage>()?;
     Ok(())
 }

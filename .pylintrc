@@ -1,0 +1,15 @@
+[MASTER]
+# Use multiple processes to speed up Pylint
+jobs=1
+
+[MESSAGES CONTROL]
+# Disable specific pylint messages
+disable=C0301,W0718,E0611,R0904,R0911,R0912,R0913,R0914,R0915,R0917,W0613
+
+[BASIC]
+# Good variable names which should always be accepted
+good-names=i,j,k,ex,Run,_,e,f,db
+
+[TYPECHECK]
+# List of module names for which member attributes should not be checked
+ignored-modules=pydantic,_snowflake_ai

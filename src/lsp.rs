@@ -866,10 +866,6 @@ impl Backend {
     async fn get_cortex_suggestions(&self, text: &str, position: Position) -> Vec<CompletionItem> {
         let mut engine_lock = self.engine.lock().await; // Changed to mut
         if let Some(engine) = &mut *engine_lock {
-            if !engine.is_cortex_enabled() {
-                return vec![];
-            }
-
             let lines: Vec<&str> = text.lines().collect();
             let current_query = if (position.line as usize) < lines.len() {
                 lines[..=(position.line as usize)].join("\n")
@@ -959,7 +955,7 @@ impl LanguageServer for Backend {
 
         let engine_lock = self.engine.lock().await;
         if let Some(engine) = &*engine_lock {
-            match engine.get_schema().await {
+            match engine.get_detailed_schema().await {
                 Ok(schema) => {
                     *self.schema_cache.lock().await = schema;
                     let count = self.schema_cache.lock().await.len();

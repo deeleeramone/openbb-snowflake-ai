@@ -5,14 +5,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use snowflake_connector_rs::{
-    Error,
-    SnowflakeAuthMethod,
-    SnowflakeClient,
-    SnowflakeClientConfig,
-    SnowflakeSession,
+    Error, SnowflakeAuthMethod, SnowflakeClient, SnowflakeClientConfig, SnowflakeSession,
 };
-
-
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Schema {
@@ -157,6 +151,10 @@ fn _get_user_schema_name(user_id: &str) -> String {
 }
 
 impl SnowflakeEngine {
+    pub fn user_schema_name(&self) -> String {
+        _get_user_schema_name(&self.user)
+    }
+
     pub async fn new(
         user: &str,
         password: &str,
@@ -206,7 +204,8 @@ impl SnowflakeEngine {
     /// Ensures the OPENBB_AGENTS database exists. User-specific resources are created on-demand.
     async fn setup_openbb_agents_database(&self) -> Result<(), String> {
         let db_name = "OPENBB_AGENTS";
-        self.execute_statement(&format!("CREATE DATABASE IF NOT EXISTS {}", db_name)).await?;
+        self.execute_statement(&format!("CREATE DATABASE IF NOT EXISTS {}", db_name))
+            .await?;
         Ok(())
     }
 
@@ -217,9 +216,11 @@ impl SnowflakeEngine {
         let fq_schema_name = format!("{}.{}", db_name, schema_name);
 
         // First ensure the database exists
-        self.execute_statement(&format!("CREATE DATABASE IF NOT EXISTS {}", db_name)).await?;
+        self.execute_statement(&format!("CREATE DATABASE IF NOT EXISTS {}", db_name))
+            .await?;
 
-        self.execute_statement(&format!("CREATE SCHEMA IF NOT EXISTS {}", fq_schema_name)).await?;
+        self.execute_statement(&format!("CREATE SCHEMA IF NOT EXISTS {}", fq_schema_name))
+            .await?;
 
         self.execute_statement(&format!(
             "CREATE TABLE IF NOT EXISTS {}.AGENTS_CONVERSATIONS (
@@ -262,7 +263,7 @@ impl SnowflakeEngine {
 
         Ok(())
     }
-    
+
     pub async fn add_message(
         &self,
         conversation_id: String,
@@ -272,7 +273,7 @@ impl SnowflakeEngine {
     ) -> Result<(), String> {
         // Ensure user resources exist first using the actual user
         self.setup_user_resources(&self.user).await?;
-        
+
         let schema_name = _get_user_schema_name(&self.user);
         let table_name = format!("OPENBB_AGENTS.{}.AGENTS_MESSAGES", schema_name);
         let query = format!(
@@ -293,7 +294,7 @@ impl SnowflakeEngine {
     ) -> Result<Vec<(String, String, String)>, String> {
         // Ensure user resources exist first using the actual user
         self.setup_user_resources(&self.user).await?;
-        
+
         let schema_name = _get_user_schema_name(&self.user);
         let table_name = format!("OPENBB_AGENTS.{}.AGENTS_MESSAGES", schema_name);
         let query = format!(
@@ -306,9 +307,21 @@ impl SnowflakeEngine {
         if let Some(rows) = results.as_array() {
             for row in rows {
                 if let Some(obj) = row.as_object() {
-                    let message_id = obj.get("MESSAGE_ID").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let role = obj.get("ROLE").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let content = obj.get("CONTENT").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let message_id = obj
+                        .get("MESSAGE_ID")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let role = obj
+                        .get("ROLE")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let content = obj
+                        .get("CONTENT")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     messages.push((message_id, role, content));
                 }
             }
@@ -372,10 +385,7 @@ impl SnowflakeEngine {
         self.semantic_model = Some(semantic_model);
         self.semantic_model_stage = Some(format!(
             "@\"{}\".\"{}\".\"{}\"/{}",
-            self.database,
-            self.schema,
-            stage_name,
-            filename
+            self.database, self.schema, stage_name, filename
         ));
 
         Ok(format!(
@@ -503,7 +513,7 @@ impl SnowflakeEngine {
             .await
             .map_err(|e| format!("Failed to read response: {}", e))?;
 
-        let cortex_response: CortexAnalystResponse = 
+        let cortex_response: CortexAnalystResponse =
             serde_json::from_str(&response_text).map_err(|e| {
                 format!(
                     "Failed to parse Cortex response: {}. Body: {}",
@@ -565,7 +575,7 @@ impl SnowflakeEngine {
         for table_name in tables {
             match self.get_table_info(&table_name).await {
                 Ok(schema_json_str) => {
-                    let schema_json: serde_json::Value = 
+                    let schema_json: serde_json::Value =
                         match serde_json::from_str(&schema_json_str) {
                             Ok(json) => json,
                             Err(_) => continue, // Skip if JSON is invalid
@@ -658,7 +668,7 @@ impl SnowflakeEngine {
 
     pub async fn generate_semantic_model_from_schema(&self) -> Result<SemanticModel, String> {
         let schema = self.get_detailed_schema().await?;
-        let mut tables_map: std::collections::HashMap<String, Vec<Schema>> = 
+        let mut tables_map: std::collections::HashMap<String, Vec<Schema>> =
             std::collections::HashMap::new();
 
         for col in schema {
@@ -977,10 +987,22 @@ impl SnowflakeEngine {
             .into_iter()
             .filter_map(|row| {
                 let mut col = serde_json::Map::new();
-                col.insert("COLUMN_NAME".to_string(), json!(row.get::<String>("name").ok()?));
-                col.insert("DATA_TYPE".to_string(), json!(row.get::<String>("type").ok()?));
-                col.insert("IS_NULLABLE".to_string(), json!(row.get::<String>("null?").unwrap_or_default()));
-                col.insert("COLUMN_DEFAULT".to_string(), json!(row.get::<Option<String>>("default").ok().flatten()));
+                col.insert(
+                    "COLUMN_NAME".to_string(),
+                    json!(row.get::<String>("name").ok()?),
+                );
+                col.insert(
+                    "DATA_TYPE".to_string(),
+                    json!(row.get::<String>("type").ok()?),
+                );
+                col.insert(
+                    "IS_NULLABLE".to_string(),
+                    json!(row.get::<String>("null?").unwrap_or_default()),
+                );
+                col.insert(
+                    "COLUMN_DEFAULT".to_string(),
+                    json!(row.get::<Option<String>>("default").ok().flatten()),
+                );
                 col.insert("ORDINAL_POSITION".to_string(), json!(0)); // Not provided by DESCRIBE
                 Some(serde_json::Value::Object(col))
             })
@@ -990,7 +1012,8 @@ impl SnowflakeEngine {
             "columns": columns_json,
             "primary_keys": [],
             "foreign_keys": [],
-        })).unwrap())
+        }))
+        .unwrap())
     }
 
     /// Get list of tables in current schema
@@ -1017,6 +1040,34 @@ impl SnowflakeEngine {
         Ok(tables)
     }
 
+    pub async fn get_available_models(&self) -> Result<Vec<(String, String)>, String> {
+        let models = vec![
+            ("claude-sonnet-4-5".to_string(), "Claude Sonnet 4.5 (Preview)".to_string()),
+            ("claude-haiku-4-5".to_string(), "Claude Haiku 4.5 (Preview)".to_string()),
+            ("claude-4-sonnet".to_string(), "Claude 4 Sonnet".to_string()),
+            ("claude-4-opus".to_string(), "Claude 4 Opus".to_string()),
+            ("claude-3-7-sonnet".to_string(), "Claude 3.7 Sonnet".to_string()),
+            ("claude-3-5-sonnet".to_string(), "Claude 3.5 Sonnet".to_string()),
+            ("openai-gpt-4.1".to_string(), "OpenAI GPT-4.1".to_string()),
+            ("openai-o4-mini".to_string(), "OpenAI o4-mini".to_string()),
+            ("openai-gpt-5".to_string(), "OpenAI GPT-5 (Preview)".to_string()),
+            ("openai-gpt-5-mini".to_string(), "OpenAI GPT-5 Mini (Preview)".to_string()),
+            ("openai-gpt-5-nano".to_string(), "OpenAI GPT-5 Nano (Preview)".to_string()),
+            ("openai-gpt-5-chat".to_string(), "OpenAI GPT-5 Chat".to_string()),
+            ("openai-gpt-oss-120b".to_string(), "OpenAI GPT OSS 120B (Preview)".to_string()),
+            ("llama4-maverick".to_string(), "Llama 4 Maverick".to_string()),
+            ("llama3.1-8b".to_string(), "Llama 3.1 8B".to_string()),
+            ("llama3.1-70b".to_string(), "Llama 3.1 70B".to_string()),
+            ("llama3.1-405b".to_string(), "Llama 3.1 405B".to_string()),
+            ("deepseek-r1".to_string(), "DeepSeek R1".to_string()),
+            ("mistral-7b".to_string(), "Mistral 7B".to_string()),
+            ("mistral-large".to_string(), "Mistral Large".to_string()),
+            ("mistral-large2".to_string(), "Mistral Large 2".to_string()),
+            ("snowflake-llama-3.3-70b".to_string(), "Snowflake Llama 3.3 70B".to_string()),
+        ];
+        Ok(models)
+    }
+
     /// List documents available in the user's Cortex uploads stage
     /// Returns a list of (file_name, stage_path, is_parsed, page_count) tuples
     /// This lists files from the stage and checks if they have been parsed
@@ -1026,8 +1077,11 @@ impl SnowflakeEngine {
         let table_name = format!("OPENBB_AGENTS.{}.DOCUMENT_PARSE_RESULTS", schema_name);
 
         // First, list files from the stage
-        let list_query = format!("LIST @\"OPENBB_AGENTS\".\"{}\".\"CORTEX_UPLOADS\"", schema_name);
-        
+        let list_query = format!(
+            "LIST @\"OPENBB_AGENTS\".\"{}\".\"CORTEX_UPLOADS\"",
+            schema_name
+        );
+
         let stage_files = match self.session.query(list_query.as_str()).await {
             Ok(results) => {
                 let mut files = Vec::new();
@@ -1051,17 +1105,17 @@ impl SnowflakeEngine {
 
         // Check which files have been parsed and get their page counts
         let mut documents = Vec::new();
-        
+
         for file_name in stage_files {
             let stage_path = format!("@{}/{}", stage_name, file_name);
-            
+
             // Check if this file has been parsed
             let check_query = format!(
                 "SELECT COUNT(*) as PAGE_COUNT FROM \"OPENBB_AGENTS\".\"{}\".\"DOCUMENT_PARSE_RESULTS\" WHERE FILE_NAME = '{}'",
                 schema_name,
                 file_name.replace("'", "''")
             );
-            
+
             let (is_parsed, page_count) = match self.session.query(check_query.as_str()).await {
                 Ok(results) => {
                     if let Some(row) = results.into_iter().next() {
@@ -1073,10 +1127,10 @@ impl SnowflakeEngine {
                 }
                 Err(_) => (false, 0), // Table might not exist
             };
-            
+
             documents.push((file_name, stage_path, is_parsed, page_count));
         }
-        
+
         Ok(documents)
     }
 
@@ -1084,7 +1138,7 @@ impl SnowflakeEngine {
     /// document_id is the FILE_NAME - file is downloaded from CORTEX_UPLOADS stage
     pub async fn download_cortex_document(&self, document_id: &str) -> Result<String, String> {
         let schema_name = _get_user_schema_name(&self.user);
-        
+
         // Extract just the filename if a full stage path was provided
         // Input could be: "@OPENBB_AGENTS.USER_XXX.CORTEX_UPLOADS/file.pdf" or just "file.pdf"
         let file_name = if document_id.contains('/') {
@@ -1095,12 +1149,13 @@ impl SnowflakeEngine {
         };
 
         // Use GET command to download the file via Snow CLI
-        let snow_cli_path = self
-            .find_snow_cli()
-            .ok_or_else(|| "Snow CLI not found. Please install snowflake-cli-python.".to_string())?;
+        let snow_cli_path = self.find_snow_cli().ok_or_else(|| {
+            "Snow CLI not found. Please install snowflake-cli-python.".to_string()
+        })?;
 
         // Create a temp directory for the download
-        let temp_dir = std::env::temp_dir().join(format!("snowflake_download_{}", std::process::id()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("snowflake_download_{}", std::process::id()));
         std::fs::create_dir_all(&temp_dir)
             .map_err(|e| format!("Failed to create temp directory: {}", e))?;
 
@@ -1110,8 +1165,11 @@ impl SnowflakeEngine {
         // Local path needs trailing slash for directory
         // Both paths must be single-quoted, especially if filename contains spaces
         let local_path = format!("file://{}/", temp_dir.to_string_lossy().replace("\\", "/"));
-        let stage_path = format!("@OPENBB_AGENTS.{}.CORTEX_UPLOADS/{}", schema_name, file_name);
-        
+        let stage_path = format!(
+            "@OPENBB_AGENTS.{}.CORTEX_UPLOADS/{}",
+            schema_name, file_name
+        );
+
         let get_query = format!("GET '{}' '{}'", stage_path, local_path);
 
         eprintln!("[DEBUG] GET query: {}", get_query);
@@ -1166,9 +1224,9 @@ impl SnowflakeEngine {
         } else {
             temp_dir.join(file_name)
         };
-        
+
         eprintln!("[DEBUG] Looking for file at: {}", downloaded_file.display());
-        
+
         // Check if file exists
         if !downloaded_file.exists() {
             let _ = std::fs::remove_dir_all(&temp_dir);
@@ -1186,12 +1244,18 @@ impl SnowflakeEngine {
                 .map_err(|e| format!("Failed to open compressed file: {}", e))?;
             let mut decoder = flate2::read::GzDecoder::new(file);
             let mut decompressed = Vec::new();
-            decoder.read_to_end(&mut decompressed)
+            decoder
+                .read_to_end(&mut decompressed)
                 .map_err(|e| format!("Failed to decompress file: {}", e))?;
             decompressed
         } else {
-            std::fs::read(&downloaded_file)
-                .map_err(|e| format!("Failed to read downloaded file '{}': {}", downloaded_file.display(), e))?
+            std::fs::read(&downloaded_file).map_err(|e| {
+                format!(
+                    "Failed to read downloaded file '{}': {}",
+                    downloaded_file.display(),
+                    e
+                )
+            })?
         };
 
         eprintln!("[DEBUG] Read {} bytes from file", file_content.len());
@@ -1206,6 +1270,7 @@ impl SnowflakeEngine {
 
     /// Upload bytes directly to a Snowflake stage (for widget PDF uploads)
     /// Returns the stage path where the file was uploaded
+    /// file_name can include subdirectories (e.g., "doc.pdf/page_1_image_0.jpeg")
     pub async fn upload_bytes_to_stage(
         &self,
         file_bytes: &[u8],
@@ -1223,28 +1288,46 @@ impl SnowflakeEngine {
              ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE')",
             schema_name, stage
         );
-        self.session.query(create_stage_query.as_str()).await
+        self.session
+            .query(create_stage_query.as_str())
+            .await
             .map_err(|e| format!("Failed to create stage: {}", e))?;
 
-        // Write bytes to temp file
-        let temp_dir = std::env::temp_dir().join(format!("snowflake_upload_{}", std::process::id()));
+        // Handle subdirectories in file_name (e.g., "doc.pdf/page_1_image_0.jpeg")
+        // Extract just the base filename for the temp file, and the subdirectory for the stage path
+        let path = std::path::Path::new(file_name);
+        let base_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(file_name);
+        let subdir = path.parent().and_then(|p| p.to_str()).unwrap_or("");
+
+        // Write bytes to temp file (just the base filename)
+        let temp_dir =
+            std::env::temp_dir().join(format!("snowflake_upload_{}", std::process::id()));
         std::fs::create_dir_all(&temp_dir)
             .map_err(|e| format!("Failed to create temp directory: {}", e))?;
 
-        let temp_file_path = temp_dir.join(file_name);
+        let temp_file_path = temp_dir.join(base_name);
         std::fs::write(&temp_file_path, file_bytes)
             .map_err(|e| format!("Failed to write temp file: {}", e))?;
 
         // Find Snow CLI
-        let snow_cli_path = self
-            .find_snow_cli()
-            .ok_or_else(|| "Snow CLI not found. Please install snowflake-cli-python.".to_string())?;
+        let snow_cli_path = self.find_snow_cli().ok_or_else(|| {
+            "Snow CLI not found. Please install snowflake-cli-python.".to_string()
+        })?;
 
-        // Build PUT query
+        // Build PUT query - include subdirectory in stage path if present
         let temp_file_str = temp_file_path.to_string_lossy().replace("\\", "/");
+        let stage_target = if subdir.is_empty() {
+            format!("@\"{}\".\"{}\"", schema_name, stage)
+        } else {
+            // PUT to subdirectory: @SCHEMA.STAGE/subdir/
+            format!("@\"{}\".\"{}\"/{}/", schema_name, stage, subdir)
+        };
         let put_query = format!(
-            "PUT 'file://{}' @\"{}\".\"{}\" AUTO_COMPRESS = FALSE OVERWRITE = TRUE",
-            temp_file_str, schema_name, stage
+            "PUT 'file://{}' {} AUTO_COMPRESS = FALSE OVERWRITE = TRUE",
+            temp_file_str, stage_target
         );
 
         let mut cmd = std::process::Command::new(&snow_cli_path);
@@ -1279,7 +1362,7 @@ impl SnowflakeEngine {
         );
         let _ = self.session.query(refresh_query.as_str()).await;
 
-        // Return the stage path
+        // Return the stage path with full path including subdirectory
         Ok(format!("@{}/{}", qualified_stage_name, file_name))
     }
 
@@ -1290,7 +1373,11 @@ impl SnowflakeEngine {
     }
 
     /// List files in a specific stage
-    pub async fn list_files_in_stage(&self, stage_name: &str, _no_cache: bool) -> Result<Vec<String>, String> {
+    pub async fn list_files_in_stage(
+        &self,
+        stage_name: &str,
+        _no_cache: bool,
+    ) -> Result<Vec<String>, String> {
         // Always query directly from Snowflake (ignore no_cache parameter)
         self.list_files_in_stage_direct(stage_name)
             .await
@@ -1328,7 +1415,7 @@ impl SnowflakeEngine {
     pub async fn list_databases(&self) -> Result<Vec<String>, String> {
         let query = "SHOW DATABASES";
         let results = self.session.query(query).await.map_err(|e| e.to_string())?;
-        
+
         let mut databases = Vec::new();
         for row in results {
             if let Ok(name) = row.get::<String>("name") {
@@ -1459,12 +1546,18 @@ impl SnowflakeEngine {
 
     /// List all tables across all accessible databases and schemas
     async fn list_all_tables_direct(&self) -> Result<Vec<(String, String, String)>, String> {
-        let databases = self.list_databases().await
+        let databases = self
+            .list_databases()
+            .await
             .map_err(|e| format!("Failed to list databases: {}", e))?;
         let mut all_tables = Vec::new();
 
         for db in &databases {
-            match self.list_schemas_direct(Some(db)).await.map_err(|e| e.to_string()) {
+            match self
+                .list_schemas_direct(Some(db))
+                .await
+                .map_err(|e| e.to_string())
+            {
                 Ok(schemas) => {
                     for schema in &schemas {
                         let query = format!(
@@ -1475,7 +1568,12 @@ impl SnowflakeEngine {
                             db, schema
                         );
 
-                        match self.session.query(query.as_str()).await.map_err(|e| e.to_string()) {
+                        match self
+                            .session
+                            .query(query.as_str())
+                            .await
+                            .map_err(|e| e.to_string())
+                        {
                             Ok(results) => {
                                 for row in results {
                                     if let (Ok(catalog), Ok(schema_name), Ok(table)) = (
@@ -1569,14 +1667,10 @@ impl SnowflakeEngine {
                 .join(file_path)
         };
         // Normalize path separators for Windows to forward slashes as required by PUT command
-        let abs_path_str = abs_path
-            .to_string_lossy()
-            .replace("\\", "/");
+        let abs_path_str = abs_path.to_string_lossy().replace("\\", "/");
 
         // Determine auto-compression
-        let compressed_extensions = [
-            "gz", "bz2", "brotli", "zstd", "zip", "parquet", "orc",
-        ];
+        let compressed_extensions = ["gz", "bz2", "brotli", "zstd", "zip", "parquet", "orc"];
         let auto_compress = match file_path.extension().and_then(|s| s.to_str()) {
             Some(ext) => !compressed_extensions.contains(&ext.to_lowercase().as_str()),
             None => true,
@@ -1627,24 +1721,27 @@ impl SnowflakeEngine {
     ) -> Result<String, String> {
         // Parse mode: LAYOUT preserves formatting, OCR for text extraction
         let parse_mode = mode.unwrap_or("LAYOUT");
-        
+
         // Parse the stage path to build the TO_FILE call correctly
         let query = if stage_file_path.starts_with("@") {
             // Stage path format: @stage_name/file.pdf or @db.schema.stage/file.pdf
             let path = stage_file_path.trim_start_matches('@');
-            
+
             // Split into stage and file parts
             if let Some(slash_pos) = path.find('/') {
                 let stage = &path[..slash_pos];
                 let file = &path[slash_pos + 1..];
-                
+
                 // Build the proper AI_PARSE_DOCUMENT query
                 format!(
                     "SELECT AI_PARSE_DOCUMENT(TO_FILE('@{}', '{}'), {{'mode': '{}', 'page_split': true}}) as parsed_content",
                     stage, file, parse_mode
                 )
             } else {
-                return Err(format!("Invalid stage path format - must include file: {}", stage_file_path));
+                return Err(format!(
+                    "Invalid stage path format - must include file: {}",
+                    stage_file_path
+                ));
             }
         } else {
             return Err(format!("Stage path must start with @: {}", stage_file_path));
@@ -1662,9 +1759,10 @@ impl SnowflakeEngine {
 
         if let Some(row) = results.into_iter().next() {
             // Get the parsed content - it returns a VARIANT/JSON
-            let parsed_content: serde_json::Value = row.get("parsed_content")
+            let parsed_content: serde_json::Value = row
+                .get("parsed_content")
                 .map_err(|e| format!("Failed to get parsed content: {}", e))?;
-            
+
             // Convert to JSON string for Python
             Ok(serde_json::to_string(&parsed_content).map_err(|e| e.to_string())?)
         } else {
@@ -1678,7 +1776,9 @@ impl SnowflakeEngine {
         table_name: &str,
         file_type: &str,
     ) -> Result<(), String> {
-        let sanitized_table_name = table_name.to_uppercase().replace(|c: char| !c.is_alphanumeric() && c != '_', "_");
+        let sanitized_table_name = table_name
+            .to_uppercase()
+            .replace(|c: char| !c.is_alphanumeric() && c != '_', "_");
         let file_type_upper = file_type.to_uppercase();
 
         if file_type_upper != "JSON" && file_type_upper != "XML" {
@@ -1687,17 +1787,38 @@ impl SnowflakeEngine {
 
         let file_format_name = format!("FORMAT_{}", sanitized_table_name);
         let create_format_query = if file_type_upper == "XML" {
-            format!("CREATE OR REPLACE FILE FORMAT {} TYPE = XML STRIP_OUTER_ELEMENT = TRUE", file_format_name)
+            format!(
+                "CREATE OR REPLACE FILE FORMAT {} TYPE = XML STRIP_OUTER_ELEMENT = TRUE",
+                file_format_name
+            )
         } else {
-            format!("CREATE OR REPLACE FILE FORMAT {} TYPE = JSON STRIP_OUTER_ARRAY = TRUE", file_format_name)
+            format!(
+                "CREATE OR REPLACE FILE FORMAT {} TYPE = JSON STRIP_OUTER_ARRAY = TRUE",
+                file_format_name
+            )
         };
-        self.session.query(&*create_format_query).await.map_err(|e| e.to_string())?;
+        self.session
+            .query(&*create_format_query)
+            .await
+            .map_err(|e| e.to_string())?;
 
-        let create_table_query = format!("CREATE OR REPLACE TABLE {} (RAW_DATA VARIANT)", sanitized_table_name);
-        self.session.query(&*create_table_query).await.map_err(|e| e.to_string())?;
+        let create_table_query = format!(
+            "CREATE OR REPLACE TABLE {} (RAW_DATA VARIANT)",
+            sanitized_table_name
+        );
+        self.session
+            .query(&*create_table_query)
+            .await
+            .map_err(|e| e.to_string())?;
 
-        let copy_into_query = format!("COPY INTO {} FROM '{}' FILE_FORMAT = (FORMAT_NAME = '{}') ON_ERROR = 'CONTINUE'", sanitized_table_name, stage_path, file_format_name);
-        self.session.query(copy_into_query.as_str()).await.map_err(|e| e.to_string())?;
+        let copy_into_query = format!(
+            "COPY INTO {} FROM '{}' FILE_FORMAT = (FORMAT_NAME = '{}') ON_ERROR = 'CONTINUE'",
+            sanitized_table_name, stage_path, file_format_name
+        );
+        self.session
+            .query(copy_into_query.as_str())
+            .await
+            .map_err(|e| e.to_string())?;
 
         Ok(())
     }
@@ -1722,7 +1843,7 @@ impl SnowflakeEngine {
         variant_column: Option<&str>,
     ) -> Result<serde_json::Value, String> {
         let column = variant_column.unwrap_or("RAW_DATA");
-        
+
         let select_expression = if let Some(index) = element_index {
             format!("XMLGET({}, '{}', {}):'$'", column, element_name, index)
         } else {
@@ -1731,8 +1852,12 @@ impl SnowflakeEngine {
 
         // Casting to VARCHAR here to get the content as a string.
         // If the element contains complex XML/JSON, it will be returned as such.
-        let query = format!("SELECT {sel_expr}::VARCHAR FROM {table_name}", sel_expr = select_expression, table_name = table_name);
-        
+        let query = format!(
+            "SELECT {sel_expr}::VARCHAR FROM {table_name}",
+            sel_expr = select_expression,
+            table_name = table_name
+        );
+
         self.execute_query(&query, None, None, None).await
     }
 
@@ -1748,8 +1873,7 @@ impl SnowflakeEngine {
 
         let query = format!(
             "SELECT METADATA FROM {} WHERE CONVERSATION_ID = '{}'",
-            table_name,
-            conversation_id
+            table_name, conversation_id
         );
         let result = self.execute_statement(&query).await?;
 
@@ -1762,7 +1886,7 @@ impl SnowflakeEngine {
                 }
             }
         }
-        
+
         let settings_str = serde_json::to_string(&settings).map_err(|e| e.to_string())?;
         let insert_query = format!(
             "INSERT INTO {} (CONVERSATION_ID, METADATA) SELECT '{}', PARSE_JSON('{}')",
@@ -1797,11 +1921,11 @@ impl SnowflakeEngine {
     pub async fn get_database(&self) -> Result<String, String> {
         Ok(self.database.clone())
     }
-    
+
     pub async fn get_schema(&self) -> Result<String, String> {
         Ok(self.schema.clone())
     }
-    
+
     pub async fn get_user(&self) -> Result<String, String> {
         Ok(self.user.clone())
     }

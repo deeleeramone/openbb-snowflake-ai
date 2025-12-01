@@ -1,16 +1,30 @@
-"""Slash command handler for Snowflake AI server."""
+"""Slash command handlers for Snowflake AI."""
 
 import asyncio
 import json
 import os
+
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any, AsyncIterator
 
-from ._snowflake_ai import SnowflakeAI, SnowflakeAgent
+from . import SnowflakeAI, SnowflakeAgent
 from .helpers import clear_message_signatures, get_row_value, to_sse
+from .logger import get_logger
+
+
+logger = get_logger(__name__)
+
+# Session expiration error codes from Snowflake
+SESSION_EXPIRED_CODES = {"390112", "390114", "390111"}
+
+
+def is_session_expired_error(error: Exception) -> bool:
+    """Check if an error indicates Snowflake session expiration."""
+    error_str = str(error)
+    return any(code in error_str for code in SESSION_EXPIRED_CODES)
 
 
 async def run_in_thread(func, *args, **kwargs):
@@ -55,10 +69,12 @@ async def handle_slash_command(
         help_text = """**Available Commands:**
 
 📁 **File Management**
-- `/upload <file_path>` - Upload a file to Snowflake stage
-- `/parse <stage_path>` - Parse a document from stage
+- `/upload <file_path> [--embed-images]` - Upload a file to Snowflake stage
+- `/parse <stage_path> [--embed-images]` - Parse a document from stage
 - `/stages` - List all available stages
 - `/stage_files <stage>` - List files in a specific stage
+
+*Note: Use `--embed-images` flag to include image embeddings during parsing*
 
 🔧 **Model Settings**
 - `/models` - List available AI models
@@ -86,8 +102,22 @@ Type any command to get started!"""
         yield to_sse(message_chunk(help_text))
 
     elif user_command.startswith("/upload "):
-        file_path_str = user_command[8:].strip()
-        yield to_sse(reasoning_step(f"Processing '{file_path_str}'..."))
+        upload_args = user_command[8:].strip()
+
+        # Parse --embed-images flag
+        embed_images = False
+        if "--embed-images" in upload_args:
+            embed_images = True
+            upload_args = upload_args.replace("--embed-images", "").strip()
+
+        file_path_str = upload_args
+        yield to_sse(
+            reasoning_step(
+                f"Processing '{file_path_str}'"
+                + (" with image embedding" if embed_images else "")
+                + "..."
+            )
+        )
 
         # Expand user path and check if file exists
         file_path = Path(file_path_str).expanduser().resolve()
@@ -276,7 +306,8 @@ Type any command to get started!"""
                 capture_output=True,
                 text=True,
                 env=env,
-                timeout=300,  # 300 second timeout for large files
+                timeout=300,
+                check=False,
             )
 
             # Check for success
@@ -313,9 +344,9 @@ Type any command to get started!"""
         except subprocess.TimeoutExpired:
             yield to_sse(
                 message_chunk(
-                    f"❌ **Upload timed out**\n\n"
-                    f"The file upload is taking too long. This might happen with very large files.\n"
-                    f"Try uploading a smaller file or use the Snowflake Web UI."
+                    "❌ **Upload timed out**\n\n"
+                    "The file upload is taking too long. This might happen with very large files.\n"
+                    "Try uploading a smaller file or use the Snowflake Web UI."
                 )
             )
             return
@@ -327,7 +358,7 @@ Type any command to get started!"""
             if temp_dir and os.path.exists(temp_dir):
                 try:
                     shutil.rmtree(temp_dir)
-                except:
+                except Exception:
                     pass  # Ignore cleanup errors
 
         # If upload was successful, verify and optionally parse
@@ -339,8 +370,7 @@ Type any command to get started!"""
                 refresh_query = f"ALTER STAGE {qualified_stage_name} REFRESH"
                 await run_in_thread(client.execute_statement, refresh_query)
             except Exception as refresh_err:
-                if os.environ.get("SNOWFLAKE_DEBUG"):
-                    print(f"[DEBUG] Stage refresh warning: {refresh_err}")
+                logger.debug("Stage refresh warning: %s", refresh_err)
                 # Continue anyway - refresh failure is not critical
 
             # Wait a moment for the file to appear in the stage
@@ -351,8 +381,6 @@ Type any command to get started!"""
                 list_query = f"LIST {stage_path}"
                 result_json = await run_in_thread(client.execute_statement, list_query)
                 rows = json.loads(result_json) if result_json else []
-                if os.environ.get("SNOWFLAKE_DEBUG"):
-                    print(f"[DEBUG] LIST result: {rows}")
 
                 file_found = False
                 if rows:
@@ -367,7 +395,7 @@ Type any command to get started!"""
                             break
 
                 if file_found:
-                    yield to_sse(message_chunk(f"✅ File verified in stage"))
+                    yield to_sse(message_chunk("✅ File verified in stage"))
 
                     parseable_extensions = [
                         ".pdf",
@@ -398,6 +426,7 @@ Type any command to get started!"""
                                 conv_id,
                                 db_name,
                                 schema_name,
+                                embed_images=embed_images,
                             )
                         )
                     elif file_extension in data_extensions:
@@ -543,6 +572,13 @@ Type any command to get started!"""
 
         filename = os.path.basename(stage_path)
 
+        # Parse --embed-images flag for /parse command
+        parse_embed_images = False
+        if "--embed-images" in stage_path:
+            parse_embed_images = True
+            stage_path = stage_path.replace("--embed-images", "").strip()
+            filename = os.path.basename(stage_path)
+
         # Fire and forget background task with working context
         asyncio.create_task(
             process_document_background(
@@ -552,12 +588,15 @@ Type any command to get started!"""
                 conv_id,
                 current_working_db,
                 current_working_schema,
+                embed_images=parse_embed_images,
             )
         )
         yield to_sse(
             message_chunk(
                 f"✅ **Parsing started.**\n\n"
-                f"Document `{filename}` is being processed in the background.\n"
+                f"Document `{filename}` is being processed in the background"
+                + (" with image embedding" if parse_embed_images else "")
+                + ".\n"
                 f"Results will be saved to `DOCUMENT_PARSE_RESULTS` table in {current_working_db}.{current_working_schema}."
             )
         )
@@ -583,8 +622,27 @@ Type any command to get started!"""
         try:
             if agent:
                 await run_in_thread(agent.reset_conversation)
-            await run_in_thread(client.clear_conversation, conv_id)
+            try:
+                await run_in_thread(client.clear_conversation, conv_id)
+            except Exception as e:
+                if is_session_expired_error(e):
+                    # Import refresh_client from server
+                    from .server import refresh_client
+
+                    logger.warning(
+                        "Session expired during /clear, refreshing client..."
+                    )
+                    client = refresh_client(conv_id)
+                    await run_in_thread(client.clear_conversation, conv_id)
+                else:
+                    raise
             clear_message_signatures(conv_id)
+
+            # Clear document processor caches for this conversation
+            from .document_processor import DocumentProcessor
+
+            DocumentProcessor.instance().clear_conversation_cache(conv_id)
+
             yield to_sse(message_chunk("✅ Conversation history cleared."))
         except Exception as e:
             yield to_sse(message_chunk(f"❌ Error clearing history: {str(e)}"))
@@ -602,6 +660,10 @@ Type any command to get started!"""
         }
         await run_in_thread(
             client.update_conversation_settings, conv_id, json.dumps(current_settings)
+        )
+        # Also persist to conversation data for reload on server restart
+        await run_in_thread(
+            client.set_conversation_data, conv_id, "model_preference", model_name
         )
         yield to_sse(message_chunk(f"✅ Model set to: `{model_name}`"))
 
@@ -624,6 +686,13 @@ Type any command to get started!"""
                     client.update_conversation_settings,
                     conv_id,
                     json.dumps(current_settings),
+                )
+                # Also persist to conversation data for reload on server restart
+                await run_in_thread(
+                    client.set_conversation_data,
+                    conv_id,
+                    "temperature_preference",
+                    str(temp_value),
                 )
                 yield to_sse(message_chunk(f"✅ Temperature set to: {temp_value}"))
             else:
@@ -656,6 +725,13 @@ Type any command to get started!"""
                     client.update_conversation_settings,
                     conv_id,
                     json.dumps(current_settings),
+                )
+                # Also persist to conversation data for reload on server restart
+                await run_in_thread(
+                    client.set_conversation_data,
+                    conv_id,
+                    "max_tokens_preference",
+                    str(tokens_value),
                 )
                 yield to_sse(message_chunk(f"✅ Max tokens set to: {tokens_value}"))
             else:
@@ -836,7 +912,7 @@ Type any command to get started!"""
                         name = get_row_value(row, "name")
                         if name:
                             stages.append(f"OPENBB_AGENTS.{user_schema}.{name}")
-                except:
+                except Exception:
                     pass  # Ignore errors accessing user schema
 
             if stages:
@@ -972,9 +1048,6 @@ Type any command to get started!"""
             token_usage_str = await run_in_thread(
                 client.get_conversation_data, conv_id, "token_usage"
             )
-            if os.environ.get("SNOWFLAKE_DEBUG"):
-                print(f"[DEBUG] /history - conv_id: {conv_id}")
-                print(f"[DEBUG] /history - raw token_usage_str: {token_usage_str}")
             total_tokens = 0
             if token_usage_str:
                 try:
@@ -1001,7 +1074,7 @@ Type any command to get started!"""
                     and (content.startswith("[Tool Result") or role == "tool")
                 )
 
-                history_text = f"**Conversation Statistics:**\n\n"
+                history_text = "**Conversation Statistics:**\n\n"
                 history_text += f"- Total Messages: {total_msgs}\n"
                 history_text += f"- User Messages: {user_msgs}\n"
                 history_text += f"- Assistant Messages: {ai_msgs}\n"
@@ -1077,13 +1150,16 @@ async def process_document_background(
     conv_id: str,
     target_database: str,
     target_schema: str,
+    embed_images: bool = False,
 ):
-    """Background task to parse document and save results to the working database context."""
-    try:
-        if os.environ.get("SNOWFLAKE_DEBUG"):
-            print(f"[DEBUG] Starting background parsing for {filename}")
-            print(f"[DEBUG] Target location: {target_database}.{target_schema}")
+    """Background task to parse document and save results to the working database context.
 
+    Parameters
+    ----------
+    embed_images : bool, optional
+        Whether to generate embeddings for images in the document, by default False
+    """
+    try:
         # 1. Parse document
         content = await run_in_thread(client.parse_document, stage_path)
 
@@ -1151,10 +1227,60 @@ async def process_document_background(
                 str(num_pages),
             )
 
-        if os.environ.get("SNOWFLAKE_DEBUG"):
-            print(f"[DEBUG] Background parsing complete for {filename}")
-            print(f"[DEBUG] Results stored in {qualified_table}")
+        # Generate embeddings after parsing
+        if num_pages > 0:
+            try:
+                from .document_processor import DocumentProcessor
+
+                doc_proc = DocumentProcessor.instance()
+
+                # Get parsed pages
+                select_query = f"SELECT PAGE_NUMBER, PAGE_CONTENT FROM {qualified_table} WHERE FILE_NAME = '{filename}' AND STAGE_PATH = '{stage_path}' ORDER BY PAGE_NUMBER"
+                result_json = await run_in_thread(
+                    client.execute_statement, select_query
+                )
+                rows = json.loads(result_json) if result_json else []
+
+                pages = []
+                for row in rows:
+                    page_num = (
+                        row.get("PAGE_NUMBER")
+                        if "PAGE_NUMBER" in row
+                        else row.get("page_number")
+                    )
+                    content = (
+                        row.get("PAGE_CONTENT")
+                        if "PAGE_CONTENT" in row
+                        else row.get("page_content")
+                    )
+                    if page_num and content:
+                        pages.append({"page": int(page_num), "content": content})
+
+                if pages:
+                    logger.info(
+                        "Generating embeddings for %s (embed_images=%s)",
+                        filename,
+                        embed_images,
+                    )
+                    await doc_proc._create_document_embeddings_table(client)
+                    success = await doc_proc._generate_embeddings_for_document(
+                        client=client,
+                        file_name=filename,
+                        stage_path=stage_path,
+                        pages=pages,
+                        pdf_bytes=None,
+                        embed_images=embed_images,
+                    )
+                    if success:
+                        logger.info(
+                            "Embeddings generated successfully for %s", filename
+                        )
+                    else:
+                        logger.warning("Failed to generate embeddings for %s", filename)
+            except Exception as emb_err:
+                logger.error(
+                    "Embedding generation failed for %s: %s", filename, emb_err
+                )
 
     except Exception as e:
-        if os.environ.get("SNOWFLAKE_DEBUG"):
-            print(f"[ERROR] Background parsing failed for {filename}: {e}")
+        logger.error("Background parsing failed for %s: %s", filename, e)

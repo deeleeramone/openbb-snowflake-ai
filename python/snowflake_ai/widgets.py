@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 import os
+from functools import lru_cache
 from typing import Annotated
 
 from fastapi import APIRouter, Body, Depends, HTTPException
@@ -14,7 +15,11 @@ from openbb_platform_api.response_models import (
 )
 
 from ._snowflake_ai import SnowflakeAI
+from .document_processor import DocumentProcessor
+from .logger import get_logger
 
+
+logger = get_logger(__name__)
 router = APIRouter(prefix="/widgets", tags=["widgets"])
 
 
@@ -122,13 +127,13 @@ async def upload_widget_file(
     """
     # pylint: disable=import-outside-toplevel
     from openbb_core.provider.utils.helpers import get_async_requests_session
-    from .helpers import remove_file_from_stage
 
     # Check if this is a remove request (document list provided)
     if documents := payload.get("document", []):
+        doc_proc = DocumentProcessor.instance()
         results = []
         for doc_path in documents:
-            success, message = await remove_file_from_stage(client, doc_path)
+            success, message = await doc_proc.remove_file_from_stage(client, doc_path)
             results.append(
                 {
                     "document": doc_path,
@@ -137,14 +142,12 @@ async def upload_widget_file(
                 }
             )
 
-        if os.environ.get("SNOWFLAKE_DEBUG"):
-            print(f"[DEBUG] Upload widget remove results: {results}")
-
         return True
 
     file_bytes: bytes | None = None
     file_name: str = ""
     stage_name = payload.get("stage_name")  # Optional, defaults to CORTEX_UPLOADS
+    embed_images = payload.get("embed_images", False)  # Optional, default False
 
     # Handle different input methods
     if path := payload.get("path", ""):  # nosec
@@ -160,10 +163,12 @@ async def upload_widget_file(
             file_bytes = file.read()
 
     elif url := payload.get("url", ""):
-        file_name = url.split("/")[-1].split("?")[0]  # Remove query params
+        file_name = (
+            payload.get("file_name") or url.split("/")[-1].split("?")[0]
+        )  # Remove query params
 
         async with await get_async_requests_session() as session:
-            async with session.get(url) as response:
+            async with await session.get(url) as response:
                 response.raise_for_status()
                 file_bytes = await response.read()
 
@@ -191,6 +196,9 @@ async def upload_widget_file(
 
     try:
         # Upload bytes to Snowflake stage
+        if not file_name.endswith(".pdf"):
+            file_name += ".pdf"
+        print(file_name)
         stage_path = client.upload_bytes_to_stage(
             list(file_bytes),  # Convert bytes to list for PyO3
             file_name,
@@ -228,16 +236,86 @@ async def upload_widget_file(
     tabular_extensions = {".csv", ".tsv"}
 
     if file_ext in parseable_extensions:
-        # Fire and forget background document parsing
+        doc_proc = DocumentProcessor.instance()
+
+        # STEP 1: Extract and store PDF positions/metadata IMMEDIATELY (before returning)
+        # This ensures positions/metadata are always available for AI chat
+        if file_ext == ".pdf" and file_bytes:
+            try:
+                # Single-pass extraction of positions + metadata
+                _, text_positions, pdf_metadata = doc_proc.extract_pdf_with_positions(
+                    file_bytes, extract_metadata=True
+                )
+                logger.info(
+                    "Widget upload: Extracted %d positions and %d outline entries for %s",
+                    len(text_positions) if text_positions else 0,
+                    len(pdf_metadata.get("outline", [])) if pdf_metadata else 0,
+                    file_name,
+                )
+
+                # Store positions immediately
+                if text_positions:
+                    await doc_proc.store_pdf_positions_in_snowflake(
+                        client,
+                        file_name,
+                        stage_path,
+                        text_positions,
+                    )
+                    logger.info(
+                        "Widget upload: Stored %d text positions for %s",
+                        len(text_positions),
+                        file_name,
+                    )
+
+                # Store metadata immediately
+                if pdf_metadata:
+                    await doc_proc.store_document_metadata(
+                        client,
+                        file_name,
+                        stage_path,
+                        pdf_metadata,
+                    )
+                    logger.info(
+                        "Widget upload: Stored document metadata for %s", file_name
+                    )
+
+            except Exception as e:
+                logger.warning(
+                    "Widget upload: Failed to extract/store PDF metadata: %s", e
+                )
+
+        # STEP 2: Create job record
+        job_id = None
+        try:
+            job_id = await doc_proc.create_processing_job(
+                client, file_name, stage_path, embed_images
+            )
+        except Exception as e:
+            logger.warning("Widget upload: Job creation failed: %s", e)
+
+        # STEP 3: Start background task for image upload + stored procedure call
+        # This returns immediately - all heavy work happens in background
         asyncio.create_task(
-            _process_document_background(
-                client, stage_path, file_name, db_name, schema_name
+            _process_document_with_images(
+                client,
+                doc_proc,
+                file_name,
+                stage_path,
+                db_name,
+                schema_name,
+                embed_images,
+                job_id,
+                pdf_bytes=file_bytes if embed_images else None,
             )
         )
+
         processing_status = "parsing"
+        job_info = f" (job_id: {job_id})" if job_id else ""
         processing_message = (
             f"File uploaded to {stage_path}. "
-            f"Document parsing started in background. "
+            f"Document parsing started in background{job_info}"
+            + (" with image embedding" if embed_images else "")
+            + ". "
             f"Results will be saved to {db_name}.{schema_name}.DOCUMENT_PARSE_RESULTS"
         )
 
@@ -350,10 +428,122 @@ async def upload_widget_file(
         "processing_status": processing_status,
         "message": processing_message,
     }
-    if os.environ.get("SNOWFLAKE_DEBUG"):
-        print(f"[DEBUG] Upload widget status: {status}")
 
-    return True
+    return status
+
+
+async def _process_document_with_images(
+    client: SnowflakeAI,
+    doc_proc: DocumentProcessor,
+    file_name: str,
+    stage_path: str,
+    target_database: str,
+    target_schema: str,
+    embed_images: bool = False,
+    job_id: str | None = None,
+    pdf_bytes: bytes | None = None,
+):
+    """Background task to process document with parallel image upload and parsing.
+
+    This runs asynchronously in the background - the upload endpoint returns immediately.
+
+    Flow (PARALLEL):
+    1. Start document parsing via stored procedure immediately
+    2. Upload images to DOCUMENT_IMAGES stage concurrently (if embed_images=True)
+    3. Stored procedure handles text embeddings, then waits for images to generate image embeddings
+
+    Parameters
+    ----------
+    pdf_bytes : bytes | None
+        Raw PDF bytes for image extraction. Only needed if embed_images=True.
+    """
+    logger.info(
+        "_process_document_with_images ENTRY: file=%s, embed_images=%s, has_pdf_bytes=%s",
+        file_name,
+        embed_images,
+        pdf_bytes is not None,
+    )
+
+    try:
+        # Run image upload and document processing in PARALLEL
+        # This is much faster than sequential processing
+
+        async def upload_images_task():
+            """Upload images concurrently while parsing runs."""
+            if embed_images and pdf_bytes:
+                try:
+                    count = await doc_proc.upload_images_and_store_metadata(
+                        client,
+                        file_name,
+                        stage_path,
+                        pdf_bytes,
+                    )
+                    logger.info(
+                        "_process_document_with_images: Uploaded %d images for %s",
+                        count,
+                        file_name,
+                    )
+                    return count
+                except Exception as e:
+                    logger.warning(
+                        "_process_document_with_images: Image upload failed: %s", e
+                    )
+            return 0
+
+        async def parsing_task():
+            """Start document parsing (text parsing + embeddings)."""
+            if job_id:
+                try:
+                    success = await doc_proc.start_document_processing_async(
+                        client,
+                        job_id,
+                        file_name,
+                        stage_path,
+                        embed_images,
+                    )
+                    return success
+                except Exception as e:
+                    logger.error(
+                        "_process_document_with_images: Stored procedure failed: %s", e
+                    )
+                    return False
+            return False
+
+        # Run both tasks concurrently
+        image_count, parsing_success = await asyncio.gather(
+            upload_images_task(),
+            parsing_task(),
+            return_exceptions=False,
+        )
+
+        if not parsing_success and job_id:
+            # Fall back to Python background processing
+            logger.warning("Stored procedure failed, falling back to Python processing")
+            await _process_document_background(
+                client,
+                stage_path,
+                file_name,
+                target_database,
+                target_schema,
+                embed_images,
+                job_id,
+                pdf_bytes=pdf_bytes,
+            )
+
+    except Exception as e:
+        logger.error(
+            "_process_document_with_images failed for %s: %s",
+            file_name,
+            e,
+            exc_info=True,
+        )
+        if job_id:
+            try:
+                await doc_proc.update_processing_job(
+                    client, job_id, status="failed", error_message=str(e)[:500]
+                )
+            except Exception:
+                pass
 
 
 async def _process_document_background(
@@ -362,72 +552,230 @@ async def _process_document_background(
     filename: str,
     target_database: str,
     target_schema: str,
+    embed_images: bool = False,
+    job_id: str | None = None,
+    pdf_bytes: bytes | None = None,
 ):
-    """Background task to parse document and save results."""
+    """Background task to parse document with Cortex and generate embeddings.
 
-    def _run_sync():
+    This runs asynchronously in the background - the upload endpoint returns immediately.
+    PDF positions and metadata are extracted and stored during upload (not here).
+
+    Parameters
+    ----------
+    pdf_bytes : bytes | None
+        Raw PDF bytes for image extraction. Only needed if embed_images=True.
+    """
+    logger.info(
+        "_process_document_background ENTRY: file=%s, embed_images=%s, has_pdf_bytes=%s, pdf_len=%d",
+        filename,
+        embed_images,
+        pdf_bytes is not None,
+        len(pdf_bytes) if pdf_bytes else 0,
+    )
+    doc_proc = DocumentProcessor.instance()
+    qualified_table = f"{target_database}.{target_schema}.DOCUMENT_PARSE_RESULTS"
+
+    # Update job status to parsing
+    if job_id:
         try:
-            if os.environ.get("SNOWFLAKE_DEBUG"):
-                print(
-                    f"[DEBUG] Widget upload: Starting background parsing for {filename}"
-                )
-
-            # Ensure results table exists
-            qualified_table = (
-                f"{target_database}.{target_schema}.DOCUMENT_PARSE_RESULTS"
-            )
-            create_table_query = f"""
-            CREATE TABLE IF NOT EXISTS {qualified_table} (
-                FILE_NAME STRING,
-                STAGE_PATH STRING,
-                PAGE_NUMBER INTEGER,
-                PAGE_CONTENT STRING,
-                METADATA VARIANT,
-                PARSED_AT TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP()
-            )
-            """
-            client.execute_statement(create_table_query)
-
-            # Extract stage info from stage_path
-            clean_path = stage_path.lstrip("@")
-            if "/" in clean_path:
-                parts = clean_path.split("/", 1)
-                stage_name_extracted = f"@{parts[0]}"
-                relative_file_path = parts[1]
-            else:
-                stage_name_extracted = f"@{clean_path}"
-                relative_file_path = filename
-
-            # Parse and insert in a single query
-            insert_query = f"""
-            INSERT INTO {qualified_table} (FILE_NAME, STAGE_PATH, PAGE_NUMBER, PAGE_CONTENT, METADATA)
-            WITH DOC AS (
-              SELECT AI_PARSE_DOCUMENT(TO_FILE('{stage_name_extracted}', '{relative_file_path}'), {{'mode': 'LAYOUT', 'page_split': true}}) AS RAW
-            )
-            SELECT 
-                '{filename}',
-                '{stage_path}',
-                INDEX + 1,
-                GET(VALUE, 'content')::STRING,
-                GET(DOC.RAW, 'metadata')
-            FROM DOC, TABLE(FLATTEN(input => COALESCE(GET(DOC.RAW, 'pages'), DOC.RAW)))
-            """
-            client.execute_statement(insert_query)
-
-            if os.environ.get("SNOWFLAKE_DEBUG"):
-                print(
-                    f"[DEBUG] Widget upload: Background parsing complete for {filename}"
-                )
-
+            await doc_proc.update_processing_job(client, job_id, status="parsing")
         except Exception as e:
-            if os.environ.get("SNOWFLAKE_DEBUG"):
-                print(
-                    f"[ERROR] Widget upload: Background parsing failed for {filename}: {e}"
-                )
+            logger.warning("Failed to update job status: %s", e)
 
-    # Run synchronous code in thread pool
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, _run_sync)
+    # STEP 1: Parse document with Snowflake AI_PARSE_DOCUMENT
+    page_count = 0
+    try:
+        create_table_query = f"""
+        CREATE TABLE IF NOT EXISTS {qualified_table} (
+            FILE_NAME STRING,
+            STAGE_PATH STRING,
+            PAGE_NUMBER INTEGER,
+            PAGE_CONTENT STRING,
+            METADATA VARIANT,
+            PARSED_AT TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP()
+        )
+        """
+        await asyncio.to_thread(client.execute_statement, create_table_query)
+
+        # Delete any existing records for this document to avoid duplicates
+        escaped_filename = filename.replace("'", "''")
+        escaped_stage_path = stage_path.replace("'", "''")
+        delete_query = f"""
+        DELETE FROM {qualified_table}
+        WHERE FILE_NAME = '{escaped_filename}' OR STAGE_PATH = '{escaped_stage_path}'
+        """
+        await asyncio.to_thread(client.execute_statement, delete_query)
+        logger.info("Widget upload: Deleted existing parse results for %s", filename)
+
+        # Extract stage info from stage_path
+        clean_path = stage_path.lstrip("@")
+        if "/" in clean_path:
+            parts = clean_path.split("/", 1)
+            stage_name_extracted = f"@{parts[0]}"
+            relative_file_path = parts[1]
+        else:
+            stage_name_extracted = f"@{clean_path}"
+            relative_file_path = filename
+
+        # Parse and insert in a single query
+        insert_query = f"""
+        INSERT INTO {qualified_table} (FILE_NAME, STAGE_PATH, PAGE_NUMBER, PAGE_CONTENT, METADATA)
+        WITH DOC AS (
+          SELECT AI_PARSE_DOCUMENT(TO_FILE('{stage_name_extracted}', '{relative_file_path}'), {{'mode': 'LAYOUT', 'page_split': true}}) AS RAW
+        )
+        SELECT 
+            '{filename}',
+            '{stage_path}',
+            INDEX + 1,
+            GET(VALUE, 'content')::STRING,
+            GET(DOC.RAW, 'metadata')
+        FROM DOC, TABLE(FLATTEN(input => COALESCE(GET(DOC.RAW, 'pages'), DOC.RAW)))
+        """
+        await asyncio.to_thread(client.execute_statement, insert_query)
+
+        logger.info("Widget upload: Document parsing completed for %s", filename)
+
+        # Get page count
+        count_query = f"""
+        SELECT COUNT(*) as cnt FROM {qualified_table}
+        WHERE FILE_NAME = '{filename.replace("'", "''")}' 
+          AND STAGE_PATH = '{stage_path.replace("'", "''")}'
+        """
+        count_result = await asyncio.to_thread(client.execute_query, count_query)
+        count_data = json.loads(count_result) if count_result else {}
+        if count_data.get("rowData"):
+            row = count_data["rowData"][0]
+            page_count = row.get("CNT", row.get("cnt", 0))
+
+        # Update job with parse completion
+        if job_id:
+            try:
+                await doc_proc.update_processing_job(
+                    client,
+                    job_id,
+                    status="embedding",
+                    last_completed_step="parse",
+                    page_count=page_count,
+                )
+            except Exception as e:
+                logger.warning("Failed to update job status: %s", e)
+
+    except Exception as e:
+        logger.error("Widget upload: Background parsing failed for %s: %s", filename, e)
+        if job_id:
+            try:
+                await doc_proc.update_processing_job(
+                    client,
+                    job_id,
+                    status="failed",
+                    error_message=str(e)[:500],
+                )
+            except Exception:
+                pass
+        return
+
+    # STEP 2: Generate embeddings after parsing
+    try:
+
+        # Ensure embeddings table exists
+        await doc_proc._create_document_embeddings_table(client)
+
+        # Get parsed pages
+        select_query = f"""
+        SELECT PAGE_NUMBER, PAGE_CONTENT
+        FROM {qualified_table}
+        WHERE FILE_NAME = '{filename.replace("'", "''")}' 
+          AND STAGE_PATH = '{stage_path.replace("'", "''")}'
+        ORDER BY PAGE_NUMBER
+        """
+        result_json = await asyncio.to_thread(client.execute_statement, select_query)
+        rows = json.loads(result_json) if result_json else []
+
+        pages = []
+        for row in rows:
+            page_num = row.get("PAGE_NUMBER") or row.get("page_number")
+            content = row.get("PAGE_CONTENT") or row.get("page_content")
+            if page_num and content:
+                pages.append({"page": int(page_num), "content": content})
+
+        if pages:
+            logger.info(
+                "Widget upload: Generating embeddings for %s (embed_images=%s, has_pdf_bytes=%s)",
+                filename,
+                embed_images,
+                pdf_bytes is not None,
+            )
+
+            # Generate embeddings - pdf_bytes passed from upload for image extraction
+            success = await doc_proc._generate_embeddings_for_document(
+                client=client,
+                file_name=filename,
+                stage_path=stage_path,
+                pages=pages,
+                pdf_bytes=pdf_bytes,
+                embed_images=embed_images,
+            )
+
+            if success:
+                logger.info(
+                    "Widget upload: Embeddings generated successfully for %s",
+                    filename,
+                )
+                # Update job as completed
+                if job_id:
+                    try:
+                        await doc_proc.update_processing_job(
+                            client,
+                            job_id,
+                            status="completed",
+                            last_completed_step="embed",
+                            embedding_count=len(pages),
+                        )
+                    except Exception as e:
+                        logger.warning("Failed to update job status: %s", e)
+            else:
+                logger.warning(
+                    "Widget upload: Failed to generate embeddings for %s", filename
+                )
+                if job_id:
+                    try:
+                        await doc_proc.update_processing_job(
+                            client,
+                            job_id,
+                            status="completed",
+                            last_completed_step="embed",
+                            error_message="Embedding generation returned False",
+                        )
+                    except Exception:
+                        pass
+        else:
+            # No pages to embed, mark as completed
+            if job_id:
+                try:
+                    await doc_proc.update_processing_job(
+                        client,
+                        job_id,
+                        status="completed",
+                        last_completed_step="parse",
+                    )
+                except Exception:
+                    pass
+
+    except Exception as e:
+        logger.error(
+            "Widget upload: Embedding generation failed for %s: %s", filename, e
+        )
+        if job_id:
+            try:
+                await doc_proc.update_processing_job(
+                    client,
+                    job_id,
+                    status="failed",
+                    error_message=f"Embedding failed: {str(e)[:400]}",
+                )
+            except Exception:
+                pass
 
 
 @router.get("/list_documents")
@@ -474,6 +822,74 @@ def list_cortex_documents(
     return documents
 
 
+@router.get("/processing_status/{job_id}")
+async def get_processing_status(
+    job_id: str,
+    client: Annotated[SnowflakeAI, Depends(snowflake_client)],
+) -> dict:
+    """Get the status of a document processing job.
+
+    Parameters
+    ----------
+    job_id : str
+        The job ID returned from upload_widget_file
+
+    Returns
+    -------
+    dict
+        Job status including:
+        - job_id: The job ID
+        - file_name: Name of the file being processed
+        - stage_path: Stage path where the file is stored
+        - status: Current status (pending, parsing, embedding, completed, failed)
+        - last_completed_step: Name of the last completed processing step
+        - page_count: Number of pages parsed
+        - embedding_count: Number of embeddings generated
+        - error_message: Error message if job failed
+        - created_at: When the job was created
+        - updated_at: When the job was last updated
+    """
+    doc_proc = DocumentProcessor.instance()
+    status = await doc_proc.get_processing_job_status(client, job_id)
+
+    if status is None:
+        raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
+
+    return status
+
+
+@router.get("/document_ready")
+async def check_document_ready(
+    stage_path: str,
+    client: Annotated[SnowflakeAI, Depends(snowflake_client)],
+) -> dict:
+    """Check what data is available for a document.
+
+    Use this to determine if a document is ready for AI chat and what
+    context can be provided.
+
+    Parameters
+    ----------
+    stage_path : str
+        The stage path of the document to check
+
+    Returns
+    -------
+    dict
+        Availability status including:
+        - has_positions: Whether text positions are available
+        - has_metadata: Whether document metadata is available
+        - has_parsed_pages: Whether Cortex-parsed pages are available
+        - has_embeddings: Whether embeddings are available
+        - page_count: Number of parsed pages
+        - embedding_count: Number of embeddings
+        - processing_status: Current processing status from job table (if exists)
+    """
+    doc_proc = DocumentProcessor.instance()
+    return await doc_proc.check_document_ready(client, stage_path)
+
+
+@lru_cache(maxsize=128)
 @router.get("/list_document_choices", include_in_schema=False)
 def list_cortex_document_choices(
     client: Annotated[SnowflakeAI, Depends(snowflake_client)],
@@ -624,8 +1040,7 @@ startxref
                     "content": f"Failed to download {filename}",
                 }
             )
-            if os.environ.get("SNOWFLAKE_DEBUG"):
-                print(f"[ERROR] Failed to download document {filename}: {exc}")
+            logger.error("Failed to download document %s: %s", filename, exc)
             continue
 
         if not document_content:

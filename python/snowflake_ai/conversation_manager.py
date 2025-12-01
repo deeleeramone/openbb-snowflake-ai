@@ -1,12 +1,16 @@
-"""Conversation history and context management for Snowflake AI."""
+"""Conversation manager for Snowflake AI."""
 
 import asyncio
 import os
 import uuid
 from typing import Any
 
-from ._snowflake_ai import SnowflakeAI
-from .helpers import parse_widget_data
+from . import SnowflakeAI
+from .logger import get_logger
+from .widget_handler import WidgetHandler
+
+
+logger = get_logger(__name__)
 
 
 async def run_in_thread(func, *args, **kwargs):
@@ -36,8 +40,10 @@ async def load_conversation_history(
     cached_messages = await run_in_thread(client.get_messages, conv_id)
 
     if os.environ.get("SNOWFLAKE_DEBUG"):
-        print(
-            f"[DEBUG] Loaded {len(cached_messages)} messages from database for conversation {conv_id}"
+        logger.debug(
+            "Loaded %d messages from database for conversation %s",
+            len(cached_messages),
+            conv_id,
         )
 
     # Build history from cached messages
@@ -68,7 +74,8 @@ async def load_conversation_history(
             }
 
             if message.role == "tool" and hasattr(message, "data"):
-                context_str = parse_widget_data(message.data, conv_id)
+                widget_handler = await WidgetHandler.instance()
+                context_str = widget_handler.parse_widget_data(message.data, conv_id)
                 msg_dict["content"] = f"Tool output:\n{context_str}"
                 msg_dict["details"] = message.data
 
@@ -84,8 +91,8 @@ async def load_conversation_history(
             )
 
     if os.environ.get("SNOWFLAKE_DEBUG"):
-        print(
-            f"[DEBUG] After processing: {len(final_conversation_history)} total messages"
+        logger.debug(
+            "After processing: %d total messages", len(final_conversation_history)
         )
 
     return final_conversation_history
@@ -140,7 +147,17 @@ def format_messages_for_llm(
                 formatted.append(("user", tool_result))
             pending_tool_results.clear()
 
-            formatted.append(("assistant", content))
+            # Handle consecutive assistant messages by merging them
+            # Cortex API requires alternating user/assistant roles
+            if formatted and formatted[-1][0] == "assistant":
+                # Merge with previous assistant message
+                prev_content = formatted[-1][1]
+                # Only merge if content is different (avoid pure duplicates)
+                if content.strip() != prev_content.strip():
+                    formatted[-1] = ("assistant", prev_content + "\n\n" + content)
+                # If content is same/similar, skip this duplicate
+            else:
+                formatted.append(("assistant", content))
         elif role == "system":
             # Merge system messages
             if formatted and formatted[0][0] == "system":
