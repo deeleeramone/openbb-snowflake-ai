@@ -168,6 +168,51 @@ async def stream_llm_with_tools(
     """
     doc_proc = DocumentProcessor.instance()
 
+    sql_scan_buffer = ""
+    inside_sql_block = False
+    pending_sql_buffer = ""
+
+    def split_sql_segments(text: str) -> list[tuple[str, str]]:
+        nonlocal sql_scan_buffer, inside_sql_block, pending_sql_buffer
+
+        segments: list[tuple[str, str]] = []
+        sql_scan_buffer += text
+
+        while True:
+            if not inside_sql_block:
+                lower_buffer = sql_scan_buffer.lower()
+                start_idx = lower_buffer.find("```sql")
+                if start_idx == -1:
+                    if len(sql_scan_buffer) > 5:
+                        safe = sql_scan_buffer[:-5]
+                        if safe:
+                            segments.append(("text", safe))
+                        sql_scan_buffer = sql_scan_buffer[-5:]
+                    break
+
+                if start_idx > 0:
+                    segments.append(("text", sql_scan_buffer[:start_idx]))
+
+                sql_scan_buffer = sql_scan_buffer[start_idx + 5 :]
+                sql_scan_buffer = sql_scan_buffer.lstrip("\r\n")
+                inside_sql_block = True
+                pending_sql_buffer = ""
+            else:
+                end_idx = sql_scan_buffer.find("```")
+                if end_idx == -1:
+                    pending_sql_buffer += sql_scan_buffer
+                    sql_scan_buffer = ""
+                    break
+
+                pending_sql_buffer += sql_scan_buffer[:end_idx]
+                segments.append(("sql", pending_sql_buffer))
+                sql_scan_buffer = sql_scan_buffer[end_idx + 3 :]
+                sql_scan_buffer = sql_scan_buffer.lstrip("\r\n")
+                pending_sql_buffer = ""
+                inside_sql_block = False
+
+        return segments
+
     def estimate_tokens(text: str) -> int:
         """Estimate token count - roughly 4 characters per token for English."""
         if not text:
@@ -600,8 +645,15 @@ async def stream_llm_with_tools(
                     # Only process non-think text through citation handling
                     if output_text:
                         cleaned = cleanup_text(output_text)
-                        buffer += cleaned
-                        full_text += cleaned
+                        for segment_type, segment_value in split_sql_segments(cleaned):
+                            if segment_type == "sql":
+                                sql_body = segment_value.strip()
+                                if sql_body:
+                                    full_text += f"```sql\n{sql_body}\n```"
+                                    yield ("sql", sql_body)
+                            else:
+                                buffer += segment_value
+                                full_text += segment_value
 
                     # Process buffer for citations
                     while True:
@@ -892,6 +944,17 @@ async def stream_llm_with_tools(
             yield ("text", buffer)
             buffer = ""
 
+    if sql_scan_buffer and not inside_sql_block:
+        buffer += sql_scan_buffer
+        full_text += sql_scan_buffer
+        sql_scan_buffer = ""
+    elif inside_sql_block and pending_sql_buffer:
+        # Unclosed SQL fence - treat remainder as plain text
+        recovered = f"```sql\n{pending_sql_buffer}"
+        buffer += recovered
+        full_text += recovered
+        sql_scan_buffer = ""
+
     # Yield any remaining buffer - no citation processing here since it should have been done in the loop
     if buffer:
         yield ("text", buffer)
@@ -943,6 +1006,10 @@ async def generate_sse_events(stream_generator, stream_state: dict):
             if event_type == "text" and isinstance(data, str):
                 yield to_sse(message_chunk(data))
                 stream_state["full_text"] += data
+            elif event_type == "sql" and isinstance(data, str):
+                block = f"```sql\n{data.strip()}\n```"
+                yield to_sse(message_chunk(block))
+                stream_state["full_text"] += block
             elif event_type == "reasoning_complete" and isinstance(data, str):
                 # Emit complete think block as a single reasoning event
                 yield to_sse(reasoning_step(data, event_type="INFO"))

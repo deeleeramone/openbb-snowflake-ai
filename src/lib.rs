@@ -388,6 +388,20 @@ impl SnowflakeAI {
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
     }
 
+    /// Generate SQL from natural language without executing it
+    fn text2sql(&self, prompt: String) -> PyResult<String> {
+        let engine = Arc::clone(&self.engine);
+
+        let result = self.runtime.block_on(async move {
+            let mut engine = engine.lock().await;
+            engine.execute_with_cortex_context(&prompt, false).await
+        });
+
+        result
+            .and_then(|v| serde_json::to_string(&v).map_err(|e| e.to_string()))
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
+    }
+
     /// Validate SQL query
     fn validate_query(&self, query: String) -> PyResult<()> {
         let engine = Arc::clone(&self.engine);
@@ -532,6 +546,24 @@ impl SnowflakeAI {
         result.map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
     }
 
+    fn has_semantic_model_cache(&self) -> PyResult<bool> {
+        let engine = Arc::clone(&self.engine);
+        let result = self.runtime.block_on(async move {
+            let engine = engine.lock().await;
+            Ok(engine.has_semantic_model_cache())
+        });
+        result.map_err(|e: String| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
+    }
+
+    fn use_conversation_context(&self, database: Option<String>, schema: Option<String>) -> PyResult<()> {
+        let engine = Arc::clone(&self.engine);
+        let result = self.runtime.block_on(async move {
+            let mut engine = engine.lock().await;
+            engine.use_conversation_context(database, schema).await
+        });
+        result.map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
+    }
+
     /// Get current user
     fn get_current_user(&self) -> PyResult<String> {
         let engine = Arc::clone(&self.engine);
@@ -539,6 +571,24 @@ impl SnowflakeAI {
             let engine = engine.lock().await;
             // Use the getter method
             engine.get_user().await
+        });
+        result.map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
+    }
+
+    /// Fetch the LAST_ALTERED timestamp for a fully qualified table
+    #[pyo3(signature = (database, schema, table))]
+    fn get_table_last_altered(
+        &self,
+        database: String,
+        schema: String,
+        table: String,
+    ) -> PyResult<Option<String>> {
+        let engine = Arc::clone(&self.engine);
+        let result = self.runtime.block_on(async move {
+            let engine = engine.lock().await;
+            engine
+                .get_table_last_altered(&database, &schema, &table)
+                .await
         });
         result.map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
     }
@@ -600,7 +650,7 @@ impl SnowflakeAI {
             "type": "function",
             "function": {
                 "name": "get_multiple_table_definitions",
-                "description": "Get schema definitions for multiple tables at once.",
+                "description": "Get schema definitions for multiple tables at once. Always use fully qualified table names.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -609,7 +659,7 @@ impl SnowflakeAI {
                             "items": {
                                 "type": "string"
                             },
-                            "description": "List of fully qualified table names (e.g., DATABASE.SCHEMA.TABLE or just TABLE)"
+                            "description": "List of fully qualified table names in DATABASE.SCHEMA.TABLE format (e.g., CME_DATA.PUBLIC.NYMEX_SETTLEMENTS)"
                         }
                     },
                     "required": ["table_names"]
@@ -775,19 +825,42 @@ impl SnowflakeAI {
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
     }
 
+    /// Get tool definition for text2sql
+    fn text2sql_tool(&self) -> PyResult<String> {
+        let tool_def = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "text2sql",
+                "description": "PRIMARY TOOL for SQL generation. When the user asks to write SQL, generate SQL, create a query, or asks a question that requires SQL - USE THIS TOOL FIRST. Uses Snowflake Cortex Analyst AI to convert natural language into optimized SQL. Returns SQL query and explanation WITHOUT executing it. The user can review and choose to execute it separately.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "prompt": {
+                            "type": "string",
+                            "description": "Natural language description of the desired SQL query. Include filters, aggregations, and ordering instructions. Example: 'Show me the top 10 customers by revenue in 2024'"
+                        }
+                    },
+                    "required": ["prompt"]
+                }
+            }
+        });
+        serde_json::to_string(&tool_def)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+    }
+
     /// Get tool definition for get_table_sample_data
     fn get_table_sample_data_tool(&self) -> PyResult<String> {
         let tool_def = serde_json::json!({
             "type": "function",
             "function": {
                 "name": "get_table_sample_data",
-                "description": "Get sample data from a Snowflake table. Returns up to 1 row of data to understand the table structure and content.",
+                "description": "Get sample data from a Snowflake table. Returns up to 1 row of data to understand the table structure and content. Always use fully qualified table names.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "table_name": {
                             "type": "string",
-                            "description": "The fully qualified table name (e.g., DATABASE.SCHEMA.TABLE or just TABLE)"
+                            "description": "The fully qualified table name in DATABASE.SCHEMA.TABLE format (e.g., CME_DATA.PUBLIC.NYMEX_SETTLEMENTS)"
                         }
                     },
                     "required": ["table_name"]
@@ -804,13 +877,13 @@ impl SnowflakeAI {
             "type": "function",
             "function": {
                 "name": "execute_query",
-                "description": "Execute a SQL query against Snowflake and return the results as JSON.",
+                "description": "Execute an ALREADY-WRITTEN SQL query and return results. ONLY use this when you already have valid SQL (e.g., from text2sql tool output, or for simple queries you wrote yourself). For generating SQL from natural language, use text2sql tool instead. IMPORTANT: Always use fully qualified table names: DATABASE.SCHEMA.TABLE",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "The SQL query to execute"
+                            "description": "The complete, valid SQL query to execute. Use fully qualified table names: DATABASE.SCHEMA.TABLE"
                         }
                     },
                     "required": ["query"]
@@ -868,13 +941,13 @@ impl SnowflakeAI {
             "type": "function",
             "function": {
                 "name": "get_table_schema",
-                "description": "Get the schema/structure of a Snowflake table including column names, types, and constraints.",
+                "description": "Get the schema/structure of a Snowflake table including column names, types, and constraints. Always use fully qualified table names.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "table_name": {
                             "type": "string",
-                            "description": "The fully qualified table name (e.g., DATABASE.SCHEMA.TABLE or just TABLE)"
+                            "description": "The fully qualified table name in DATABASE.SCHEMA.TABLE format (e.g., CME_DATA.PUBLIC.NYMEX_SETTLEMENTS)"
                         }
                     },
                     "required": ["table_name"]

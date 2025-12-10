@@ -1,11 +1,14 @@
 """Tool execution for Snowflake AI."""
 
 import asyncio
+import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import traceback
+from datetime import datetime, timezone
 from typing import Any
 
 from openbb_ai import reasoning_step
@@ -16,6 +19,225 @@ from .helpers import to_sse
 from .logger import get_logger
 
 logger = get_logger(__name__)
+
+SQL_CACHE_KEY = "text2sql_cache_v1"
+SQL_CACHE_MAX_ENTRIES = 5
+SQL_CACHE_ROW_LIMIT = 500
+SQL_TABLE_PATTERN = re.compile(
+    r"\b(?:from|join|into|update|table)\s+([\w\.\"$]+)",
+    re.IGNORECASE,
+)
+
+
+def _normalize_sql(sql: str) -> str:
+    return re.sub(r"\s+", " ", sql or "").strip()
+
+
+def _hash_sql(sql: str) -> str:
+    return hashlib.sha256(sql.encode("utf-8")).hexdigest()
+
+
+async def _load_sql_cache(client: SnowflakeAI, conv_id: str) -> dict:
+    try:
+        raw = await asyncio.to_thread(
+            client.get_conversation_data, conv_id, SQL_CACHE_KEY
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("Failed to load SQL cache: %s", exc)
+        return {}
+
+    if not raw:
+        return {}
+
+    try:
+        cache = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+
+    return cache if isinstance(cache, dict) else {}
+
+
+async def _persist_sql_cache(client: SnowflakeAI, conv_id: str, cache: dict):
+    try:
+        await asyncio.to_thread(
+            client.set_conversation_data,
+            conv_id,
+            SQL_CACHE_KEY,
+            json.dumps(cache),
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("Failed to persist SQL cache: %s", exc)
+
+
+def _shrink_cache(cache: dict):
+    if len(cache) <= SQL_CACHE_MAX_ENTRIES:
+        return
+
+    def _entry_ts(item):
+        value = item[1].get("executed_at")
+        if isinstance(value, str):
+            try:
+                ts = value.replace("Z", "+00:00")
+                return datetime.fromisoformat(ts)
+            except ValueError:
+                return datetime.min.replace(tzinfo=timezone.utc)
+        return datetime.min.replace(tzinfo=timezone.utc)
+
+    sorted_items = sorted(cache.items(), key=_entry_ts, reverse=True)
+    trimmed = dict(sorted_items[:SQL_CACHE_MAX_ENTRIES])
+    cache.clear()
+    cache.update(trimmed)
+
+
+def _split_identifier(identifier: str) -> list[str]:
+    parts: list[str] = []
+    current = []
+    in_quotes = False
+    for char in identifier:
+        if char == '"':
+            in_quotes = not in_quotes
+            continue
+        if char == "." and not in_quotes:
+            if current:
+                parts.append("".join(current))
+                current = []
+            continue
+        if not in_quotes and char in ",;()":
+            break
+        current.append(char)
+    if current:
+        parts.append("".join(current))
+    return [p.strip() for p in parts if p.strip()]
+
+
+async def _get_context_defaults(client: SnowflakeAI) -> tuple[str | None, str | None]:
+    try:
+        database = await asyncio.to_thread(client.get_current_database)
+    except Exception:  # pragma: no cover - defensive
+        database = None
+    try:
+        schema = await asyncio.to_thread(client.get_current_schema)
+    except Exception:  # pragma: no cover - defensive
+        schema = None
+    return database, schema
+
+
+def _extract_tables_from_sql(
+    sql: str, default_db: str | None, default_schema: str | None
+) -> list[dict[str, str]]:
+    tables: list[dict[str, str]] = []
+    seen = set()
+    for match in SQL_TABLE_PATTERN.finditer(sql):
+        identifier = match.group(1)
+        parts = _split_identifier(identifier)
+        if not parts:
+            continue
+        if len(parts) == 3:
+            database, schema, table = parts
+        elif len(parts) == 2:
+            database = default_db
+            schema, table = parts
+        else:
+            database = default_db
+            schema = default_schema
+            table = parts[0]
+
+        key = (database or "", schema or "", table)
+        if key in seen or not table:
+            continue
+        seen.add(key)
+        tables.append(
+            {
+                "database": (database or "").strip('"'),
+                "schema": (schema or "").strip('"'),
+                "table": table.strip('"'),
+            }
+        )
+    return tables
+
+
+async def _capture_table_freshness(
+    client: SnowflakeAI, tables: list[dict[str, str]]
+) -> list[dict[str, str]]:
+    freshness = []
+    for table in tables:
+        db = table.get("database")
+        schema = table.get("schema")
+        name = table.get("table")
+        if not (db and schema and name):
+            continue
+        try:
+            last_altered = await asyncio.to_thread(
+                client.get_table_last_altered,
+                db,
+                schema,
+                name,
+            )
+        except Exception:  # pragma: no cover - defensive
+            last_altered = None
+        if last_altered:
+            freshness.append({**table, "last_altered": last_altered})
+    return freshness
+
+
+async def _is_cache_entry_stale(client: SnowflakeAI, entry: dict) -> bool:
+    tables = entry.get("tables") or []
+    if not tables:
+        return True
+
+    for table in tables:
+        db = table.get("database")
+        schema = table.get("schema")
+        name = table.get("table")
+        cached_ts = table.get("last_altered")
+        if not (db and schema and name and cached_ts):
+            return True
+        try:
+            current = await asyncio.to_thread(
+                client.get_table_last_altered,
+                db,
+                schema,
+                name,
+            )
+        except Exception:  # pragma: no cover - defensive
+            return True
+        if not current:
+            return True
+        if current > cached_ts:
+            return True
+    return False
+
+
+async def _cache_query_result(
+    client: SnowflakeAI,
+    conv_id: str,
+    cache: dict,
+    query_hash: str,
+    query: str,
+    result_json: dict,
+    row_count: int,
+    tables: list[dict[str, str]],
+):
+    if not tables:
+        return
+
+    freshness = await _capture_table_freshness(client, tables)
+    if not freshness:
+        return
+
+    cached_copy = json.loads(json.dumps(result_json))
+    if isinstance(cached_copy.get("rowData"), list):
+        cached_copy["rowData"] = cached_copy["rowData"][:SQL_CACHE_ROW_LIMIT]
+
+    cache[query_hash] = {
+        "query": query,
+        "executed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "row_count": row_count,
+        "tables": freshness,
+        "result": cached_copy,
+    }
+    _shrink_cache(cache)
+    await _persist_sql_cache(client, conv_id, cache)
 
 
 def _find_snow_cli_binary():
@@ -162,12 +384,14 @@ async def execute_tool(
     # Inject conversation ID for tools that need cached metadata
     tool_args["_conversation_id"] = conv_id
 
-    yield to_sse(
-        reasoning_step(
-            f"Executing tool: {tool_name} with arguments: {tool_args_str}",
-            event_type="INFO",
+    # Some tools provide their own reasoning steps, so skip the generic one
+    if tool_name not in ["text2sql"]:
+        yield to_sse(
+            reasoning_step(
+                f"Executing tool: {tool_name} with arguments: {tool_args_str}",
+                event_type="INFO",
+            )
         )
-    )
 
     # Execute the appropriate tool
     if tool_name == "get_table_sample_data":
@@ -342,6 +566,75 @@ async def execute_tool(
             yield error_msg, {"error": str(e)}
             return
 
+    elif tool_name == "text2sql":
+        prompt = tool_args.get("prompt") or tool_args.get("question")
+        if not prompt:
+            yield "Error: 'prompt' argument is required for text2sql.", {
+                "error": "Missing prompt"
+            }
+            return
+
+        # Set conversation context (database/schema) if stored in settings
+        # This allows text2sql to use the correct schema from /use_database, /use_schema commands
+        try:
+            settings_json = await asyncio.to_thread(
+                client.get_or_create_conversation, conv_id, json.dumps({})
+            )
+            if settings_json:
+                settings = json.loads(settings_json)
+                db = settings.get("database")
+                sch = settings.get("schema")
+                if db or sch:
+                    await asyncio.to_thread(client.use_conversation_context, db, sch)
+        except Exception:
+            pass  # Ignore errors, use default database/schema
+
+        # Check if semantic model needs to be generated
+        # This is indicated by not having a cached model
+        has_cached_model = await asyncio.to_thread(client.has_semantic_model_cache)
+
+        if not has_cached_model:
+            yield to_sse(
+                reasoning_step(
+                    "Preparing semantic model and generating SQL (first run may take 30-60 seconds)...",
+                    event_type="INFO",
+                )
+            )
+        else:
+            yield to_sse(
+                reasoning_step(
+                    "Generating SQL using cached semantic model...",
+                    event_type="INFO",
+                )
+            )
+
+        try:
+            response = await asyncio.to_thread(client.text2sql, prompt)
+            parsed = json.loads(response)
+        except Exception as exc:  # pragma: no cover - defensive
+            error_msg = f"text2sql generation failed: {exc}"
+            if os.environ.get("SNOWFLAKE_DEBUG"):
+                logger.error(error_msg)
+            yield error_msg, {"error": str(exc)}
+            return
+
+        sql_text = (parsed.get("sql") or "").strip()
+        explanation = (parsed.get("explanation") or "").strip()
+        request_id = parsed.get("request_id")
+
+        output_sections: list[str] = []
+        if explanation:
+            output_sections.append(explanation)
+        if sql_text:
+            output_sections.append(f"```sql\n{sql_text}\n```")
+        else:
+            output_sections.append("No SQL was generated.")
+        if request_id:
+            output_sections.append(f"(request_id: {request_id})")
+
+        yield "\n\n".join(output_sections), parsed
+        return
+
     elif tool_name == "validate_query":
         query = tool_args.get("query", "")
         try:
@@ -356,114 +649,85 @@ async def execute_tool(
 
     elif tool_name == "execute_query":
         query = tool_args.get("query", "")
+        conv_id = tool_args.get("_conversation_id", "default")
+        force_refresh = bool(tool_args.get("force_refresh"))
+
+        normalized_query = _normalize_sql(query)
+        query_hash = _hash_sql(normalized_query)
+        cache = await _load_sql_cache(client, conv_id)
+
+        if not force_refresh and query_hash in cache:
+            cache_entry = cache[query_hash]
+            try:
+                is_stale = await _is_cache_entry_stale(client, cache_entry)
+            except Exception as freshness_error:  # pragma: no cover - defensive
+                logger.debug("Cache freshness check failed: %s", freshness_error)
+                is_stale = True
+
+            if not is_stale:
+                cached_result = cache_entry.get("result")
+                if isinstance(cached_result, dict):
+                    reuse_msg = cache_entry.get("executed_at", "cached result")
+                    yield (
+                        f"Reusing cached query result from {reuse_msg} (no schema changes detected).",
+                        cached_result,
+                    )
+                    return
+
         try:
             result = await asyncio.to_thread(client.execute_query, query)
             result_json = json.loads(result)
             row_data = result_json.get("rowData", [])
             num_rows = len(row_data)
 
+            # Generate table artifact if we have data
+            if num_rows > 0 and row_data:
+                try:
+                    from openbb_ai.helpers import table
+
+                    # Create table artifact with query results
+                    table_artifact = table(
+                        data=row_data,
+                        name="Query Results",
+                        description=(
+                            query[:200] if len(query) <= 200 else query[:197] + "..."
+                        ),
+                    )
+
+                    # Yield table artifact for UI
+                    yield to_sse(table_artifact)
+
+                except Exception as artifact_error:
+                    logger.warning(f"Failed to create table artifact: {artifact_error}")
+
+            # Generate text summary for LLM
             if num_rows == 0:
                 output = "Query executed successfully. Returned 0 rows."
             else:
-                # Get headers from the first row
                 headers = list(row_data[0].keys()) if row_data else []
-
-                # Limit output to 50 rows for LLM context
-                limit = 50
-                display_rows = min(num_rows, limit)
-
-                estimated_size = (
-                    len("| " + " | ".join(headers) + " |\n") * 2
-                )  # Header + separator
-                for row in row_data[:10]:  # Sample first 10 rows to estimate
-                    values = [str(row.get(h, "")) for h in headers]
-                    estimated_size += len("| " + " | ".join(values) + " |\n")
-                estimated_size = (
-                    estimated_size * (num_rows / 10)
-                    if num_rows > 10
-                    else estimated_size
+                output = (
+                    f"Query returned {num_rows} rows with columns: {', '.join(headers)}"
                 )
 
-                if estimated_size > 20000:  # If likely to exceed safe limit
-                    # Return data with instructions for chunked display
-                    output = f"Query returned {num_rows} rows (ALL DATA FOLLOWS - NO TRUNCATION):\n\n"
-                    output += (
-                        "IMPORTANT: This is the COMPLETE dataset. Display it ALL.\n\n"
-                    )
-                    output += "| " + " | ".join(headers) + " |\n"
-                    output += "|" + "|".join(["---" for _ in headers]) + "|\n"
-
-                    # Include ALL rows but with a marker for the LLM
-                    rows_added = 0
-                    current_chunk = output
-
-                    for row in row_data:
-                        values = []
-                        for h in headers:
-                            val = row.get(h, "")
-                            if val is None:
-                                val_str = "NULL"
-                            else:
-                                val_str = str(val)
-                            values.append(val_str)
-                        row_text = "| " + " | ".join(values) + " |\n"
-
-                        # Check if adding this row would exceed chunk size
-                        if (
-                            len(current_chunk) + len(row_text) > 15000
-                            and rows_added > 0
-                        ):
-                            # Add continuation marker
-                            current_chunk += f"\n[CONTINUE WITH ROWS {rows_added+1}-{num_rows} IN NEXT OUTPUT]\n"
-                            break
-
-                        current_chunk += row_text
-                        rows_added += 1
-
-                    output = current_chunk
-
-                    # If we didn't add all rows, store the rest for continuation
-                    if rows_added < num_rows:
-                        remaining_rows = row_data[rows_added:]
-                        # Store remaining data in cache for continuation
-                        continuation_key = f"query_continuation_{tool_call.id}"
-                        continuation_data = {
-                            "headers": headers,
-                            "remaining_rows": remaining_rows,
-                            "start_row": rows_added + 1,
-                            "total_rows": num_rows,
-                        }
-                        await asyncio.to_thread(
-                            client.set_conversation_data,
-                            tool_args.get("conversation_id", "default"),
-                            continuation_key,
-                            json.dumps(continuation_data),
-                        )
-                        output += (
-                            f"\n\nNOTE: Displaying rows 1-{rows_added} of {num_rows}. "
-                        )
-                        output += (
-                            f"ALL {num_rows} rows are available and MUST be shown. "
-                        )
-                        output += "Continue displaying the remaining rows immediately."
-                else:
-                    # Small enough to display normally
-                    output = f"Query returned {num_rows} rows (displaying all):\n\n"
-                    output += "| " + " | ".join(headers) + " |\n"
-                    output += "|" + "|".join(["---" for _ in headers]) + "|\n"
-
-                    for row in row_data:
-                        values = []
-                        for h in headers:
-                            val = row.get(h, "")
-                            if val is None:
-                                val_str = "NULL"
-                            else:
-                                val_str = str(val)
-                            values.append(val_str)
-                        output += "| " + " | ".join(values) + " |\n"
-
             yield output, result_json
+
+            try:
+                default_db, default_schema = await _get_context_defaults(client)
+                tables = _extract_tables_from_sql(
+                    normalized_query, default_db, default_schema
+                )
+                await _cache_query_result(
+                    client,
+                    conv_id,
+                    cache,
+                    query_hash,
+                    normalized_query,
+                    result_json,
+                    num_rows,
+                    tables,
+                )
+            except Exception as cache_exc:  # pragma: no cover - defensive
+                logger.debug("Skipping query cache storage: %s", cache_exc)
             return
 
         except Exception as e:
@@ -2004,10 +2268,256 @@ CRITICAL:
             yield error_msg, {"error": str(e)}
             return
 
+    elif tool_name == "ai_agg":
+        import re
+
+        instruction = tool_args.get("instruction", "")
+        text = tool_args.get("text")
+        query = tool_args.get("query")
+        text_column = tool_args.get("text_column")
+
+        # Validate parameters
+        if not instruction:
+            error_msg = "Error: 'instruction' parameter is required for ai_agg"
+            yield to_sse(reasoning_step(error_msg, event_type="ERROR"))
+            yield error_msg, {"error": "Missing instruction parameter"}
+            return
+
+        if not text and not (query and text_column):
+            error_msg = "Error: Provide either 'text' for direct aggregation or both 'query' and 'text_column' for query-based aggregation"
+            yield to_sse(reasoning_step(error_msg, event_type="ERROR"))
+            yield error_msg, {"error": "Missing required parameters"}
+            return
+
+        try:
+            # Escape instruction for SQL
+            instruction_escaped = instruction.replace("'", "''")
+
+            # Mode 1: Direct text aggregation
+            if text:
+                text_escaped = text.replace("'", "''")
+                ai_agg_sql = f"SELECT AI_AGG('{text_escaped}', '{instruction_escaped}') AS AGGREGATED_RESULT"
+
+                yield to_sse(
+                    reasoning_step(
+                        f"Applying AI_AGG to direct text with instruction: '{instruction[:50]}...'",
+                        event_type="INFO",
+                    )
+                )
+
+            # Mode 2: Query-based aggregation
+            else:
+                text_col_escaped = text_column.replace('"', '""')
+
+                # Check if query has GROUP BY
+                has_group_by = bool(re.search(r"\bGROUP\s+BY\b", query, re.IGNORECASE))
+
+                if has_group_by:
+                    # Query already has GROUP BY, wrap it and apply AI_AGG
+                    ai_agg_sql = f"""
+                    WITH source_data AS (
+                        {query}
+                    )
+                    SELECT *, AI_AGG("{text_col_escaped}", '{instruction_escaped}') AS AGGREGATED_RESULT
+                    FROM source_data
+                    """
+                    yield to_sse(
+                        reasoning_step(
+                            f"Applying AI_AGG with GROUP BY aggregation: '{instruction[:50]}...'",
+                            event_type="INFO",
+                        )
+                    )
+                else:
+                    # No GROUP BY, aggregate all rows
+                    ai_agg_sql = f"""
+                    WITH source_data AS (
+                        {query}
+                    )
+                    SELECT AI_AGG("{text_col_escaped}", '{instruction_escaped}') AS AGGREGATED_RESULT
+                    FROM source_data
+                    """
+                    yield to_sse(
+                        reasoning_step(
+                            f"Applying AI_AGG to all rows with instruction: '{instruction[:50]}...'",
+                            event_type="INFO",
+                        )
+                    )
+
+            # Execute query
+            result = await asyncio.to_thread(client.execute_query, ai_agg_sql)
+            result_json = json.loads(result)
+            row_data = result_json.get("rowData", [])
+
+            if not row_data:
+                yield "No results from AI_AGG", {"error": "No results"}
+                return
+
+            # Format output
+            output = f"**AI Aggregation Results**\n\n**Instruction:** {instruction}\n\n"
+
+            if len(row_data) == 1:
+                # Single result (no grouping)
+                aggregated = row_data[0].get("AGGREGATED_RESULT") or row_data[0].get(
+                    "aggregated_result"
+                )
+                output += f"{aggregated}\n"
+
+            else:
+                # Multiple results (grouped)
+                # Detect group columns (all columns except AGGREGATED_RESULT)
+                group_cols = [
+                    col
+                    for col in row_data[0].keys()
+                    if col.upper() != "AGGREGATED_RESULT"
+                ]
+
+                for row in row_data:
+                    # Build hierarchical header for group
+                    for i, col in enumerate(group_cols):
+                        indent = "  " * i
+                        col_value = row.get(col)
+                        output += f"{indent}**{col}:** {col_value}\n"
+
+                    # Add aggregation result
+                    aggregated = row.get("AGGREGATED_RESULT") or row.get(
+                        "aggregated_result"
+                    )
+                    indent = "  " * len(group_cols)
+                    output += f"{indent}{aggregated}\n\n"
+
+            yield output, {
+                "instruction": instruction,
+                "row_count": len(row_data),
+                "has_grouping": len(row_data) > 1,
+            }
+            return
+
+        except Exception as e:
+            error_msg = f"Error executing AI_AGG: {str(e)}"
+            logger.error("AI_AGG error: %s", traceback.format_exc())
+            yield to_sse(reasoning_step(error_msg, event_type="ERROR"))
+            yield error_msg, {"error": str(e)}
+            return
+
+    elif tool_name == "ai_summarize_agg":
+        import re
+
+        text = tool_args.get("text")
+        query = tool_args.get("query")
+        text_column = tool_args.get("text_column")
+
+        # Validate parameters
+        if not text and not (query and text_column):
+            error_msg = "Error: Provide either 'text' for direct summarization or both 'query' and 'text_column' for query-based summarization"
+            yield to_sse(reasoning_step(error_msg, event_type="ERROR"))
+            yield error_msg, {"error": "Missing required parameters"}
+            return
+
+        try:
+            # Mode 1: Direct text summarization
+            if text:
+                text_escaped = text.replace("'", "''")
+                summarize_sql = f"SELECT AI_SUMMARIZE_AGG('{text_escaped}') AS SUMMARY"
+
+                yield to_sse(
+                    reasoning_step(
+                        "Applying AI_SUMMARIZE_AGG to direct text",
+                        event_type="INFO",
+                    )
+                )
+
+            # Mode 2: Query-based summarization
+            else:
+                text_col_escaped = text_column.replace('"', '""')
+
+                # Check if query has GROUP BY
+                has_group_by = bool(re.search(r"\bGROUP\s+BY\b", query, re.IGNORECASE))
+
+                if has_group_by:
+                    # Query already has GROUP BY, wrap it and apply AI_SUMMARIZE_AGG
+                    summarize_sql = f"""
+                    WITH source_data AS (
+                        {query}
+                    )
+                    SELECT *, AI_SUMMARIZE_AGG("{text_col_escaped}") AS SUMMARY
+                    FROM source_data
+                    """
+                    yield to_sse(
+                        reasoning_step(
+                            "Applying AI_SUMMARIZE_AGG with GROUP BY aggregation",
+                            event_type="INFO",
+                        )
+                    )
+                else:
+                    # No GROUP BY, summarize all rows
+                    summarize_sql = f"""
+                    WITH source_data AS (
+                        {query}
+                    )
+                    SELECT AI_SUMMARIZE_AGG("{text_col_escaped}") AS SUMMARY
+                    FROM source_data
+                    """
+                    yield to_sse(
+                        reasoning_step(
+                            "Applying AI_SUMMARIZE_AGG to all rows",
+                            event_type="INFO",
+                        )
+                    )
+
+            # Execute query
+            result = await asyncio.to_thread(client.execute_query, summarize_sql)
+            result_json = json.loads(result)
+            row_data = result_json.get("rowData", [])
+
+            if not row_data:
+                yield "No results from AI_SUMMARIZE_AGG", {"error": "No results"}
+                return
+
+            # Format output
+            output = "**AI Summary**\n\n"
+
+            if len(row_data) == 1:
+                # Single result (no grouping)
+                summary = row_data[0].get("SUMMARY") or row_data[0].get("summary")
+                output += f"{summary}\n"
+
+            else:
+                # Multiple results (grouped)
+                # Detect group columns (all columns except SUMMARY)
+                group_cols = [
+                    col for col in row_data[0].keys() if col.upper() != "SUMMARY"
+                ]
+
+                for row in row_data:
+                    # Build hierarchical header for group
+                    for i, col in enumerate(group_cols):
+                        indent = "  " * i
+                        col_value = row.get(col)
+                        output += f"{indent}**{col}:** {col_value}\n"
+
+                    # Add summary
+                    summary = row.get("SUMMARY") or row.get("summary")
+                    indent = "  " * len(group_cols)
+                    output += f"{indent}{summary}\n\n"
+
+            yield output, {
+                "row_count": len(row_data),
+                "has_grouping": len(row_data) > 1,
+            }
+            return
+
+        except Exception as e:
+            error_msg = f"Error executing AI_SUMMARIZE_AGG: {str(e)}"
+            logger.error("AI_SUMMARIZE_AGG error: %s", traceback.format_exc())
+            yield to_sse(reasoning_step(error_msg, event_type="ERROR"))
+            yield error_msg, {"error": str(e)}
+            return
+
 
 def get_tool_definitions(client: SnowflakeAI) -> list:
     """Get the list of available tool definitions."""
     raw_tools = [
+        client.text2sql_tool(),
         client.get_table_sample_data_tool(),
         client.get_table_schema_tool(),
         client.get_multiple_table_definitions_tool(),
@@ -2214,6 +2724,66 @@ def get_tool_definitions(client: SnowflakeAI) -> list:
         },
     }
     raw_tools.append(ai_filter_tool)
+
+    # Add ai_agg tool for AI-powered text aggregation
+    ai_agg_tool = {
+        "type": "function",
+        "function": {
+            "name": "ai_agg",
+            "description": "Reduce large text columns using natural language instructions. Handles datasets LARGER than LLM context windows (unlike summarize tool). Examples: AI_AGG(reviews, 'Summarize customer feedback'), AI_AGG('Menu: ' || menu_item || '\\nReview: ' || review, 'Find most positive review to highlight on website'), SELECT product_id, AI_AGG(review, 'Identify common complaints') FROM reviews GROUP BY product_id. Use for: aggregating reviews/comments/transcripts across many rows, extracting patterns from large datasets, custom aggregation instructions like 'Describe common complaints', 'Identify all people mentioned with short biographies', 'Find patterns across customer feedback'.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "instruction": {
+                        "type": "string",
+                        "description": "Natural language instruction describing how to aggregate the text. Use declarative statements like 'Summarize the reviews', 'Identify common themes', 'Find the most positive review'. Be specific about the intended use case.",
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "Direct text string to aggregate. Use for simple aggregations without a query.",
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "SQL query that returns text data to aggregate. Can include GROUP BY to aggregate by groups. Example: 'SELECT product_id, review FROM reviews'.",
+                    },
+                    "text_column": {
+                        "type": "string",
+                        "description": "Column name containing text to aggregate when using 'query' parameter. Required when query is provided.",
+                    },
+                },
+                "required": ["instruction"],
+            },
+        },
+    }
+    raw_tools.append(ai_agg_tool)
+
+    # Add ai_summarize_agg tool for general-purpose text summarization
+    ai_summarize_agg_tool = {
+        "type": "function",
+        "function": {
+            "name": "ai_summarize_agg",
+            "description": "General-purpose summarization of large text columns. Handles datasets LARGER than LLM context windows. Examples: AI_SUMMARIZE_AGG(churn_reason), SELECT restaurant_id, AI_SUMMARIZE_AGG(review) FROM reviews GROUP BY restaurant_id, AI_SUMMARIZE_AGG('Item: ' || item || '\\nReview: ' || text). Automatically generates summaries without needing custom instructions. For specific aggregations with custom prompts like 'identify complaints' or 'find patterns', use ai_agg instead. For single document summarization, use summarize tool.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "Direct text string to summarize. Use for simple summarizations without a query.",
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "SQL query that returns text data to summarize. Can include GROUP BY to summarize by groups.",
+                    },
+                    "text_column": {
+                        "type": "string",
+                        "description": "Column name containing text to summarize when using 'query' parameter. Required when query is provided.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    }
+    raw_tools.append(ai_summarize_agg_tool)
 
     normalized_tools: list[Any] = []
     for tool in raw_tools:

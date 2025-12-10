@@ -141,43 +141,75 @@ def get_or_create_agent(conversation_id: str = "default") -> SnowflakeAgent:
         client_pool[conversation_id] = client
         agent_pool[conversation_id] = client.create_agent()
 
-        # Load preferences from cache if available
+        # Initialize/load conversation from AGENTS_CONVERSATIONS table
+        default_settings = {
+            "model": "openai-gpt-5-chat",
+            "temperature": 0.7,
+            "max_tokens": 4096,
+        }
         try:
-            cached_model = client.get_conversation_data(
-                conversation_id, "model_preference"
+            result = client.get_or_create_conversation(
+                conversation_id, json.dumps(default_settings)
             )
-            if cached_model:
-                model_preferences[conversation_id] = cached_model
-            else:
-                client.set_conversation_data(
-                    conversation_id,
-                    "model_preference",
-                    model_preferences.get(conversation_id, "openai-gpt-5-chat"),
+            # If conversation existed, load its settings
+            if result:
+                try:
+                    existing_settings = json.loads(result)
+                    if "model" in existing_settings:
+                        model_preferences[conversation_id] = existing_settings["model"]
+                    if "temperature" in existing_settings:
+                        temperature_preferences[conversation_id] = float(
+                            existing_settings["temperature"]
+                        )
+                    if "max_tokens" in existing_settings:
+                        max_tokens_preferences[conversation_id] = int(
+                            existing_settings["max_tokens"]
+                        )
+                    if "token_usage" in existing_settings:
+                        token_usage[conversation_id] = existing_settings["token_usage"]
+                    # Restore database and schema context
+                    if "database" in existing_settings or "schema" in existing_settings:
+                        db = existing_settings.get("database")
+                        sch = existing_settings.get("schema")
+                        if db or sch:
+                            client.use_conversation_context(db, sch)
+                            if os.environ.get("SNOWFLAKE_DEBUG"):
+                                logger.debug(
+                                    "Restored context for conversation %s: database=%s, schema=%s",
+                                    conversation_id,
+                                    db,
+                                    sch,
+                                )
+                except (json.JSONDecodeError, ValueError, TypeError):
+                    pass
+        except Exception as e:
+            if os.environ.get("SNOWFLAKE_DEBUG"):
+                logger.debug(
+                    "Error initializing conversation %s: %s", conversation_id, e
                 )
 
-            cached_temperature = client.get_conversation_data(
-                conversation_id, "temperature_preference"
-            )
-            if cached_temperature:
-                temperature_preferences[conversation_id] = float(cached_temperature)
-            else:
-                client.set_conversation_data(
-                    conversation_id,
-                    "temperature_preference",
-                    str(temperature_preferences.get(conversation_id, 0.7)),
+        # Load preferences from AGENTS_CONTEXT_OBJECTS if not already loaded
+        try:
+            if conversation_id not in model_preferences:
+                cached_model = client.get_conversation_data(
+                    conversation_id, "model_preference"
                 )
+                if cached_model:
+                    model_preferences[conversation_id] = cached_model
 
-            cached_max_tokens = client.get_conversation_data(
-                conversation_id, "max_tokens_preference"
-            )
-            if cached_max_tokens:
-                max_tokens_preferences[conversation_id] = int(cached_max_tokens)
-            else:
-                client.set_conversation_data(
-                    conversation_id,
-                    "max_tokens_preference",
-                    str(max_tokens_preferences.get(conversation_id, 4096)),
+            if conversation_id not in temperature_preferences:
+                cached_temperature = client.get_conversation_data(
+                    conversation_id, "temperature_preference"
                 )
+                if cached_temperature:
+                    temperature_preferences[conversation_id] = float(cached_temperature)
+
+            if conversation_id not in max_tokens_preferences:
+                cached_max_tokens = client.get_conversation_data(
+                    conversation_id, "max_tokens_preference"
+                )
+                if cached_max_tokens:
+                    max_tokens_preferences[conversation_id] = int(cached_max_tokens)
 
             # Initialize token usage for new conversation
             if conversation_id not in token_usage:
@@ -846,29 +878,9 @@ async def stream(request_obj: Request, request: QueryRequest):
                         "conversation_id", conv_id
                     )
 
-            # Only process if we have a new user message OR need to respond to existing one
-            if (
-                not has_new_user_message
-                and not widget_context_str
-                and not needs_response
-            ):
-                # Return the last assistant message if it exists
-                for msg in reversed(all_messages):
-                    if msg["role"] == "assistant":
-                        yield to_sse(message_chunk(msg["content"]))
-                        return
-
-                # If no assistant message found, acknowledge the situation
-                yield to_sse(
-                    message_chunk(
-                        "I'm ready to help. Please ask me a question or use /help to see available commands."
-                    )
-                )
-                return
-
+            # Store new messages FIRST before any early returns
             # Only add truly new unique messages from request and store them
             if request_messages_to_add:
-
                 for message in request_messages_to_add:
                     msg_dict = {
                         "role": message.role,
@@ -888,7 +900,7 @@ async def stream(request_obj: Request, request: QueryRequest):
                         msg_id = str(uuid.uuid4())
                         all_messages.append(msg_dict)
 
-                        # Store ONLY new messages in cache
+                        # Store new messages in Snowflake
                         await run_in_thread(
                             client.add_message,
                             conv_id,
@@ -896,6 +908,26 @@ async def stream(request_obj: Request, request: QueryRequest):
                             msg_dict["role"],
                             msg_dict["content"],
                         )
+
+            # Only process if we have a new user message OR need to respond to existing one
+            if (
+                not has_new_user_message
+                and not widget_context_str
+                and not needs_response
+            ):
+                # Return the last assistant message if it exists
+                for msg in reversed(all_messages):
+                    if msg["role"] == "assistant":
+                        yield to_sse(message_chunk(msg["content"]))
+                        return
+
+                # If no assistant message found, acknowledge the situation
+                yield to_sse(
+                    message_chunk(
+                        "I'm ready to help. Please ask me a question or use /help to see available commands."
+                    )
+                )
+                return
             # Get the CURRENT user message from the request (not from cached history)
             current_request_user_msg = None
             for msg in reversed(request.messages):
@@ -1391,6 +1423,14 @@ async def stream(request_obj: Request, request: QueryRequest):
                                     buffered_text_chunks.append(event_data)
                                     buffered_events.append(("text", event_data))
                                     stream_state["full_text"] += event_data
+                            elif event_type == "sql":
+                                if isinstance(event_data, str):
+                                    sql_block = event_data.strip()
+                                    if sql_block:
+                                        formatted_sql = f"```sql\n{sql_block}\n```"
+                                        buffered_text_chunks.append(formatted_sql)
+                                        buffered_events.append(("text", formatted_sql))
+                                        stream_state["full_text"] += formatted_sql
                             elif event_type == "reasoning_complete":
                                 # Emit complete think block as a single reasoning event
                                 if isinstance(event_data, str) and event_data.strip():
@@ -1757,6 +1797,38 @@ async def stream(request_obj: Request, request: QueryRequest):
                                 raw_tool_data = raw_tool_data or {
                                     "error": "empty_result"
                                 }
+
+                            # For text2sql tool, return output directly to user and end conversation
+                            if tool_name == "text2sql":
+                                yield to_sse(message_chunk(current_tool_output_for_llm))
+                                # Store the tool result but don't continue the conversation
+                                tool_result_text = f"[Tool Result from {tool_name}]\n{current_tool_output_for_llm}"
+                                tool_message = {
+                                    "role": "user",
+                                    "content": tool_result_text,
+                                    "details": {
+                                        "is_tool_result": True,
+                                        "message_type": "tool_result",
+                                        "tool_name": tool_name,
+                                    },
+                                }
+                                if should_store_message(
+                                    conv_id,
+                                    tool_message["role"],
+                                    tool_message["content"],
+                                    details=tool_message["details"],
+                                ):
+                                    tool_msg_id = str(uuid.uuid4())
+                                    all_messages.append(tool_message)
+                                    await run_in_thread(
+                                        client.add_message,
+                                        conv_id,
+                                        tool_msg_id,
+                                        tool_message["role"],
+                                        tool_message["content"],
+                                    )
+                                # End the conversation - don't continue to LLM
+                                return
 
                             # Yield completion reasoning step
                             if "Error getting" in str(

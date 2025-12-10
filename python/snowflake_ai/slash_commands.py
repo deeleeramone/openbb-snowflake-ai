@@ -96,7 +96,7 @@ async def handle_slash_command(
 - `/clear` - Clear conversation history
 - `/history` - Show conversation history
 - `/context` - Show database context
-- `/complete <prompt>` - Complete a prompt
+- `/suggest <prompt>` - Generate SQL (text2sql) without executing it
 
 Type any command to get started!"""
         yield to_sse(message_chunk(help_text))
@@ -1018,26 +1018,37 @@ Type any command to get started!"""
         except Exception as e:
             yield to_sse(message_chunk(f"❌ Error switching warehouse: {str(e)}"))
 
-    elif user_command.startswith("/complete "):
-        prompt = user_command[10:].strip()
-        yield to_sse(reasoning_step("Generating completion..."))
-        try:
-            current_model = model_preferences.get(conv_id, selected_model)
-            current_temp = temperature_preferences.get(conv_id, selected_temperature)
-            current_tokens = max_tokens_preferences.get(conv_id, selected_max_tokens)
+    elif user_command.startswith("/suggest "):
+        prompt = user_command[len("/suggest ") :].strip()
 
-            response = await run_in_thread(
-                client.complete,
-                prompt,
-                current_model,
-                current_temp,
-                current_tokens,
-                None,  # context
-                None,  # tools
-            )
-            yield to_sse(message_chunk(response))
+        if not prompt:
+            yield to_sse(message_chunk("❌ Please provide a prompt for /suggest."))
+            return
+
+        yield to_sse(
+            reasoning_step("Calling text2sql to generate SQL without executing it...")
+        )
+        try:
+            raw_response = await run_in_thread(client.text2sql, prompt)
+            parsed = json.loads(raw_response)
+
+            sql_text = (parsed.get("sql") or "").strip()
+            explanation = (parsed.get("explanation") or "").strip()
+            request_id = parsed.get("request_id")
+
+            output_parts = []
+            if explanation:
+                output_parts.append(explanation)
+            if sql_text:
+                output_parts.append(f"```sql\n{sql_text}\n```")
+            else:
+                output_parts.append("No SQL was generated.")
+            if request_id:
+                output_parts.append(f"(request_id: {request_id})")
+
+            yield to_sse(message_chunk("\n\n".join(output_parts)))
         except Exception as e:
-            yield to_sse(message_chunk(f"❌ Error generating completion: {str(e)}"))
+            yield to_sse(message_chunk(f"❌ Error generating SQL suggestion: {str(e)}"))
 
     elif user_command == "/history":
         yield to_sse(reasoning_step("Fetching conversation history..."))
