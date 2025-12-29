@@ -382,3 +382,47 @@ async def iterate_sync_generator(generator):
         if chunk is None:
             break
         yield chunk
+
+
+def format_tool_overview(tool_defs: list[dict] | None) -> str:
+    """Create a human-readable summary of available tools."""
+
+    if not tool_defs:
+        return ""
+
+    lines: list[str] = []
+    for tool in tool_defs:
+        if not isinstance(tool, dict):
+            continue
+
+        function = tool.get("function")
+        if not isinstance(function, dict):
+            continue
+
+        name = function.get("name")
+        if not name:
+            continue
+
+        description = (function.get("description") or "").strip()
+        parameters = function.get("parameters")
+        arg_bits: list[str] = []
+
+        if isinstance(parameters, dict):
+            props = parameters.get("properties")
+            if isinstance(props, dict):
+                for param_name, schema in props.items():
+                    if not isinstance(schema, dict):
+                        continue
+                    param_text = param_name
+                    param_type = schema.get("type")
+                    param_desc = (schema.get("description") or "").strip()
+                    if param_type:
+                        param_text += f" ({param_type})"
+                    if param_desc:
+                        param_text += f": {param_desc}"
+                    arg_bits.append(param_text)
+
+        arg_text = f" Args: {'; '.join(arg_bits)}" if arg_bits else ""
+        lines.append(f"- {name}: {description}{arg_text}".strip())
+
+    return "\n".join(lines)

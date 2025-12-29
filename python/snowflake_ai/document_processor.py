@@ -1,5 +1,7 @@
 """Document processing singleton for Snowflake AI."""
 
+# pylint: disable=C0302,R1702
+
 from __future__ import annotations
 
 import asyncio
@@ -810,17 +812,29 @@ class DocumentProcessor:
         """
         await self._run_in_thread(client.execute_statement, delete_sql)
 
-        batch_size = 100
+        def escape_sql_string(s: str) -> str:
+            """Properly escape a string for SQL insertion using $$ delimiters."""
+            if not s:
+                return ""
+            # Replace $$ with $ $ to avoid breaking our delimiter
+            s = s.replace("$$", "$ $")
+            # Remove null bytes
+            s = s.replace("\x00", "")
+            return s
+
+        # Batch insert using dollar-quoted strings to handle any content
+        batch_size = 500
         for i in range(0, len(positions), batch_size):
             batch = positions[i : i + batch_size]
             values = []
             for pos in batch:
-                text_escaped = pos["text"].replace("'", "''")
-                stage_path_escaped = stage_path.replace("'", "''")
-                file_name_escaped = file_name.replace("'", "''")
+                text_escaped = escape_sql_string(pos["text"])
+                stage_path_escaped = escape_sql_string(stage_path)
+                file_name_escaped = escape_sql_string(file_name)
+                # Use $$ delimiters for text to handle quotes, newlines, etc.
                 values.append(
-                    f"('{file_name_escaped}', '{stage_path_escaped}', "
-                    f"{pos['page']}, '{text_escaped}', "
+                    f"($${file_name_escaped}$$, $${stage_path_escaped}$$, "
+                    f"{pos['page']}, $${text_escaped}$$, "
                     f"{pos['x0']}, {pos['top']}, {pos['x1']}, {pos['bottom']})"
                 )
             if values:
@@ -1452,7 +1466,7 @@ class DocumentProcessor:
                         0,  -- chunk_index (whole page for now)
                         'text',
                         PAGE_CONTENT,
-                        SNOWFLAKE.CORTEX.EMBED_TEXT_1024('snowflake-arctic-embed-l-v2.0', PAGE_CONTENT),
+                        AI_EMBED('snowflake-arctic-embed-l-v2.0', PAGE_CONTENT),
                         'snowflake-arctic-embed-l-v2.0'
                     FROM {parse_table}
                     WHERE FILE_NAME = :P_FILE_NAME 
@@ -1612,74 +1626,33 @@ class DocumentProcessor:
                 embed_images,
             )
 
-            # Execute the stored procedure (this blocks until complete)
-            await self._run_in_thread(client.execute_statement, call_sql)
-
-            # Monitor job status with polling loop
-            max_wait_seconds = 900  # 15 minute timeout
-            poll_interval = 2  # Check every 2 seconds
-            elapsed = 0
-            last_status = None
-            last_step = None
-
-            while elapsed < max_wait_seconds:
-                job_info = await self.get_processing_job_status(client, job_id)
-                if not job_info:
-                    logger.warning("[Job %s] Job not found in status table", job_id)
-                    break
-
-                current_status = job_info.get("status")
-                current_step = job_info.get("last_completed_step")
-                error_msg = job_info.get("error_message")
-
-                # Log status transitions
-                if current_status != last_status or current_step != last_step:
-                    if current_status == "failed":
-                        logger.error(
-                            "[Job %s] FAILED at step '%s': %s",
+            # Execute the stored procedure in a background thread
+            # Don't wait for completion - let it run asynchronously
+            # The job status table tracks progress
+            async def run_procedure_background():
+                try:
+                    await self._run_in_thread(client.execute_statement, call_sql)
+                    logger.info("[Job %s] Stored procedure completed", job_id)
+                except Exception as proc_err:
+                    logger.error(
+                        "[Job %s] Stored procedure failed: %s", job_id, proc_err
+                    )
+                    # Update job status on failure
+                    try:
+                        await self.update_processing_job(
+                            client,
                             job_id,
-                            current_step or "unknown",
-                            error_msg or "No error message",
+                            status="failed",
+                            error_message=str(proc_err),
                         )
-                    else:
-                        logger.info(
-                            "[Job %s] Status: %s, Step: %s",
-                            job_id,
-                            current_status,
-                            current_step or "starting",
-                        )
-                    last_status = current_status
-                    last_step = current_step
+                    except Exception:
+                        pass
 
-                # Check for terminal states
-                if current_status in ("completed", "failed"):
-                    if current_status == "completed":
-                        page_count = job_info.get("page_count", 0)
-                        embed_count = job_info.get("embedding_count", 0)
-                        logger.info(
-                            "[Job %s] COMPLETED: %d pages, %d embeddings",
-                            job_id,
-                            page_count,
-                            embed_count,
-                        )
-                    return current_status == "completed"
+            # Fire and forget - don't await
+            asyncio.create_task(run_procedure_background())
 
-                await asyncio.sleep(poll_interval)
-                elapsed += poll_interval
-
-            # Timeout reached
-            logger.error(
-                "[Job %s] TIMEOUT after %d seconds - marking as failed",
-                job_id,
-                max_wait_seconds,
-            )
-            await self.update_processing_job(
-                client,
-                job_id,
-                status="failed",
-                error_message=f"Processing timed out after {max_wait_seconds} seconds",
-            )
-            return False
+            # Return immediately - procedure runs in background
+            return True
         except Exception as e:
             logger.error("Failed to start document processing: %s", e, exc_info=True)
             return False
@@ -1806,13 +1779,15 @@ class DocumentProcessor:
             metadata_table = f"{db_name}.{user_schema}.DOCUMENT_IMAGES_METADATA"
 
             # Clean up old images for this document
+            # Sanitize filename for stage paths (replace spaces with underscores)
+            file_name_safe = file_name.replace(" ", "_")
             file_name_escaped = file_name.replace("'", "''")
             try:
                 # Delete from metadata table
                 delete_sql = f"DELETE FROM {metadata_table} WHERE FILE_NAME = '{file_name_escaped}'"
                 await self._run_in_thread(client.execute_statement, delete_sql)
-                # Remove from stage
-                remove_sql = f"REMOVE @{qualified_stage}/{file_name_escaped}/"
+                # Remove from stage - use safe filename for path
+                remove_sql = f"REMOVE @{qualified_stage}/{file_name_safe}/"
                 await self._run_in_thread(client.execute_statement, remove_sql)
                 logger.info("Cleaned up old images for %s", file_name)
             except Exception as e:
@@ -1834,8 +1809,8 @@ class DocumentProcessor:
                 nonlocal uploaded_count
                 async with upload_semaphore:
                     try:
-                        # Simple path: filename/page_X_image_Y.format
-                        relative_path = f"{file_name}/page_{img['page_number']}_image_{img['image_index']}.{img['format']}"
+                        # Simple path: filename/page_X_image_Y.format (use safe filename)
+                        relative_path = f"{file_name_safe}/page_{img['page_number']}_image_{img['image_index']}.{img['format']}"
                         full_stage_path = f"@{qualified_stage}/{relative_path}"
 
                         # Upload image bytes to stage
@@ -1846,7 +1821,7 @@ class DocumentProcessor:
                             stage_name,
                         )
 
-                        # Store metadata in table
+                        # Store metadata in table (use original filename for metadata)
                         stage_path_escaped = stage_path.replace("'", "''")
                         relative_path_escaped = relative_path.replace("'", "''")
                         full_stage_path_escaped = full_stage_path.replace("'", "''")
@@ -2197,8 +2172,6 @@ class DocumentProcessor:
         list[dict]
             List of rendered image dictionaries
         """
-        from PIL import Image
-
         rendered_images = []
 
         try:
@@ -2327,9 +2300,8 @@ class DocumentProcessor:
             WHERE FILE_NAME = '{file_name_escaped}'
             """
             result = await self._run_in_thread(client.execute_statement, check_sql)
-            if result:
-                import json
 
+            if result:
                 rows = json.loads(result) if isinstance(result, str) else []
                 existing_count = rows[0].get("CNT", 0) if rows else 0
                 if existing_count > 0:
@@ -2686,8 +2658,7 @@ class DocumentProcessor:
             self.set_pdf_blocks(conversation_id, text_positions)
             return True
         except Exception as exc:  # noqa: W0718
-            if os.environ.get("SNOWFLAKE_DEBUG"):
-                logger.error("Failed to extract PDF positions: %s", exc)
+            logger.error("Failed to extract PDF positions: %s", exc)
             return False
 
     async def ensure_pdf_positions(
@@ -3202,8 +3173,6 @@ class DocumentProcessor:
         list[dict]
             List of up to 5 related position dictionaries, sorted by position
         """
-        from difflib import SequenceMatcher
-
         if not query_text or not pdf_positions or not anchor_position:
             return []
 
@@ -3321,8 +3290,6 @@ class DocumentProcessor:
         dict | None
             Dictionary with match info or None if no good match found
         """
-        from difflib import SequenceMatcher
-
         pages = self.get_document_pages(conversation_id)
         if not pages or not query_text:
             return None
@@ -3484,12 +3451,9 @@ class DocumentProcessor:
         tuple[list[dict], float]
             Tuple of (list of matching chunks with similarity scores, final threshold used)
         """
-        # Progressive thresholds to try
-        thresholds_to_try = [similarity_threshold, 0.5, 0.4]
-        # Remove duplicates and keep only thresholds <= initial
-        thresholds_to_try = sorted(
-            set(t for t in thresholds_to_try if t <= similarity_threshold), reverse=True
-        )
+        # Use a lower minimum threshold and filter in code
+        # This avoids multiple expensive AI_EMBED calls
+        min_threshold = 0.4
 
         try:
             user_schema = await self._get_user_schema(client)
@@ -3504,9 +3468,61 @@ class DocumentProcessor:
                 file_name_escaped = file_name.replace("'", "''")
                 file_filter = f"AND FILE_NAME = '{file_name_escaped}'"
 
-            for current_threshold in thresholds_to_try:
-                # Search TEXT embeddings using snowflake-arctic-embed model
-                text_search_sql = f"""
+            # Search TEXT embeddings - single query with lowest threshold
+            # Fetch more results and filter by score in code
+            text_search_sql = f"""
+            SELECT * FROM (
+                SELECT
+                    EMBEDDING_ID,
+                    FILE_NAME,
+                    STAGE_PATH,
+                    PAGE_NUMBER,
+                    CHUNK_INDEX,
+                    CONTENT_TYPE,
+                    CHUNK_TEXT,
+                    IMAGE_STAGE_PATH,
+                    CHUNK_START_CHAR,
+                    CHUNK_END_CHAR,
+                    VECTOR_COSINE_SIMILARITY(
+                        EMBEDDING,
+                        AI_EMBED('snowflake-arctic-embed-l-v2.0', '{query_escaped}')
+                    ) AS SIMILARITY_SCORE
+                FROM {qualified_table}
+                WHERE CONTENT_TYPE = 'text' {file_filter}
+            ) subq
+            WHERE SIMILARITY_SCORE >= {min_threshold}
+            ORDER BY SIMILARITY_SCORE DESC
+            LIMIT {top_k * 2}
+            """
+
+            # Run text and image searches in PARALLEL
+            async def search_text():
+                result = await self._run_in_thread(
+                    client.execute_statement, text_search_sql
+                )
+                matches = []
+                if result:
+                    try:
+                        parsed_result = (
+                            json.loads(result) if isinstance(result, str) else result
+                        )
+                        rows = []
+                        if isinstance(parsed_result, dict):
+                            rows = parsed_result.get(
+                                "data", parsed_result.get("DATA", [])
+                            )
+                        elif isinstance(parsed_result, list):
+                            rows = parsed_result
+                        matches = self._parse_embedding_rows(rows)
+                    except json.JSONDecodeError:
+                        logger.warning("Failed to parse text search result as JSON")
+                return matches
+
+            async def search_images():
+                if not include_images:
+                    return []
+
+                image_search_sql = f"""
                 SELECT * FROM (
                     SELECT
                         EMBEDDING_ID,
@@ -3521,121 +3537,85 @@ class DocumentProcessor:
                         CHUNK_END_CHAR,
                         VECTOR_COSINE_SIMILARITY(
                             EMBEDDING,
-                            AI_EMBED('snowflake-arctic-embed-l-v2.0', '{query_escaped}')
+                            AI_EMBED('voyage-multimodal-3', '{query_escaped}')
                         ) AS SIMILARITY_SCORE
                     FROM {qualified_table}
-                    WHERE CONTENT_TYPE = 'text' {file_filter}
+                    WHERE CONTENT_TYPE = 'image' {file_filter}
                 ) subq
-                WHERE SIMILARITY_SCORE >= {current_threshold}
+                WHERE SIMILARITY_SCORE >= {min_threshold}
                 ORDER BY SIMILARITY_SCORE DESC
-                LIMIT {top_k}
+                LIMIT {top_k * 2}
                 """
 
-                result = await self._run_in_thread(
-                    client.execute_statement, text_search_sql
+                image_result = await self._run_in_thread(
+                    client.execute_statement, image_search_sql
                 )
 
-                # execute_statement returns JSON string, not a cursor
-                all_matches = []
-
-                if result:
+                matches = []
+                if image_result:
                     try:
-                        parsed_result = (
-                            json.loads(result) if isinstance(result, str) else result
+                        parsed_image_result = (
+                            json.loads(image_result)
+                            if isinstance(image_result, str)
+                            else image_result
                         )
-                        rows = []
-                        if isinstance(parsed_result, dict):
-                            rows = parsed_result.get(
-                                "data", parsed_result.get("DATA", [])
+                        image_rows = []
+                        if isinstance(parsed_image_result, dict):
+                            image_rows = parsed_image_result.get(
+                                "data", parsed_image_result.get("DATA", [])
                             )
-                        elif isinstance(parsed_result, list):
-                            rows = parsed_result
-
-                        all_matches.extend(self._parse_embedding_rows(rows))
+                        elif isinstance(parsed_image_result, list):
+                            image_rows = parsed_image_result
+                        matches = self._parse_embedding_rows(image_rows)
                     except json.JSONDecodeError:
-                        logger.warning("Failed to parse text search result as JSON")
+                        logger.warning("Failed to parse image search result as JSON")
+                return matches
 
-                # Search IMAGE embeddings using voyage-multimodal-3 model
-                if include_images:
-                    image_search_sql = f"""
-                    SELECT * FROM (
-                        SELECT
-                            EMBEDDING_ID,
-                            FILE_NAME,
-                            STAGE_PATH,
-                            PAGE_NUMBER,
-                            CHUNK_INDEX,
-                            CONTENT_TYPE,
-                            CHUNK_TEXT,
-                            IMAGE_STAGE_PATH,
-                            CHUNK_START_CHAR,
-                            CHUNK_END_CHAR,
-                            VECTOR_COSINE_SIMILARITY(
-                                EMBEDDING,
-                                AI_EMBED('voyage-multimodal-3', '{query_escaped}')
-                            ) AS SIMILARITY_SCORE
-                        FROM {qualified_table}
-                        WHERE CONTENT_TYPE = 'image' {file_filter}
-                    ) subq
-                    WHERE SIMILARITY_SCORE >= {current_threshold}
-                    ORDER BY SIMILARITY_SCORE DESC
-                    LIMIT {top_k}
-                    """
+            # Execute searches in parallel
+            text_matches, image_matches = await asyncio.gather(
+                search_text(),
+                search_images(),
+            )
 
-                    image_result = await self._run_in_thread(
-                        client.execute_statement, image_search_sql
-                    )
+            all_matches = text_matches + image_matches
 
-                    if image_result:
-                        try:
-                            parsed_image_result = (
-                                json.loads(image_result)
-                                if isinstance(image_result, str)
-                                else image_result
-                            )
-                            image_rows = []
-                            if isinstance(parsed_image_result, dict):
-                                image_rows = parsed_image_result.get(
-                                    "data", parsed_image_result.get("DATA", [])
-                                )
-                            elif isinstance(parsed_image_result, list):
-                                image_rows = parsed_image_result
-
-                            all_matches.extend(self._parse_embedding_rows(image_rows))
-                        except json.JSONDecodeError:
-                            logger.warning(
-                                "Failed to parse image search result as JSON"
-                            )
-
-                if not all_matches:
-                    logger.info(
-                        "No results at threshold %.2f for query '%s', trying lower...",
-                        current_threshold,
-                        query[:50],
-                    )
-                    continue
-
-                # Sort combined results by similarity score and limit to top_k
-                all_matches.sort(key=lambda x: x["similarity_score"], reverse=True)
-                matches = all_matches[:top_k]
-
-                logger.info(
-                    "Semantic search found %d results for query '%s' (threshold=%.2f, text=%d, images=%d)",
-                    len(matches),
+            if not all_matches:
+                logger.warning(
+                    "No semantic search results for query '%s' at threshold %.2f",
                     query[:50],
-                    current_threshold,
-                    len([m for m in matches if m.get("content_type") == "text"]),
-                    len([m for m in matches if m.get("content_type") == "image"]),
+                    min_threshold,
                 )
-                return matches, current_threshold
+                return [], min_threshold
 
-            # No results at any threshold
-            logger.warning(
-                "No semantic search results at any threshold for query: %s", query[:50]
+            # Sort combined results by similarity score
+            all_matches.sort(key=lambda x: x["similarity_score"], reverse=True)
+
+            # Determine effective threshold based on results
+            # Try thresholds from high to low, return first that has results
+            for threshold in [similarity_threshold, 0.5, 0.4]:
+                filtered = [
+                    m for m in all_matches if m["similarity_score"] >= threshold
+                ]
+                if filtered:
+                    matches = filtered[:top_k]
+                    logger.info(
+                        "Semantic search found %d results for query '%s' (threshold=%.2f, text=%d, images=%d)",
+                        len(matches),
+                        query[:50],
+                        threshold,
+                        len([m for m in matches if m.get("content_type") == "text"]),
+                        len([m for m in matches if m.get("content_type") == "image"]),
+                    )
+                    return matches, threshold
+
+            # Return whatever we have at lowest threshold
+            matches = all_matches[:top_k]
+            logger.info(
+                "Semantic search found %d results at min threshold %.2f",
+                len(matches),
+                min_threshold,
             )
-            return [], (
-                thresholds_to_try[-1] if thresholds_to_try else similarity_threshold
-            )
+            return matches, min_threshold
 
         except Exception as e:
             error_str = str(e)
@@ -4023,6 +4003,7 @@ class DocumentProcessor:
         tuple[bool, str, str | None]
             Tuple of (success, message, stage_path)
         """
+        # pylint: disable=import-outside-toplevel
         import shutil
         import tempfile
         from pathlib import Path
@@ -4037,8 +4018,7 @@ class DocumentProcessor:
                     client.execute_statement, f"CREATE DATABASE IF NOT EXISTS {db_name}"
                 )
             except Exception as e:
-                if os.environ.get("SNOWFLAKE_DEBUG"):
-                    logger.debug("Could not create database: %s", e)
+                logger.debug("Could not create database: %s", e)
 
             try:
                 await self._run_in_thread(
@@ -4046,8 +4026,7 @@ class DocumentProcessor:
                     f"CREATE SCHEMA IF NOT EXISTS {db_name}.{user_schema}",
                 )
             except Exception as e:
-                if os.environ.get("SNOWFLAKE_DEBUG"):
-                    logger.debug("Could not create schema: %s", e)
+                logger.debug("Could not create schema: %s", e)
 
             qualified_stage_name = f'"{db_name}"."{user_schema}"."{stage_name}"'
 
@@ -4063,8 +4042,7 @@ class DocumentProcessor:
                     f"ALTER STAGE {qualified_stage_name} REFRESH",
                 )
             except Exception as e:
-                if os.environ.get("SNOWFLAKE_DEBUG"):
-                    logger.debug("Could not ensure stage: %s", e)
+                logger.debug("Could not ensure stage: %s", e)
 
             temp_dir = None
             try:
@@ -4346,9 +4324,8 @@ class DocumentProcessor:
                     logger.warning("Failed to generate embeddings for %s", filename)
 
         except Exception as e:
-            if os.environ.get("SNOWFLAKE_DEBUG"):
-                logger.error("Background parsing failed for %s: %s", filename, e)
-                traceback.print_exc()
+            logger.error("Background parsing failed for %s: %s", filename, e)
+            traceback.print_exc()
 
     async def check_existing_snowflake_document(
         self,
@@ -4426,8 +4403,7 @@ class DocumentProcessor:
             return None
 
         except Exception as e:
-            if os.environ.get("SNOWFLAKE_DEBUG"):
-                logger.debug("Error checking existing Snowflake document: %s", e)
+            logger.debug("Error checking existing Snowflake document: %s", e)
             return None
 
     def trigger_snowflake_upload_for_widget_pdf(
@@ -5268,9 +5244,8 @@ class DocumentProcessor:
                 _ = await self._run_in_thread(client.execute_statement, remove_query)
             except Exception as e:
                 error_msg = f"Failed to remove file from stage: {e}"
-                if os.environ.get("SNOWFLAKE_DEBUG"):
-                    logger.error("%s", error_msg)
-                    traceback.print_exc()
+                logger.error("%s", error_msg)
+                traceback.print_exc()
                 return False, error_msg
 
             # Also delete from DOCUMENT_PARSE_RESULTS if exists
@@ -5298,9 +5273,8 @@ class DocumentProcessor:
 
         except Exception as e:
             error_msg = f"Failed to remove file from stage: {e}"
-            if os.environ.get("SNOWFLAKE_DEBUG"):
-                logger.error("%s", error_msg)
-                traceback.print_exc()
+            logger.error("%s", error_msg)
+            traceback.print_exc()
 
             return False, error_msg
 
@@ -5335,6 +5309,5 @@ class DocumentProcessor:
         except RuntimeError:
             return asyncio.run(self.remove_file_from_stage(client, file_path))
         except Exception as e:
-            if os.environ.get("SNOWFLAKE_DEBUG"):
-                logger.debug("Error in sync wrapper: %s", e)
+            logger.debug("Error in sync wrapper: %s", e)
             return False, str(e)

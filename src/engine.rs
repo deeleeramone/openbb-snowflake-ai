@@ -122,11 +122,64 @@ pub struct SnowflakeEngine {
     cortex_enabled: bool,
     semantic_model: Option<SemanticModel>,
     semantic_model_stage: Option<String>,
+    #[allow(dead_code)]
     semantic_model_file: Option<String>,
     conversation_history: Vec<CortexMessage>,
     jwt_token: Option<String>,
     cached_semantic_yaml: Option<String>,
     has_semantic_model_cache: bool,
+    /// Track semantic views that have been attempted (for retry logic)
+    attempted_semantic_views: Vec<String>,
+    /// Cache of available semantic views with their metadata
+    cached_semantic_views: Option<Vec<SemanticViewInfo>>,
+}
+
+/// Metadata about a semantic view from SHOW/DESCRIBE SEMANTIC VIEW
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SemanticViewInfo {
+    pub name: String,
+    pub fqn: String,
+    pub database_name: String,
+    pub schema_name: String,
+    pub comment: Option<String>,
+    pub owner: Option<String>,
+    pub owner_role_type: Option<String>,
+    pub created_on: Option<String>,
+    /// Logical tables in this semantic view
+    pub tables: Vec<SemanticTableInfo>,
+    /// Dimensions defined in this semantic view
+    pub dimensions: Vec<SemanticColumnInfo>,
+    /// Facts defined in this semantic view
+    pub facts: Vec<SemanticColumnInfo>,
+    /// Metrics defined in this semantic view
+    pub metrics: Vec<SemanticColumnInfo>,
+}
+
+/// Info about a logical table in a semantic view
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SemanticTableInfo {
+    pub name: String,
+    pub base_table: String,
+    pub base_database: Option<String>,
+    pub base_schema: Option<String>,
+    pub primary_key: Option<String>,
+}
+
+/// Info about a dimension/fact/metric in a semantic view
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SemanticColumnInfo {
+    pub name: String,
+    pub table: Option<String>,
+    pub expression: Option<String>,
+    pub data_type: Option<String>,
+}
+
+/// Internal struct for parsing DESCRIBE SEMANTIC VIEW results
+struct SemanticViewDefinition {
+    tables: Vec<SemanticTableInfo>,
+    dimensions: Vec<SemanticColumnInfo>,
+    facts: Vec<SemanticColumnInfo>,
+    metrics: Vec<SemanticColumnInfo>,
 }
 
 impl fmt::Debug for SnowflakeEngine {
@@ -198,6 +251,8 @@ impl SnowflakeEngine {
             jwt_token: None,
             cached_semantic_yaml: None,
             has_semantic_model_cache: false,
+            attempted_semantic_views: Vec::new(),
+            cached_semantic_views: None,
         };
 
         // Only ensure the database exists, not user-specific resources
@@ -280,13 +335,13 @@ impl SnowflakeEngine {
 
         let schema_name = _get_user_schema_name(&self.user);
         let table_name = format!("OPENBB_AGENTS.{}.AGENTS_MESSAGES", schema_name);
-        
+
         // Escape content for SQL - use $$ delimiter to avoid escaping issues
         let escaped_content = content.replace("$$", "$ $");
         let escaped_conversation_id = conversation_id.replace("'", "''");
         let escaped_message_id = message_id.replace("'", "''");
         let escaped_role = role.replace("'", "''");
-        
+
         let query = format!(
             "INSERT INTO {} (CONVERSATION_ID, MESSAGE_ID, ROLE, CONTENT) VALUES ('{}', '{}', '{}', $${}$$)",
             table_name,
@@ -295,7 +350,7 @@ impl SnowflakeEngine {
             escaped_role,
             escaped_content
         );
-        
+
         // Execute and log any errors
         match self.execute_statement(&query).await {
             Ok(_) => Ok(()),
@@ -438,89 +493,639 @@ impl SnowflakeEngine {
         Ok(warnings)
     }
 
-    /// Try to find a semantic view, returns None if not found
-    async fn find_semantic_view(&self, user_question: &str) -> Option<String> {
-        // Query INFORMATION_SCHEMA.SEMANTIC_VIEWS to get list of semantic views
-        let views_query = format!(
-            "SELECT NAME FROM {}.INFORMATION_SCHEMA.SEMANTIC_VIEWS",
-            self.database
-        );
-        
-        println!("[SEMANTIC VIEW] Running query: {}", views_query);
-        
+    /// Parse explicit view directive from user message.
+    /// Matches patterns like "use semantic view ETF_HOLDINGS_VIEW" or "use the ETF_HOLDINGS_VIEW semantic view"
+    /// Returns the normalized view name (UPPERCASE unless wrapped in double quotes)
+    fn parse_explicit_view_directive(&self, message: &str) -> Option<String> {
+        use regex::Regex;
+
+        // Patterns to match explicit view directives (case-insensitive)
+        // Pattern 1: "use (the )?(semantic )?view NAME"
+        // Pattern 2: "use (the )?NAME (semantic )?view"
+        let patterns = [
+            r#"(?i)use\s+(?:the\s+)?(?:semantic\s+)?view\s+("?[\w_]+"?)"#,
+            r#"(?i)use\s+(?:the\s+)?("?[\w_]+"?)\s+(?:semantic\s+)?view"#,
+        ];
+
+        for pattern in &patterns {
+            if let Ok(re) = Regex::new(pattern) {
+                if let Some(caps) = re.captures(message) {
+                    if let Some(m) = caps.get(1) {
+                        let view_name = m.as_str().trim();
+                        // Check if wrapped in double quotes (preserve case) or normalize to UPPERCASE
+                        if view_name.starts_with('"') && view_name.ends_with('"') {
+                            // Remove quotes but preserve case
+                            return Some(view_name[1..view_name.len() - 1].to_string());
+                        } else {
+                            // Normalize to UPPERCASE per Snowflake convention
+                            return Some(view_name.to_uppercase());
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Load semantic views with their metadata (name, description, tables)
+    async fn load_semantic_views(&mut self) -> Vec<SemanticViewInfo> {
+        // Return cached views if available
+        if let Some(ref views) = self.cached_semantic_views {
+            return views.clone();
+        }
+
+        // Use SHOW SEMANTIC VIEWS command (not INFORMATION_SCHEMA)
+        // See: https://docs.snowflake.com/en/sql-reference/sql/show-semantic-views
+        let views_query = format!("SHOW SEMANTIC VIEWS IN DATABASE {}", self.database);
+
+        if std::env::var("SNOWFLAKE_DEBUG").is_ok() {
+            eprintln!("[DEBUG] [SEMANTIC VIEW] Loading views: {}", views_query);
+        }
+
         let views_result = match self.execute_statement(&views_query).await {
             Ok(r) => r,
             Err(e) => {
-                println!("[SEMANTIC VIEW] Query failed: {}", e);
-                return None;
+                if std::env::var("SNOWFLAKE_DEBUG").is_ok() {
+                    eprintln!("[DEBUG] [SEMANTIC VIEW] Query failed: {}", e);
+                }
+                return Vec::new();
             }
         };
-        
-        println!("[SEMANTIC VIEW] Raw result: {:?}", views_result);
-        
-        let views = match views_result.as_array() {
-            Some(v) if !v.is_empty() => v,
-            _ => {
-                println!("[SEMANTIC VIEW] No semantic views found");
-                return None;
+
+        let views_array = match views_result.as_array() {
+            Some(v) => v,
+            None => {
+                if std::env::var("SNOWFLAKE_DEBUG").is_ok() {
+                    eprintln!(
+                        "[DEBUG] [SEMANTIC VIEW] Result is not an array: {:?}",
+                        views_result
+                    );
+                }
+                return Vec::new();
             }
         };
-        
-        println!("[SEMANTIC VIEW] Found {} semantic views", views.len());
-        
-        // Get the first view (or pick based on name matching if multiple)
-        let view = if views.len() == 1 {
-            &views[0]
-        } else {
-            // Multiple views - pick one that best matches the question keywords
-            let question_lower = user_question.to_lowercase();
-            let mut best_idx = 0;
-            let mut best_score = 0;
-            
-            for (idx, v) in views.iter().enumerate() {
-                let name = v.get("NAME").and_then(|n| n.as_str()).unwrap_or("");
-                let name_lower = name.to_lowercase();
-                
-                let mut score = 0;
-                for word in question_lower.split_whitespace() {
-                    if word.len() > 2 && name_lower.contains(word) {
-                        score += 10;
+
+        if std::env::var("SNOWFLAKE_DEBUG").is_ok() {
+            eprintln!(
+                "[DEBUG] [SEMANTIC VIEW] Got {} rows from SHOW SEMANTIC VIEWS",
+                views_array.len()
+            );
+            if !views_array.is_empty() {
+                eprintln!(
+                    "[DEBUG] [SEMANTIC VIEW] First row structure: {:?}",
+                    views_array[0]
+                );
+            }
+        }
+
+        let mut semantic_views = Vec::new();
+
+        for view in views_array {
+            // SHOW SEMANTIC VIEWS returns all these columns - capture them ALL
+            // Note: Column names are UPPERCASE from the driver
+            let get_str = |key: &str| -> Option<String> {
+                view.get(key)
+                    .or_else(|| view.get(&key.to_lowercase()))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            };
+
+            let name = get_str("NAME").unwrap_or_default();
+            let db_name = get_str("DATABASE_NAME").unwrap_or_else(|| self.database.clone());
+            let schema_name = get_str("SCHEMA_NAME").unwrap_or_else(|| self.schema.clone());
+            let comment = get_str("COMMENT");
+            let owner = get_str("OWNER");
+            let owner_role_type = get_str("OWNER_ROLE_TYPE");
+            let created_on = view
+                .get("CREATED_ON")
+                .or_else(|| view.get("created_on"))
+                .map(|v| {
+                    if let Some(n) = v.as_f64() {
+                        // Convert Unix timestamp to readable format
+                        let secs = n as i64;
+                        format!("{}", secs)
+                    } else if let Some(s) = v.as_str() {
+                        s.to_string()
+                    } else {
+                        v.to_string()
+                    }
+                });
+
+            if std::env::var("SNOWFLAKE_DEBUG").is_ok() {
+                eprintln!("[DEBUG] [SEMANTIC VIEW] Found view - name: {}, db: {}, schema: {}, comment: {:?}", name, db_name, schema_name, comment);
+            }
+
+            let fqn = format!("{}.{}.{}", db_name, schema_name, name);
+
+            semantic_views.push(SemanticViewInfo {
+                name: name.clone(),
+                fqn: fqn.clone(),
+                database_name: db_name,
+                schema_name,
+                comment,
+                owner,
+                owner_role_type,
+                created_on,
+                tables: Vec::new(),
+                dimensions: Vec::new(),
+                facts: Vec::new(),
+                metrics: Vec::new(),
+            });
+        }
+
+        // Now get the actual definitions for each view using DESCRIBE SEMANTIC VIEW
+        for view in &mut semantic_views {
+            if let Ok(definition) = self.describe_semantic_view(&view.fqn).await {
+                view.tables = definition.tables;
+                view.dimensions = definition.dimensions;
+                view.facts = definition.facts;
+                view.metrics = definition.metrics;
+            }
+        }
+
+        if std::env::var("SNOWFLAKE_DEBUG").is_ok() {
+            eprintln!(
+                "[DEBUG] [SEMANTIC VIEW] Loaded {} views with full definitions",
+                semantic_views.len()
+            );
+        }
+
+        // Cache for future use
+        self.cached_semantic_views = Some(semantic_views.clone());
+        semantic_views
+    }
+
+    /// Describe a semantic view to get its full definition (tables, dimensions, facts, metrics)
+    async fn describe_semantic_view(&self, fqn: &str) -> Result<SemanticViewDefinition, String> {
+        let query = format!("DESCRIBE SEMANTIC VIEW {}", fqn);
+        let result = self.execute_statement(&query).await?;
+
+        let rows = result.as_array().ok_or("Result is not an array")?;
+
+        // Group rows by object_kind and object_name
+        let mut current_tables: std::collections::HashMap<String, SemanticTableInfo> =
+            std::collections::HashMap::new();
+        let mut current_dims: std::collections::HashMap<String, SemanticColumnInfo> =
+            std::collections::HashMap::new();
+        let mut current_facts: std::collections::HashMap<String, SemanticColumnInfo> =
+            std::collections::HashMap::new();
+        let mut current_metrics: std::collections::HashMap<String, SemanticColumnInfo> =
+            std::collections::HashMap::new();
+
+        for row in rows {
+            let get_str = |key: &str| -> Option<String> {
+                row.get(key)
+                    .or_else(|| row.get(&key.to_lowercase()))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            };
+
+            let object_kind = get_str("OBJECT_KIND").or_else(|| get_str("object_kind"));
+            let object_name = get_str("OBJECT_NAME")
+                .or_else(|| get_str("object_name"))
+                .unwrap_or_default();
+            let property = get_str("PROPERTY")
+                .or_else(|| get_str("property"))
+                .unwrap_or_default();
+            let property_value = get_str("PROPERTY_VALUE")
+                .or_else(|| get_str("property_value"))
+                .unwrap_or_default();
+
+            match object_kind.as_deref() {
+                Some("TABLE") => {
+                    let entry = current_tables
+                        .entry(object_name.clone())
+                        .or_insert_with(|| SemanticTableInfo {
+                            name: object_name.clone(),
+                            base_table: String::new(),
+                            base_database: None,
+                            base_schema: None,
+                            primary_key: None,
+                        });
+                    match property.as_str() {
+                        "BASE_TABLE_NAME" => entry.base_table = property_value,
+                        "BASE_TABLE_DATABASE_NAME" => entry.base_database = Some(property_value),
+                        "BASE_TABLE_SCHEMA_NAME" => entry.base_schema = Some(property_value),
+                        "PRIMARY_KEY" => entry.primary_key = Some(property_value),
+                        _ => {}
                     }
                 }
-                
-                if score > best_score {
-                    best_score = score;
-                    best_idx = idx;
+                Some("DIMENSION") => {
+                    let entry = current_dims.entry(object_name.clone()).or_insert_with(|| {
+                        SemanticColumnInfo {
+                            name: object_name.clone(),
+                            table: None,
+                            expression: None,
+                            data_type: None,
+                        }
+                    });
+                    match property.as_str() {
+                        "TABLE" => entry.table = Some(property_value),
+                        "EXPRESSION" => entry.expression = Some(property_value),
+                        "DATA_TYPE" => entry.data_type = Some(property_value),
+                        _ => {}
+                    }
+                }
+                Some("FACT") => {
+                    let entry = current_facts.entry(object_name.clone()).or_insert_with(|| {
+                        SemanticColumnInfo {
+                            name: object_name.clone(),
+                            table: None,
+                            expression: None,
+                            data_type: None,
+                        }
+                    });
+                    match property.as_str() {
+                        "TABLE" => entry.table = Some(property_value),
+                        "EXPRESSION" => entry.expression = Some(property_value),
+                        "DATA_TYPE" => entry.data_type = Some(property_value),
+                        _ => {}
+                    }
+                }
+                Some("METRIC") | Some("DERIVED_METRIC") => {
+                    let entry = current_metrics
+                        .entry(object_name.clone())
+                        .or_insert_with(|| SemanticColumnInfo {
+                            name: object_name.clone(),
+                            table: None,
+                            expression: None,
+                            data_type: None,
+                        });
+                    match property.as_str() {
+                        "TABLE" => entry.table = Some(property_value),
+                        "EXPRESSION" => entry.expression = Some(property_value),
+                        "DATA_TYPE" => entry.data_type = Some(property_value),
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let tables: Vec<_> = current_tables.into_values().collect();
+        let dimensions: Vec<_> = current_dims.into_values().collect();
+        let facts: Vec<_> = current_facts.into_values().collect();
+        let metrics: Vec<_> = current_metrics.into_values().collect();
+
+        if std::env::var("SNOWFLAKE_DEBUG").is_ok() {
+            eprintln!(
+                "[DEBUG] [SEMANTIC VIEW] {} has {} tables, {} dimensions, {} facts, {} metrics",
+                fqn,
+                tables.len(),
+                dimensions.len(),
+                facts.len(),
+                metrics.len()
+            );
+        }
+
+        Ok(SemanticViewDefinition {
+            tables,
+            dimensions,
+            facts,
+            metrics,
+        })
+    }
+
+    /// Public method to get semantic views for the LLM tool
+    pub async fn get_semantic_views(&mut self) -> Vec<SemanticViewInfo> {
+        self.load_semantic_views().await
+    }
+    /// Extract description from YAML semantic model definition
+    #[allow(dead_code)]
+    fn extract_description_from_yaml(&self, yaml: &str) -> Option<String> {
+        // Simple extraction - look for "description:" line
+        for line in yaml.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("description:") {
+                let desc = trimmed.strip_prefix("description:").unwrap_or("").trim();
+                // Remove quotes if present
+                let desc = desc.trim_matches(|c| c == '"' || c == '\'');
+                if !desc.is_empty() {
+                    return Some(desc.to_string());
                 }
             }
-            &views[best_idx]
-        };
-        
-        println!("[SEMANTIC VIEW] Selected view: {:?}", view);
-        
-        // INFORMATION_SCHEMA.SEMANTIC_VIEWS returns uppercase NAME column
-        let name = view.get("NAME").and_then(|v| v.as_str())?;
-        
-        // Build fully qualified name: DATABASE.SCHEMA.VIEW_NAME
-        let fqn = format!("{}.{}.{}", self.database, self.schema, name);
-        println!("[SEMANTIC VIEW] Using: {}", fqn);
-        Some(fqn)
+        }
+        None
+    }
+
+    /// Extract table names from YAML semantic model definition
+    #[allow(dead_code)]
+    fn extract_tables_from_yaml(&self, yaml: &str) -> Vec<String> {
+        let mut tables = Vec::new();
+        // Look for "base_table:" or "- name:" patterns
+        for line in yaml.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("base_table:") {
+                let table = trimmed.strip_prefix("base_table:").unwrap_or("").trim();
+                let table = table.trim_matches(|c| c == '"' || c == '\'');
+                if !table.is_empty() {
+                    tables.push(table.to_string());
+                }
+            }
+        }
+        tables
+    }
+
+    /// Simplify a prompt for Cortex Analyst
+    /// Cortex Analyst works best with natural language questions, not SQL construction instructions
+    /// This function extracts the intent from overly technical prompts
+    async fn simplify_prompt_for_analyst(&self, prompt: &str) -> String {
+        // Check if this looks like a SQL construction instruction rather than a natural language question
+        let is_sql_instruction = prompt.to_lowercase().contains("write a valid")
+            || prompt.to_lowercase().contains("write sql")
+            || prompt.to_lowercase().contains("generate a sql")
+            || prompt.to_lowercase().contains("sql query (not a")
+            || prompt.to_lowercase().contains("use the table")
+            || prompt.to_lowercase().contains("aliased as t1")
+            || prompt.to_lowercase().contains("join it with");
+
+        if !is_sql_instruction {
+            // Already looks like a natural language question
+            return prompt.to_string();
+        }
+
+        if std::env::var("SNOWFLAKE_DEBUG").is_ok() {
+            eprintln!("[DEBUG] [CORTEX ANALYST] Simplifying SQL-like prompt to natural language question...");
+        }
+
+        // Use LLM to extract the natural language intent
+        let simplify_prompt = format!(
+            r#"Extract the user's actual question from this technical SQL instruction. 
+Return ONLY a simple natural language question that describes what data the user wants.
+Do NOT include any SQL syntax, table names, aliases, or technical details.
+
+Technical instruction:
+{}
+
+Simple question:"#,
+            prompt
+        );
+
+        let query = format!(
+            "SELECT SNOWFLAKE.CORTEX.COMPLETE('llama3.1-8b', '{}') as result",
+            simplify_prompt.replace("'", "''")
+        );
+
+        match self.execute_statement(&query).await {
+            Ok(result) => {
+                if let Some(rows) = result.as_array() {
+                    if let Some(first_row) = rows.first() {
+                        if let Some(response) =
+                            first_row.get("result").or_else(|| first_row.get("RESULT"))
+                        {
+                            let simplified = response.as_str().unwrap_or("").trim().to_string();
+                            if !simplified.is_empty() {
+                                if std::env::var("SNOWFLAKE_DEBUG").is_ok() {
+                                    eprintln!(
+                                        "[DEBUG] [CORTEX ANALYST] Simplified prompt: {}",
+                                        simplified
+                                    );
+                                }
+                                return simplified;
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                if std::env::var("SNOWFLAKE_DEBUG").is_ok() {
+                    eprintln!("[DEBUG] [CORTEX ANALYST] Failed to simplify prompt: {}", e);
+                }
+            }
+        }
+
+        // Fallback: return original prompt
+        prompt.to_string()
+    }
+
+    /// Use LLM to select the best semantic view for a given question
+    async fn select_best_semantic_view(
+        &self,
+        question: &str,
+        views: &[SemanticViewInfo],
+        exclude_views: &[String],
+    ) -> Option<String> {
+        // Filter out already-attempted views
+        let available_views: Vec<&SemanticViewInfo> = views
+            .iter()
+            .filter(|v| !exclude_views.contains(&v.fqn))
+            .collect();
+
+        if available_views.is_empty() {
+            if std::env::var("SNOWFLAKE_DEBUG").is_ok() {
+                eprintln!("[DEBUG] [SEMANTIC VIEW] No available views (all excluded)");
+            }
+            return None;
+        }
+
+        if available_views.len() == 1 {
+            let fqn = available_views[0].fqn.clone();
+            if std::env::var("SNOWFLAKE_DEBUG").is_ok() {
+                eprintln!("[DEBUG] [SEMANTIC VIEW] Only one view available: {}", fqn);
+            }
+            return Some(fqn);
+        }
+
+        // Build prompt for LLM with ACTUAL DEFINITIONS from DESCRIBE SEMANTIC VIEW
+        let mut view_descriptions = String::new();
+        for (i, view) in available_views.iter().enumerate() {
+            let comment = view.comment.as_deref().unwrap_or("No comment");
+
+            // Build table list
+            let tables_str: String = view
+                .tables
+                .iter()
+                .map(|t| format!("{} ({})", t.name, t.base_table))
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            // Build dimension list - include ALL dimensions
+            let dims_str: String = view
+                .dimensions
+                .iter()
+                .map(|d| d.name.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            // Build fact list - include ALL facts
+            let facts_str: String = view
+                .facts
+                .iter()
+                .map(|f| f.name.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            // Build metric list - include ALL metrics
+            let metrics_str: String = view
+                .metrics
+                .iter()
+                .map(|m| m.name.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            view_descriptions.push_str(&format!(
+                "{}. {} ({})\n   Comment: {}\n   Tables: {}\n   Dimensions: {}\n   Facts: {}\n   Metrics: {}\n\n",
+                i + 1, view.name, view.fqn, comment,
+                if tables_str.is_empty() { "none" } else { &tables_str },
+                if dims_str.is_empty() { "none" } else { &dims_str },
+                if facts_str.is_empty() { "none" } else { &facts_str },
+                if metrics_str.is_empty() { "none" } else { &metrics_str }
+            ));
+        }
+
+        let prompt = format!(
+            r#"You are a database expert. Given the following user question and semantic views with their ACTUAL DEFINITIONS (tables, dimensions, facts, metrics), select the BEST semantic view to answer the question.
+
+User Question: {}
+
+Available Semantic Views:
+{}
+
+Respond with ONLY the number (1, 2, etc.) of the best matching view. If none seem appropriate, respond with "0"."#,
+            question, view_descriptions
+        );
+
+        // Call CORTEX.COMPLETE to get LLM selection
+        let query = format!(
+            "SELECT SNOWFLAKE.CORTEX.COMPLETE('llama3.1-8b', $${})$$) as RESULT",
+            prompt.replace("$$", "\\$\\$")
+        );
+
+        match self.execute_statement(&query).await {
+            Ok(result) => {
+                if let Some(arr) = result.as_array() {
+                    if let Some(row) = arr.first() {
+                        if let Some(result_str) = row.get("RESULT").and_then(|r| r.as_str()) {
+                            let trimmed = result_str.trim();
+                            if let Ok(idx) = trimmed.parse::<usize>() {
+                                if idx > 0 && idx <= available_views.len() {
+                                    let selected = &available_views[idx - 1];
+                                    if std::env::var("SNOWFLAKE_DEBUG").is_ok() {
+                                        eprintln!(
+                                            "[DEBUG] [SEMANTIC VIEW] LLM selected view {}: {}",
+                                            idx, selected.fqn
+                                        );
+                                    }
+                                    return Some(selected.fqn.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                if std::env::var("SNOWFLAKE_DEBUG").is_ok() {
+                    eprintln!("[DEBUG] [SEMANTIC VIEW] LLM selection failed: {}", e);
+                }
+            }
+        }
+
+        // Fallback: return first available view
+        let fallback = available_views[0].fqn.clone();
+        if std::env::var("SNOWFLAKE_DEBUG").is_ok() {
+            eprintln!(
+                "[DEBUG] [SEMANTIC VIEW] Falling back to first view: {}",
+                fallback
+            );
+        }
+        Some(fallback)
+    }
+
+    /// Try to find a semantic view, returns None if not found
+    /// Supports explicit view directives and LLM-based selection for multiple views
+    async fn find_semantic_view(&mut self, user_question: &str) -> Option<String> {
+        // 1. Check for explicit view directive first (highest priority)
+        if let Some(explicit_view) = self.parse_explicit_view_directive(user_question) {
+            if std::env::var("SNOWFLAKE_DEBUG").is_ok() {
+                eprintln!(
+                    "[DEBUG] [SEMANTIC VIEW] Explicit directive found: {}",
+                    explicit_view
+                );
+            }
+
+            // Load views to validate the explicit view exists
+            let views = self.load_semantic_views().await;
+
+            // Find matching view (case-insensitive match against view names)
+            for view in &views {
+                if view.name.eq_ignore_ascii_case(&explicit_view) {
+                    if std::env::var("SNOWFLAKE_DEBUG").is_ok() {
+                        eprintln!(
+                            "[DEBUG] [SEMANTIC VIEW] Using explicitly requested view: {}",
+                            view.fqn
+                        );
+                    }
+                    return Some(view.fqn.clone());
+                }
+            }
+
+            // If explicit view not found, warn but continue with normal selection
+            if std::env::var("SNOWFLAKE_DEBUG").is_ok() {
+                eprintln!("[DEBUG] [SEMANTIC VIEW] Warning: Explicit view '{}' not found, falling back to auto-selection", explicit_view);
+            }
+        }
+
+        // 2. Load semantic views with metadata
+        let views = self.load_semantic_views().await;
+
+        if views.is_empty() {
+            if std::env::var("SNOWFLAKE_DEBUG").is_ok() {
+                eprintln!("[DEBUG] [SEMANTIC VIEW] No semantic views found");
+            }
+            return None;
+        }
+
+        if std::env::var("SNOWFLAKE_DEBUG").is_ok() {
+            eprintln!(
+                "[DEBUG] [SEMANTIC VIEW] Found {} semantic views",
+                views.len()
+            );
+        }
+
+        // 3. Use LLM to select best view (excludes already-attempted views)
+        self.select_best_semantic_view(user_question, &views, &self.attempted_semantic_views)
+            .await
+    }
+
+    /// Reset attempted semantic views (call this when starting a new query)
+    pub fn reset_attempted_views(&mut self) {
+        self.attempted_semantic_views.clear();
+    }
+
+    /// Mark a semantic view as attempted
+    pub fn mark_view_attempted(&mut self, view_fqn: &str) {
+        if !self
+            .attempted_semantic_views
+            .contains(&view_fqn.to_string())
+        {
+            self.attempted_semantic_views.push(view_fqn.to_string());
+        }
+    }
+
+    /// Get count of attempted views
+    pub fn attempted_view_count(&self) -> usize {
+        self.attempted_semantic_views.len()
     }
 
     /// Generate AI descriptions for table and columns using SNOWFLAKE.CORTEX.COMPLETE
-    async fn generate_table_and_column_descriptions(&self, table_name: &str, columns: &[&Schema]) -> (String, std::collections::HashMap<String, String>) {
+    async fn generate_table_and_column_descriptions(
+        &self,
+        table_name: &str,
+        columns: &[&Schema],
+    ) -> (String, std::collections::HashMap<String, String>) {
         let mut column_descriptions = std::collections::HashMap::new();
         let mut table_description = format!("Table containing {} data", table_name.to_lowercase());
-        
+
         if columns.is_empty() {
             return (table_description, column_descriptions);
         }
-        
+
         // Build column list with types
-        let columns_info: Vec<String> = columns.iter()
+        let columns_info: Vec<String> = columns
+            .iter()
             .map(|c| format!("  - {} ({})", c.column_name, c.data_type))
             .collect();
-        
+
         let prompt = format!(
             "You are a database expert. Analyze this table and provide:
 1. A comprehensive 1-2 sentence description of what this table represents and its business purpose
@@ -541,13 +1146,13 @@ Return ONLY a JSON object with this exact structure:
             table_name,
             columns_info.join("\n")
         );
-        
+
         // Use llama3.1-70b for better quality
         let query = format!(
             "SELECT SNOWFLAKE.CORTEX.COMPLETE('llama3.1-70b', $${}$$) as RESULT",
             prompt
         );
-        
+
         match self.execute_statement(&query).await {
             Ok(result) => {
                 if let Some(arr) = result.as_array() {
@@ -559,32 +1164,37 @@ Return ONLY a JSON object with this exact structure:
                                     let cleaned = text.trim();
                                     let json_start = cleaned.find('{');
                                     let json_end = cleaned.rfind('}');
-                                    
-                                    let json_text = if let (Some(start), Some(end)) = (json_start, json_end) {
-                                        if end > start {
-                                            &cleaned[start..=end]
+
+                                    let json_text =
+                                        if let (Some(start), Some(end)) = (json_start, json_end) {
+                                            if end > start {
+                                                &cleaned[start..=end]
+                                            } else {
+                                                cleaned
+                                            }
                                         } else {
                                             cleaned
-                                        }
-                                    } else {
-                                        cleaned
-                                    };
-                                    
+                                        };
+
                                     match serde_json::from_str::<serde_json::Value>(json_text) {
                                         Ok(json) => {
                                             // Extract table description
-                                            if let Some(table_desc) = json.get("table_description") {
+                                            if let Some(table_desc) = json.get("table_description")
+                                            {
                                                 if let Some(desc_str) = table_desc.as_str() {
                                                     table_description = desc_str.to_string();
                                                 }
                                             }
-                                            
+
                                             // Extract column descriptions
                                             if let Some(cols) = json.get("columns") {
                                                 if let Some(cols_obj) = cols.as_object() {
                                                     for (col, desc) in cols_obj {
                                                         if let Some(desc_str) = desc.as_str() {
-                                                            column_descriptions.insert(col.to_uppercase(), desc_str.to_string());
+                                                            column_descriptions.insert(
+                                                                col.to_uppercase(),
+                                                                desc_str.to_string(),
+                                                            );
                                                         }
                                                     }
                                                 }
@@ -604,54 +1214,37 @@ Return ONLY a JSON object with this exact structure:
                 // Failed to generate AI descriptions, use fallback
             }
         }
-        
+
         (table_description, column_descriptions)
     }
 
-    /// Detect relationships between tables based on common columns
-    fn generate_table_relationships(&self, all_tables: &std::collections::HashMap<String, Vec<Schema>>) -> Vec<(String, String, String, String)> {
-        let mut relationships = Vec::new();
-        
-        // Look for common column patterns that indicate relationships
-        for (table1_name, table1_cols) in all_tables.iter() {
-            for (table2_name, table2_cols) in all_tables.iter() {
-                if table1_name >= table2_name {
-                    continue; // Skip self and duplicates
-                }
-                
-                // Check for common columns (potential foreign keys)
-                for col1 in table1_cols {
-                    for col2 in table2_cols {
-                        if col1.column_name.to_uppercase() == col2.column_name.to_uppercase() {
-                            // Found a common column
-                            let col_name = col1.column_name.to_uppercase();
-                            
-                            // Common relationship patterns
-                            if col_name.contains("ID") || col_name.contains("KEY") || 
-                               col_name == "CIK" || col_name == "ADSH" || col_name == "EIN" {
-                                relationships.push((
-                                    table1_name.to_lowercase(),
-                                    col1.column_name.to_lowercase(),
-                                    table2_name.to_lowercase(),
-                                    col2.column_name.to_lowercase(),
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        
-        relationships
+    /// Detect relationships between tables based on foreign key metadata
+    /// Currently returns empty - we don't have FK metadata from INFORMATION_SCHEMA
+    /// so we should not guess at relationships based on column name matching
+    fn generate_table_relationships(
+        &self,
+        _all_tables: &std::collections::HashMap<String, Vec<Schema>>,
+    ) -> Vec<(String, String, String, String)> {
+        // TODO: Query INFORMATION_SCHEMA.TABLE_CONSTRAINTS and REFERENTIAL_CONSTRAINTS
+        // to get actual foreign key relationships if available
+        Vec::new()
     }
 
     /// Extract table names mentioned in the prompt
-    fn extract_table_names_from_prompt(&self, prompt: &str) -> Vec<String> {
+    fn extract_table_names_from_prompt(
+        &self,
+        prompt: &str,
+        known_tables: Option<&[String]>,
+    ) -> Vec<String> {
         let mut tables = Vec::new();
         let prompt_upper = prompt.to_uppercase();
-        
+
         // Look for fully qualified table names (DATABASE.SCHEMA.TABLE)
-        let pattern = format!(r"{}\.{}\.(\w+)", regex::escape(&self.database.to_uppercase()), regex::escape(&self.schema.to_uppercase()));
+        let pattern = format!(
+            r"{}\.{}\.(\w+)",
+            regex::escape(&self.database.to_uppercase()),
+            regex::escape(&self.schema.to_uppercase())
+        );
         if let Ok(re) = regex::Regex::new(&pattern) {
             for cap in re.captures_iter(&prompt_upper) {
                 if let Some(table) = cap.get(1) {
@@ -659,27 +1252,63 @@ Return ONLY a JSON object with this exact structure:
                 }
             }
         }
-        
+
+        // Also look for bare table names that match known tables in the schema
+        if let Some(known) = known_tables {
+            for table in known {
+                let table_upper = table.to_uppercase();
+                // Check if the table name appears as a word boundary in the prompt
+                let pattern = format!(r"\b{}\b", regex::escape(&table_upper));
+                if let Ok(re) = regex::Regex::new(&pattern) {
+                    if re.is_match(&prompt_upper) && !tables.contains(&table_upper) {
+                        tables.push(table_upper);
+                    }
+                }
+            }
+        }
+
         tables.sort();
         tables.dedup();
         tables
     }
 
     /// Generate a semantic model YAML string from the current schema, optionally filtered to specific tables
-    async fn generate_semantic_model_yaml_filtered(&self, table_filter: Option<Vec<String>>) -> Result<String, String> {
+    async fn generate_semantic_model_yaml_filtered(
+        &self,
+        table_filter: Option<Vec<String>>,
+    ) -> Result<String, String> {
         eprintln!("[PROGRESS] Analyzing tables and columns in database...");
         let schema = self.get_detailed_schema().await?;
         if schema.is_empty() {
-            return Err("No tables found in schema to generate semantic model".to_string());
+            return Err(format!(
+                "No tables/views found in schema {}.{}",
+                self.database, self.schema
+            ));
         }
-        
+
+        // Collect unique table names for debugging
+        let all_tables: std::collections::HashSet<String> =
+            schema.iter().map(|s| s.table_name.clone()).collect();
+        eprintln!(
+            "[SCHEMA] Found {} tables/views: {:?}",
+            all_tables.len(),
+            all_tables
+        );
+
+        if let Some(ref filter) = table_filter {
+            eprintln!("[SCHEMA] Filtering to: {:?}", filter);
+        }
+
         // Group columns by table
         let mut tables_map: std::collections::HashMap<String, Vec<Schema>> =
             std::collections::HashMap::new();
         for col in schema {
             // If table filter is specified, only include matching tables
             if let Some(ref filter) = table_filter {
-                if !filter.iter().any(|f| f.to_uppercase() == col.table_name.to_uppercase()) {
+                if !filter
+                    .iter()
+                    .any(|f| f.to_uppercase() == col.table_name.to_uppercase())
+                {
                     continue;
                 }
             }
@@ -688,52 +1317,89 @@ Return ONLY a JSON object with this exact structure:
                 .or_default()
                 .push(col);
         }
-        
+
         if tables_map.is_empty() {
             return Err("No matching tables found in schema".to_string());
         }
-        
-        eprintln!("[PROGRESS] Detecting relationships between tables...");
-        // Detect relationships between tables
+
+        // Get relationships (currently empty - no FK metadata available)
         let relationships = self.generate_table_relationships(&tables_map);
-        
+
+        // Build a map of table -> primary key columns from relationships (if any)
+        let mut primary_keys: std::collections::HashMap<String, std::collections::HashSet<String>> =
+            std::collections::HashMap::new();
+        for (table1, col1, table2, col2) in &relationships {
+            primary_keys
+                .entry(table1.clone())
+                .or_default()
+                .insert(col1.clone());
+            primary_keys
+                .entry(table2.clone())
+                .or_default()
+                .insert(col2.clone());
+        }
+
         let mut yaml = String::new();
         yaml.push_str(&format!("name: {}_semantic_model\n", self.schema));
         yaml.push_str(&format!("description: Comprehensive semantic model for {}.{} with AI-generated descriptions and relationships\n\n", self.database, self.schema));
         yaml.push_str("tables:\n");
-        
-        eprintln!("[PROGRESS] Generating AI descriptions for tables and columns using Cortex LLM...");
+
+        eprintln!(
+            "[PROGRESS] Generating AI descriptions for tables and columns using Cortex LLM..."
+        );
         for (table_name, columns) in &tables_map {
             // Convert to references for the function
             let column_refs: Vec<&Schema> = columns.iter().collect();
             // Generate AI descriptions for table and columns
-            let (table_desc, descriptions) = self.generate_table_and_column_descriptions(table_name, &column_refs).await;
-            
+            let (table_desc, descriptions) = self
+                .generate_table_and_column_descriptions(table_name, &column_refs)
+                .await;
+
             yaml.push_str(&format!("  - name: {}\n", table_name.to_lowercase()));
             yaml.push_str(&format!("    description: {}\n", table_desc));
             yaml.push_str("    base_table:\n");
             yaml.push_str(&format!("      database: {}\n", self.database));
             yaml.push_str(&format!("      schema: {}\n", self.schema));
             yaml.push_str(&format!("      table: {}\n", table_name));
-            
+
+            // Add primary_key if this table participates in relationships
+            let table_lower = table_name.to_lowercase();
+            if let Some(pk_cols) = primary_keys.get(&table_lower) {
+                yaml.push_str("    primary_key:\n");
+                yaml.push_str("      columns:\n");
+                for pk_col in pk_cols {
+                    yaml.push_str(&format!("        - {}\n", pk_col));
+                }
+            }
+
             // Separate dimensions (non-numeric) from facts (numeric)
             let mut dimensions = Vec::new();
             let mut facts = Vec::new();
             let mut time_dimensions = Vec::new();
-            
+
             for col in columns {
                 let data_type = col.data_type.to_uppercase();
                 let col_name = &col.column_name;
-                
-                if data_type.contains("DATE") || data_type.contains("TIME") || data_type.contains("TIMESTAMP") {
+
+                if data_type.contains("DATE")
+                    || data_type.contains("TIME")
+                    || data_type.contains("TIMESTAMP")
+                {
                     time_dimensions.push(col.clone());
-                } else if data_type.contains("NUMBER") || data_type.contains("INT") || 
-                          data_type.contains("FLOAT") || data_type.contains("DECIMAL") ||
-                          data_type.contains("DOUBLE") || data_type.contains("REAL") {
+                } else if data_type.contains("NUMBER")
+                    || data_type.contains("INT")
+                    || data_type.contains("FLOAT")
+                    || data_type.contains("DECIMAL")
+                    || data_type.contains("DOUBLE")
+                    || data_type.contains("REAL")
+                {
                     // Check if it looks like an ID column (dimension) vs a measure
                     let name_lower = col_name.to_lowercase();
-                    if name_lower.ends_with("_id") || name_lower.ends_with("_key") || 
-                       name_lower == "id" || name_lower.contains("_pk") {
+                    if name_lower.ends_with("_id")
+                        || name_lower.ends_with("_key")
+                        || name_lower == "id"
+                        || name_lower.contains("_pk")
+                    {
                         dimensions.push(col.clone());
                     } else {
                         facts.push(col.clone());
@@ -742,124 +1408,165 @@ Return ONLY a JSON object with this exact structure:
                     dimensions.push(col.clone());
                 }
             }
-            
+
             // Write dimensions with AI descriptions
             if !dimensions.is_empty() {
                 yaml.push_str("    dimensions:\n");
                 for col in &dimensions {
-                    let desc = descriptions.get(&col.column_name.to_uppercase())
+                    let desc = descriptions
+                        .get(&col.column_name.to_uppercase())
                         .map(|s| s.as_str())
                         .unwrap_or(&col.column_name);
-                    yaml.push_str(&format!("      - name: {}\n", col.column_name.to_lowercase()));
+                    yaml.push_str(&format!(
+                        "      - name: {}\n",
+                        col.column_name.to_lowercase()
+                    ));
                     yaml.push_str(&format!("        description: {}\n", desc));
                     yaml.push_str(&format!("        expr: {}\n", col.column_name));
                     yaml.push_str(&format!("        data_type: {}\n", col.data_type));
                 }
             }
-            
+
             // Write time dimensions with AI descriptions
             if !time_dimensions.is_empty() {
                 yaml.push_str("    time_dimensions:\n");
                 for col in &time_dimensions {
-                    let desc = descriptions.get(&col.column_name.to_uppercase())
+                    let desc = descriptions
+                        .get(&col.column_name.to_uppercase())
                         .map(|s| s.as_str())
                         .unwrap_or(&col.column_name);
-                    yaml.push_str(&format!("      - name: {}\n", col.column_name.to_lowercase()));
+                    yaml.push_str(&format!(
+                        "      - name: {}\n",
+                        col.column_name.to_lowercase()
+                    ));
                     yaml.push_str(&format!("        description: {}\n", desc));
                     yaml.push_str(&format!("        expr: {}\n", col.column_name));
                     yaml.push_str(&format!("        data_type: {}\n", col.data_type));
                 }
             }
-            
+
             // Write facts with AI descriptions
             if !facts.is_empty() {
                 yaml.push_str("    facts:\n");
                 for col in &facts {
-                    let desc = descriptions.get(&col.column_name.to_uppercase())
+                    let desc = descriptions
+                        .get(&col.column_name.to_uppercase())
                         .map(|s| s.as_str())
                         .unwrap_or(&col.column_name);
-                    yaml.push_str(&format!("      - name: {}\n", col.column_name.to_lowercase()));
+                    yaml.push_str(&format!(
+                        "      - name: {}\n",
+                        col.column_name.to_lowercase()
+                    ));
                     yaml.push_str(&format!("        description: {}\n", desc));
                     yaml.push_str(&format!("        expr: {}\n", col.column_name));
                     yaml.push_str(&format!("        data_type: {}\n", col.data_type));
                 }
             }
-            
+
             yaml.push('\n');
         }
-        
+
         eprintln!("[PROGRESS] Building semantic model YAML and caching for future requests...");
-        // Add relationships if any were found
+        // Add relationships if any were found (with proper Cortex Analyst schema)
         if !relationships.is_empty() {
             yaml.push_str("relationships:\n");
             for (table1, col1, table2, col2) in relationships {
                 yaml.push_str(&format!("  - name: {}_to_{}\n", table1, table2));
                 yaml.push_str(&format!("    left_table: {}\n", table1));
-                yaml.push_str(&format!("    left_column: {}\n", col1));
                 yaml.push_str(&format!("    right_table: {}\n", table2));
-                yaml.push_str(&format!("    right_column: {}\n", col2));
+                yaml.push_str("    relationship_columns:\n");
+                yaml.push_str(&format!("      - left_column: {}\n", col1));
+                yaml.push_str(&format!("        right_column: {}\n", col2));
+                yaml.push_str("    join_type: left_outer\n");
+                yaml.push_str("    relationship_type: many_to_one\n");
             }
         }
-        
+
         Ok(yaml)
     }
 
-    /// Generate the semantic model YAML to use inline
-    /// Generate a semantic model YAML string from the current schema
-    async fn generate_semantic_model_yaml(&self) -> Result<String, String> {
-        self.generate_semantic_model_yaml_filtered(None).await
-    }
-
-    async fn get_semantic_model_yaml(&self) -> Result<String, String> {
-        self.generate_semantic_model_yaml().await
-    }
-    
-    /// Generate semantic model YAML focused on tables mentioned in the prompt
     async fn get_focused_semantic_model_yaml(&self, prompt: &str) -> Result<String, String> {
-        let mentioned_tables = self.extract_table_names_from_prompt(prompt);
-        
-        if mentioned_tables.is_empty() {
-            eprintln!("[SEMANTIC MODEL] No specific tables mentioned, generating full model");
-            self.generate_semantic_model_yaml_filtered(None).await
-        } else {
-            eprintln!("[SEMANTIC MODEL] Focusing on tables: {:?}", mentioned_tables);
-            self.generate_semantic_model_yaml_filtered(Some(mentioned_tables)).await
+        // Get list of available tables for matching
+        let tables_query = format!(
+            "SELECT TABLE_NAME FROM {}.INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = '{}' ORDER BY TABLE_NAME",
+            self.database, self.schema
+        );
+
+        let tables_result = match self.execute_statement(&tables_query).await {
+            Ok(result) => result,
+            Err(e) => {
+                eprintln!("[SEMANTIC MODEL] Failed to list tables: {}", e);
+                return Err(e);
+            }
+        };
+
+        let mut table_names: Vec<String> = Vec::new();
+        if let Some(rows) = tables_result.as_array() {
+            for row in rows {
+                if let Some(name) = row.get("TABLE_NAME").and_then(|v| v.as_str()) {
+                    table_names.push(name.to_string());
+                }
+            }
         }
+
+        if table_names.is_empty() {
+            return Err("No tables found in schema".to_string());
+        }
+
+        // Extract explicitly mentioned tables from the prompt
+        let mentioned_tables = self.extract_table_names_from_prompt(prompt, Some(&table_names));
+
+        if mentioned_tables.is_empty() {
+            return Err(
+                "No tables specified in prompt. Please specify which tables to use.".to_string(),
+            );
+        }
+
+        eprintln!(
+            "[SEMANTIC MODEL] Focusing on tables: {:?}",
+            mentioned_tables
+        );
+        self.generate_semantic_model_yaml_filtered(Some(mentioned_tables))
+            .await
     }
 
     /// Save semantic model YAML to Snowflake table
     async fn save_semantic_model(&self, yaml_content: &str) -> Result<(), String> {
         let schema = format!("USER_{}", self.user.to_uppercase());
         let table_name = format!("{}.{}.SEMANTIC_MODELS", self.database, schema);
-        
-        println!("[SEMANTIC MODEL] Saving to {}", table_name);
-        
+
+        if std::env::var("SNOWFLAKE_DEBUG").is_ok() {
+            eprintln!("[DEBUG] [SEMANTIC MODEL] Saving to {}", table_name);
+        }
+
         // Create table if it doesn't exist
         let create_table = format!(
             "CREATE TABLE IF NOT EXISTS {} (MODEL_NAME VARCHAR, YAML_CONTENT VARCHAR, CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP())",
             table_name
         );
-        
+
         self.execute_statement(&create_table).await?;
-        
+
         // Delete existing model with same name
         let model_name = format!("{}_semantic_model", self.database);
         let delete_existing = format!(
             "DELETE FROM {} WHERE MODEL_NAME = '{}'",
             table_name, model_name
         );
-        
+
         let _ = self.execute_statement(&delete_existing).await; // Ignore error if no rows
-        
+
         // Insert new model
         let insert_query = format!(
             "INSERT INTO {} (MODEL_NAME, YAML_CONTENT) SELECT '{}', $${}$$",
             table_name, model_name, yaml_content
         );
-        
+
         self.execute_statement(&insert_query).await?;
-        println!("[SEMANTIC MODEL] ✅ Saved to {}", table_name);
-        
+        if std::env::var("SNOWFLAKE_DEBUG").is_ok() {
+            eprintln!("[DEBUG] [SEMANTIC MODEL] ✅ Saved to {}", table_name);
+        }
+
         Ok(())
     }
 
@@ -868,12 +1575,12 @@ Return ONLY a JSON object with this exact structure:
         let schema = format!("USER_{}", self.user.to_uppercase());
         let table_name = format!("{}.{}.SEMANTIC_MODELS", self.database, schema);
         let model_name = format!("{}_semantic_model", self.database);
-        
+
         let query = format!(
             "SELECT YAML_CONTENT FROM {} WHERE MODEL_NAME = '{}' ORDER BY CREATED_AT DESC LIMIT 1",
             table_name, model_name
         );
-        
+
         match self.execute_statement(&query).await {
             Ok(result) => {
                 if let Some(arr) = result.as_array() {
@@ -881,7 +1588,12 @@ Return ONLY a JSON object with this exact structure:
                         if let Some(obj) = row.as_object() {
                             if let Some(yaml_val) = obj.get("YAML_CONTENT") {
                                 if let Some(yaml_str) = yaml_val.as_str() {
-                                    println!("[SEMANTIC MODEL] ✅ Loaded from {}", table_name);
+                                    if std::env::var("SNOWFLAKE_DEBUG").is_ok() {
+                                        eprintln!(
+                                            "[DEBUG] [SEMANTIC MODEL] ✅ Loaded from {}",
+                                            table_name
+                                        );
+                                    }
                                     return Ok(Some(yaml_str.to_string()));
                                 }
                             }
@@ -902,42 +1614,70 @@ Return ONLY a JSON object with this exact structure:
         message: &str,
         use_history: bool,
     ) -> Result<CortexAnalystResponse, String> {
+        // Simplify the prompt if it looks like SQL construction instructions
+        // Cortex Analyst works best with natural language questions
+        let simplified_message = self.simplify_prompt_for_analyst(message).await;
+        let message = &simplified_message;
+
         // Determine which semantic configuration to use
         // Priority: 1) SNOWFLAKE_FILE env var, 2) existing semantic view, 3) cached YAML (memory), 4) saved YAML (Snowflake), 5) generate from schema
-        let (semantic_model_file, semantic_model_yaml, semantic_view_name): (Option<String>, Option<String>, Option<String>) = 
-            if self.semantic_model_stage.is_some() {
-                // Use semantic_model_file from env var
-                (self.semantic_model_stage.clone(), None, None)
-            } else if let Some(view_name) = self.find_semantic_view(message).await {
-                // Found an existing semantic view
-                (None, None, Some(view_name))
-            } else if let Some(cached_yaml) = &self.cached_semantic_yaml {
-                // Use in-memory cached YAML
-                println!("[CORTEX ANALYST] Using cached semantic model from memory");
-                self.has_semantic_model_cache = true;
-                (None, Some(cached_yaml.clone()), None)
-            } else if let Ok(Some(saved_yaml)) = self.load_semantic_model().await {
-                // Load previously saved YAML from Snowflake
-                println!("[CORTEX ANALYST] Loaded semantic model from Snowflake");
-                self.cached_semantic_yaml = Some(saved_yaml.clone());
-                self.has_semantic_model_cache = true;
-                (None, Some(saved_yaml), None)
-            } else {
-                // No semantic view found - generate YAML focused on relevant tables, cache it, and save to Snowflake
-                println!("[CORTEX ANALYST] No semantic view found, generating from schema...");
-                let yaml_content = self.get_focused_semantic_model_yaml(message).await?;
-                
-                // Cache in memory
-                self.cached_semantic_yaml = Some(yaml_content.clone());
-                self.has_semantic_model_cache = true;
-                
-                // Save to Snowflake for future use
-                if let Err(e) = self.save_semantic_model(&yaml_content).await {
-                    println!("[SEMANTIC MODEL] ⚠️ Failed to save to Snowflake: {}", e);
+        let (semantic_model_file, semantic_model_yaml, semantic_view_name): (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = if self.semantic_model_stage.is_some() {
+            // Use semantic_model_file from env var
+            (self.semantic_model_stage.clone(), None, None)
+        } else if let Some(view_name) = self.find_semantic_view(message).await {
+            // Found an existing semantic view - mark it as attempted for retry logic
+            if std::env::var("SNOWFLAKE_DEBUG").is_ok() {
+                eprintln!(
+                    "[DEBUG] [CORTEX ANALYST] Using semantic view: {}",
+                    view_name
+                );
+            }
+            self.mark_view_attempted(&view_name);
+            (None, None, Some(view_name))
+        } else if let Some(cached_yaml) = &self.cached_semantic_yaml {
+            // Use in-memory cached YAML
+            if std::env::var("SNOWFLAKE_DEBUG").is_ok() {
+                eprintln!("[DEBUG] [CORTEX ANALYST] Using cached semantic model from memory");
+            }
+            self.has_semantic_model_cache = true;
+            (None, Some(cached_yaml.clone()), None)
+        } else if let Ok(Some(saved_yaml)) = self.load_semantic_model().await {
+            // Load previously saved YAML from Snowflake
+            if std::env::var("SNOWFLAKE_DEBUG").is_ok() {
+                eprintln!("[DEBUG] [CORTEX ANALYST] Loaded semantic model from Snowflake");
+            }
+            self.cached_semantic_yaml = Some(saved_yaml.clone());
+            self.has_semantic_model_cache = true;
+            (None, Some(saved_yaml), None)
+        } else {
+            // No semantic view found - generate YAML focused on relevant tables, cache it, and save to Snowflake
+            if std::env::var("SNOWFLAKE_DEBUG").is_ok() {
+                eprintln!(
+                    "[DEBUG] [CORTEX ANALYST] No semantic view found, generating from schema..."
+                );
+            }
+            let yaml_content = self.get_focused_semantic_model_yaml(message).await?;
+
+            // Cache in memory
+            self.cached_semantic_yaml = Some(yaml_content.clone());
+            self.has_semantic_model_cache = true;
+
+            // Save to Snowflake for future use
+            if let Err(e) = self.save_semantic_model(&yaml_content).await {
+                if std::env::var("SNOWFLAKE_DEBUG").is_ok() {
+                    eprintln!(
+                        "[DEBUG] [SEMANTIC MODEL] ⚠️ Failed to save to Snowflake: {}",
+                        e
+                    );
                 }
-                
-                (None, Some(yaml_content), None)
-            };
+            }
+
+            (None, Some(yaml_content), None)
+        };
 
         // Generate/set token if we don't have one
         if self.jwt_token.is_none() {
@@ -973,27 +1713,18 @@ Return ONLY a JSON object with this exact structure:
 
         // Add exactly one of: semantic_model (inline YAML), semantic_model_file (stage path), or semantic_view
         if let Some(stage_path) = &semantic_model_file {
-            request_body_map.insert(
-                "semantic_model_file".to_string(),
-                json!(stage_path),
-            );
+            request_body_map.insert("semantic_model_file".to_string(), json!(stage_path));
         } else if let Some(yaml_content) = &semantic_model_yaml {
-            request_body_map.insert(
-                "semantic_model".to_string(),
-                json!(yaml_content),
-            );
+            request_body_map.insert("semantic_model".to_string(), json!(yaml_content));
         } else if let Some(view_name) = &semantic_view_name {
-            request_body_map.insert(
-                "semantic_view".to_string(),
-                json!(view_name),
-            );
+            request_body_map.insert("semantic_view".to_string(), json!(view_name));
         }
 
         let request_body = serde_json::Value::Object(request_body_map);
 
         if std::env::var("SNOWFLAKE_DEBUG").is_ok() {
-            println!(
-                "[CORTEX ANALYST REQUEST BODY]:\n{}",
+            eprintln!(
+                "[DEBUG] [CORTEX ANALYST REQUEST BODY]:\n{}",
                 serde_json::to_string_pretty(&request_body).unwrap()
             );
         }
@@ -1155,36 +1886,84 @@ Return ONLY a JSON object with this exact structure:
         question: &str,
         execute: bool,
     ) -> Result<serde_json::Value, String> {
-        let response = self.chat_with_analyst(question, false).await?;
+        const MAX_SEMANTIC_VIEW_ATTEMPTS: usize = 3;
 
-        let mut sql = None;
-        let mut explanation = None;
+        // Reset attempted views for new query
+        self.reset_attempted_views();
 
-        for content in response.message.content {
-            match content {
-                CortexResponseContent::Sql { statement } => sql = Some(statement),
-                CortexResponseContent::Text { text } => explanation = Some(text),
-                _ => {} // Ignore other content types for now
+        let mut last_error = String::new();
+        let mut attempts = 0;
+
+        while attempts < MAX_SEMANTIC_VIEW_ATTEMPTS {
+            attempts += 1;
+
+            let response = match self.chat_with_analyst(question, false).await {
+                Ok(r) => r,
+                Err(e) => {
+                    last_error = e;
+                    if std::env::var("SNOWFLAKE_DEBUG").is_ok() {
+                        eprintln!(
+                            "[DEBUG] [TEXT2SQL] Attempt {} failed: {}",
+                            attempts, last_error
+                        );
+                    }
+                    continue;
+                }
+            };
+
+            let mut sql = None;
+            let mut explanation = None;
+
+            for content in &response.message.content {
+                match content {
+                    CortexResponseContent::Sql { statement } => sql = Some(statement.clone()),
+                    CortexResponseContent::Text { text } => explanation = Some(text.clone()),
+                    _ => {} // Ignore other content types for now
+                }
+            }
+
+            if let Some(sql_text) = sql {
+                // Success! Return the result
+                if execute {
+                    let results = self.execute_query(&sql_text, None, None, None).await?;
+                    return Ok(json!({
+                        "sql": sql_text,
+                        "explanation": explanation,
+                        "results": results,
+                        "request_id": response.request_id,
+                    }));
+                } else {
+                    return Ok(json!({
+                        "sql": sql_text,
+                        "explanation": explanation,
+                        "request_id": response.request_id,
+                    }));
+                }
+            }
+
+            // No SQL generated - log and try next view
+            last_error = "No SQL generated".to_string();
+            if std::env::var("SNOWFLAKE_DEBUG").is_ok() {
+                eprintln!("[DEBUG] [TEXT2SQL] Attempt {} - No SQL generated, trying next semantic view...", attempts);
+            }
+
+            // Check if we've exhausted all available views
+            let views = self.load_semantic_views().await;
+            let available_count = views
+                .iter()
+                .filter(|v| !self.attempted_semantic_views.contains(&v.fqn))
+                .count();
+
+            if available_count == 0 {
+                if std::env::var("SNOWFLAKE_DEBUG").is_ok() {
+                    eprintln!("[DEBUG] [TEXT2SQL] All semantic views exhausted");
+                }
+                break;
             }
         }
 
-        let sql = sql.ok_or("No SQL generated")?;
-
-        if execute {
-            let results = self.execute_query(&sql, None, None, None).await?;
-            Ok(json!({
-                "sql": sql,
-                "explanation": explanation,
-                "results": results,
-                "request_id": response.request_id,
-            }))
-        } else {
-            Ok(json!({
-                "sql": sql,
-                "explanation": explanation,
-                "request_id": response.request_id,
-            }))
-        }
+        // All attempts exhausted - return structured error for Python fallback
+        Err(format!("ALL_VIEWS_EXHAUSTED: {} attempts failed. Last error: {}. Use LLM fallback to generate SQL.", attempts, last_error))
     }
 
     pub async fn generate_semantic_model_from_schema(&self) -> Result<SemanticModel, String> {
@@ -1594,20 +2373,50 @@ Return ONLY a JSON object with this exact structure:
 
     pub async fn get_available_models(&self) -> Result<Vec<(String, String)>, String> {
         let models = vec![
-            ("claude-sonnet-4-5".to_string(), "Claude Sonnet 4.5 (Preview)".to_string()),
-            ("claude-haiku-4-5".to_string(), "Claude Haiku 4.5 (Preview)".to_string()),
+            (
+                "claude-sonnet-4-5".to_string(),
+                "Claude Sonnet 4.5 (Preview)".to_string(),
+            ),
+            (
+                "claude-haiku-4-5".to_string(),
+                "Claude Haiku 4.5 (Preview)".to_string(),
+            ),
             ("claude-4-sonnet".to_string(), "Claude 4 Sonnet".to_string()),
             ("claude-4-opus".to_string(), "Claude 4 Opus".to_string()),
-            ("claude-3-7-sonnet".to_string(), "Claude 3.7 Sonnet".to_string()),
-            ("claude-3-5-sonnet".to_string(), "Claude 3.5 Sonnet".to_string()),
+            (
+                "claude-3-7-sonnet".to_string(),
+                "Claude 3.7 Sonnet".to_string(),
+            ),
+            (
+                "claude-3-5-sonnet".to_string(),
+                "Claude 3.5 Sonnet".to_string(),
+            ),
             ("openai-gpt-4.1".to_string(), "OpenAI GPT-4.1".to_string()),
             ("openai-o4-mini".to_string(), "OpenAI o4-mini".to_string()),
-            ("openai-gpt-5".to_string(), "OpenAI GPT-5 (Preview)".to_string()),
-            ("openai-gpt-5-mini".to_string(), "OpenAI GPT-5 Mini (Preview)".to_string()),
-            ("openai-gpt-5-nano".to_string(), "OpenAI GPT-5 Nano (Preview)".to_string()),
-            ("openai-gpt-5-chat".to_string(), "OpenAI GPT-5 Chat".to_string()),
-            ("openai-gpt-oss-120b".to_string(), "OpenAI GPT OSS 120B (Preview)".to_string()),
-            ("llama4-maverick".to_string(), "Llama 4 Maverick".to_string()),
+            (
+                "openai-gpt-5".to_string(),
+                "OpenAI GPT-5 (Preview)".to_string(),
+            ),
+            (
+                "openai-gpt-5-mini".to_string(),
+                "OpenAI GPT-5 Mini (Preview)".to_string(),
+            ),
+            (
+                "openai-gpt-5-nano".to_string(),
+                "OpenAI GPT-5 Nano (Preview)".to_string(),
+            ),
+            (
+                "openai-gpt-5-chat".to_string(),
+                "OpenAI GPT-5 Chat".to_string(),
+            ),
+            (
+                "openai-gpt-oss-120b".to_string(),
+                "OpenAI GPT OSS 120B (Preview)".to_string(),
+            ),
+            (
+                "llama4-maverick".to_string(),
+                "Llama 4 Maverick".to_string(),
+            ),
             ("llama3.1-8b".to_string(), "Llama 3.1 8B".to_string()),
             ("llama3.1-70b".to_string(), "Llama 3.1 70B".to_string()),
             ("llama3.1-405b".to_string(), "Llama 3.1 405B".to_string()),
@@ -1615,7 +2424,10 @@ Return ONLY a JSON object with this exact structure:
             ("mistral-7b".to_string(), "Mistral 7B".to_string()),
             ("mistral-large".to_string(), "Mistral Large".to_string()),
             ("mistral-large2".to_string(), "Mistral Large 2".to_string()),
-            ("snowflake-llama-3.3-70b".to_string(), "Snowflake Llama 3.3 70B".to_string()),
+            (
+                "snowflake-llama-3.3-70b".to_string(),
+                "Snowflake Llama 3.3 70B".to_string(),
+            ),
         ];
         Ok(models)
     }
@@ -1654,31 +2466,33 @@ Return ONLY a JSON object with this exact structure:
             return Ok(Vec::new());
         }
 
-        // Check which files have been parsed and get their page counts
-        let mut documents = Vec::new();
+        // Get page counts for ALL files in a single query
+        let page_counts_query = format!(
+            "SELECT FILE_NAME, COUNT(*) as PAGE_COUNT 
+             FROM \"OPENBB_AGENTS\".\"{}\".\"DOCUMENT_PARSE_RESULTS\" 
+             GROUP BY FILE_NAME",
+            schema_name
+        );
 
+        let mut page_count_map: std::collections::HashMap<String, i64> =
+            std::collections::HashMap::new();
+
+        if let Ok(results) = self.session.query(page_counts_query.as_str()).await {
+            for row in results {
+                if let (Ok(file_name), Ok(count)) =
+                    (row.get::<String>("FILE_NAME"), row.get::<i64>("PAGE_COUNT"))
+                {
+                    page_count_map.insert(file_name, count);
+                }
+            }
+        }
+
+        // Build document list using the pre-fetched page counts
+        let mut documents = Vec::new();
         for file_name in stage_files {
             let stage_path = format!("@{}/{}", stage_name, file_name);
-
-            // Check if this file has been parsed
-            let check_query = format!(
-                "SELECT COUNT(*) as PAGE_COUNT FROM \"OPENBB_AGENTS\".\"{}\".\"DOCUMENT_PARSE_RESULTS\" WHERE FILE_NAME = '{}'",
-                schema_name,
-                file_name.replace("'", "''")
-            );
-
-            let (is_parsed, page_count) = match self.session.query(check_query.as_str()).await {
-                Ok(results) => {
-                    if let Some(row) = results.into_iter().next() {
-                        let count: i64 = row.get("PAGE_COUNT").unwrap_or(0);
-                        (count > 0, count)
-                    } else {
-                        (false, 0)
-                    }
-                }
-                Err(_) => (false, 0), // Table might not exist
-            };
-
+            let page_count = *page_count_map.get(&file_name).unwrap_or(&0);
+            let is_parsed = page_count > 0;
             documents.push((file_name, stage_path, is_parsed, page_count));
         }
 
@@ -1979,6 +2793,10 @@ Return ONLY a JSON object with this exact structure:
     /// List all schemas in a specific database (or current if None)
     pub async fn list_schemas(&self, database: Option<&str>) -> Result<Vec<String>, String> {
         let db_to_use = database.unwrap_or(&self.database);
+        // If no database is specified and current database is empty, return error
+        if db_to_use.is_empty() {
+            return Err("No database selected. Use /use_database first.".to_string());
+        }
         // Always query directly from Snowflake
         self.list_schemas_direct(Some(db_to_use))
             .await
@@ -2299,7 +3117,7 @@ Return ONLY a JSON object with this exact structure:
         };
 
         if std::env::var("SNOWFLAKE_DEBUG").is_ok() {
-            println!("[DEBUG] AI_PARSE_DOCUMENT query: {}", query);
+            eprintln!("[DEBUG] AI_PARSE_DOCUMENT query: {}", query);
         }
 
         let results = self
@@ -2422,17 +3240,29 @@ Return ONLY a JSON object with this exact structure:
         let schema_name = _get_user_schema_name(&self.user);
         let table_name = format!("OPENBB_AGENTS.{}.AGENTS_CONVERSATIONS", schema_name);
 
+        // Use TO_VARCHAR to ensure we get a string back, not a VARIANT object
         let query = format!(
-            "SELECT METADATA FROM {} WHERE CONVERSATION_ID = '{}'",
+            "SELECT TO_VARCHAR(METADATA) AS METADATA FROM {} WHERE CONVERSATION_ID = '{}'",
             table_name, conversation_id
         );
         let result = self.execute_statement(&query).await?;
 
         if let Some(rows) = result.as_array() {
             if !rows.is_empty() {
-                if let Some(metadata_str) = rows[0].get("METADATA").and_then(|v| v.as_str()) {
-                    if !metadata_str.is_empty() {
-                        return serde_json::from_str(metadata_str).map_err(|e| e.to_string());
+                // Try to get METADATA as a string first, then as an object
+                if let Some(row) = rows.get(0) {
+                    if let Some(metadata_val) = row.get("METADATA") {
+                        // If it's already a string, parse it
+                        if let Some(metadata_str) = metadata_val.as_str() {
+                            if !metadata_str.is_empty() {
+                                return serde_json::from_str(metadata_str)
+                                    .map_err(|e| e.to_string());
+                            }
+                        }
+                        // If it's an object (VARIANT was returned as JSON), return it directly
+                        else if metadata_val.is_object() {
+                            return Ok(metadata_val.clone());
+                        }
                     }
                 }
             }
@@ -2459,9 +3289,17 @@ Return ONLY a JSON object with this exact structure:
         let schema_name = _get_user_schema_name(&self.user);
         let table_name = format!("OPENBB_AGENTS.{}.AGENTS_CONVERSATIONS", schema_name);
         let settings_str = serde_json::to_string(&settings).map_err(|e| e.to_string())?;
+
+        if std::env::var("SNOWFLAKE_DEBUG").is_ok() {
+            eprintln!(
+                "[DEBUG] update_conversation_settings: conv_id={}, settings={}",
+                conversation_id, settings_str
+            );
+        }
+
         let escaped_settings = settings_str.replace("'", "''");
         let escaped_conv_id = conversation_id.replace("'", "''");
-        
+
         // Use MERGE to insert or update - creates row if it doesn't exist
         let query = format!(
             "MERGE INTO {} AS target \
@@ -2496,12 +3334,29 @@ Return ONLY a JSON object with this exact structure:
         self.has_semantic_model_cache
     }
 
-    pub async fn use_conversation_context(&mut self, database: Option<String>, schema: Option<String>) -> Result<(), String> {
-        if let Some(db) = database {
-            self.database = db;
+    pub async fn use_conversation_context(
+        &mut self,
+        database: Option<String>,
+        schema: Option<String>,
+    ) -> Result<(), String> {
+        // Actually switch the database and schema in Snowflake, not just update internal state
+        if let Some(ref db) = database {
+            if !db.is_empty() {
+                let query = format!("USE DATABASE \"{}\"", db);
+                self.execute_statement(&query)
+                    .await
+                    .map_err(|e| format!("Failed to switch database: {}", e))?;
+                self.database = db.clone();
+            }
         }
-        if let Some(sch) = schema {
-            self.schema = sch;
+        if let Some(ref sch) = schema {
+            if !sch.is_empty() {
+                let query = format!("USE SCHEMA \"{}\"", sch);
+                self.execute_statement(&query)
+                    .await
+                    .map_err(|e| format!("Failed to switch schema: {}", e))?;
+                self.schema = sch.clone();
+            }
         }
         Ok(())
     }

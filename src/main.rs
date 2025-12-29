@@ -1,11 +1,24 @@
+mod agentic;
 mod agents;
 mod engine;
+mod events;
+mod jobs;
 mod lsp;
+mod tools;
 
+use crate::agentic::{extract_sql_snippets, run_agentic_loop};
 use crate::engine::SnowflakeEngine;
+use crate::events::{create_emitter, EventEmitter};
+use crate::jobs::JobManager;
+use crate::tools::ToolExecutor;
 
 use clap::{Parser, Subcommand};
-use futures::StreamExt;
+use rustyline::completion::{Completer, Pair};
+use rustyline::error::ReadlineError;
+use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
+use rustyline::validate::Validator;
+use rustyline::{Config, Context, Editor, Helper};
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
@@ -13,6 +26,263 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use tokio::io::{self, AsyncBufReadExt};
 use uuid::Uuid;
+
+// ============================================================================
+// Chat Completer for rustyline
+// ============================================================================
+
+/// Slash commands available in chat
+const SLASH_COMMANDS: &[&str] = &[
+    "/exit",
+    "/help",
+    "/current",
+    "/context",
+    "/databases",
+    "/schemas",
+    "/warehouses",
+    "/tables",
+    "/all_tables",
+    "/describe",
+    "/complete",
+    "/suggest_query",
+    "/use_database",
+    "/use_warehouse",
+    "/use_schema",
+    "/use_conversation",
+    "/history",
+    "/execute",
+    "/clear",
+    "/reset",
+    "/new",
+    "/list",
+    "/delete",
+    "/upload",
+    "/documents",
+    "/download_document",
+    "/jobs",
+    "/cancel",
+    "/timeout",
+    "/tools",
+    "/conversations",
+    "/label",
+    "/model",
+    "/models",
+    "/temperature",
+    "/max_tokens",
+    "/stages",
+    "/stage_files",
+    "/parse",
+    "/text2sql",
+    "/stats",
+];
+
+/// Helper struct for rustyline completions
+struct ChatHelper {
+    /// Cached list of databases
+    databases: Vec<String>,
+    /// Cached list of schemas  
+    schemas: Vec<String>,
+    /// Cached list of tables
+    tables: Vec<String>,
+    /// Cached list of models
+    models: Vec<String>,
+    /// Cached list of warehouses
+    warehouses: Vec<String>,
+    /// Cached list of conversations
+    conversations: Vec<String>,
+}
+
+impl ChatHelper {
+    fn new() -> Self {
+        Self {
+            databases: Vec::new(),
+            schemas: Vec::new(),
+            tables: Vec::new(),
+            models: Vec::new(),
+            warehouses: Vec::new(),
+            conversations: Vec::new(),
+        }
+    }
+
+    fn update_databases(&mut self, databases: Vec<String>) {
+        self.databases = databases;
+    }
+
+    fn update_schemas(&mut self, schemas: Vec<String>) {
+        self.schemas = schemas;
+    }
+
+    fn update_tables(&mut self, tables: Vec<String>) {
+        self.tables = tables;
+    }
+
+    fn update_models(&mut self, models: Vec<String>) {
+        self.models = models;
+    }
+
+    fn update_warehouses(&mut self, warehouses: Vec<String>) {
+        self.warehouses = warehouses;
+    }
+
+    fn update_conversations(&mut self, conversations: Vec<String>) {
+        self.conversations = conversations;
+    }
+}
+
+impl Completer for ChatHelper {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        let line_to_cursor = &line[..pos];
+
+        // Complete slash commands
+        if line_to_cursor.starts_with('/') {
+            // /use_database <database> - complete with database names
+            if line_to_cursor.starts_with("/use_database ") {
+                let prefix = line_to_cursor.strip_prefix("/use_database ").unwrap_or("");
+                let start = pos - prefix.len();
+                let matches: Vec<Pair> = self
+                    .databases
+                    .iter()
+                    .filter(|db| db.to_uppercase().starts_with(&prefix.to_uppercase()))
+                    .map(|db| Pair {
+                        display: db.clone(),
+                        replacement: db.clone(),
+                    })
+                    .collect();
+                return Ok((start, matches));
+            }
+
+            // /schemas <database> - complete with database names (optional db arg)
+            if line_to_cursor.starts_with("/schemas ") {
+                let prefix = line_to_cursor.strip_prefix("/schemas ").unwrap_or("");
+                let start = pos - prefix.len();
+                let matches: Vec<Pair> = self
+                    .databases
+                    .iter()
+                    .filter(|db| db.to_uppercase().starts_with(&prefix.to_uppercase()))
+                    .map(|db| Pair {
+                        display: db.clone(),
+                        replacement: db.clone(),
+                    })
+                    .collect();
+                return Ok((start, matches));
+            }
+
+            // /use_schema <schema> - complete with schema names
+            if line_to_cursor.starts_with("/use_schema ") {
+                let prefix = line_to_cursor.strip_prefix("/use_schema ").unwrap_or("");
+                let start = pos - prefix.len();
+                let matches: Vec<Pair> = self
+                    .schemas
+                    .iter()
+                    .filter(|s| s.to_uppercase().starts_with(&prefix.to_uppercase()))
+                    .map(|s| Pair {
+                        display: s.clone(),
+                        replacement: s.clone(),
+                    })
+                    .collect();
+                return Ok((start, matches));
+            }
+
+            // /describe <table> - complete with table names
+            if line_to_cursor.starts_with("/describe ") {
+                let prefix = line_to_cursor.strip_prefix("/describe ").unwrap_or("");
+                let start = pos - prefix.len();
+                let matches: Vec<Pair> = self
+                    .tables
+                    .iter()
+                    .filter(|t| t.to_uppercase().starts_with(&prefix.to_uppercase()))
+                    .map(|t| Pair {
+                        display: t.clone(),
+                        replacement: t.clone(),
+                    })
+                    .collect();
+                return Ok((start, matches));
+            }
+
+            // /model <model> - complete with model names
+            if line_to_cursor.starts_with("/model ") {
+                let prefix = line_to_cursor.strip_prefix("/model ").unwrap_or("");
+                let start = pos - prefix.len();
+                let matches: Vec<Pair> = self
+                    .models
+                    .iter()
+                    .filter(|m| m.to_uppercase().starts_with(&prefix.to_uppercase()))
+                    .map(|m| Pair {
+                        display: m.clone(),
+                        replacement: m.clone(),
+                    })
+                    .collect();
+                return Ok((start, matches));
+            }
+
+            // /use_warehouse <warehouse> - complete with warehouse names
+            if line_to_cursor.starts_with("/use_warehouse ") {
+                let prefix = line_to_cursor.strip_prefix("/use_warehouse ").unwrap_or("");
+                let start = pos - prefix.len();
+                let matches: Vec<Pair> = self
+                    .warehouses
+                    .iter()
+                    .filter(|w| w.to_uppercase().starts_with(&prefix.to_uppercase()))
+                    .map(|w| Pair {
+                        display: w.clone(),
+                        replacement: w.clone(),
+                    })
+                    .collect();
+                return Ok((start, matches));
+            }
+
+            // /use_conversation <conversation> - complete with conversation IDs
+            if line_to_cursor.starts_with("/use_conversation ") {
+                let prefix = line_to_cursor
+                    .strip_prefix("/use_conversation ")
+                    .unwrap_or("");
+                let start = pos - prefix.len();
+                let matches: Vec<Pair> = self
+                    .conversations
+                    .iter()
+                    .filter(|c| c.to_uppercase().starts_with(&prefix.to_uppercase()))
+                    .map(|c| Pair {
+                        display: c.clone(),
+                        replacement: c.clone(),
+                    })
+                    .collect();
+                return Ok((start, matches));
+            }
+
+            // Complete the slash command itself
+            let matches: Vec<Pair> = SLASH_COMMANDS
+                .iter()
+                .filter(|cmd| cmd.starts_with(line_to_cursor))
+                .map(|cmd| Pair {
+                    display: cmd.to_string(),
+                    replacement: cmd.to_string(),
+                })
+                .collect();
+            return Ok((0, matches));
+        }
+
+        Ok((pos, Vec::new()))
+    }
+}
+
+impl Hinter for ChatHelper {
+    type Hint = String;
+
+    fn hint(&self, _line: &str, _pos: usize, _ctx: &Context<'_>) -> Option<String> {
+        None
+    }
+}
+
+impl Highlighter for ChatHelper {}
+impl Validator for ChatHelper {}
+impl Helper for ChatHelper {}
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -131,6 +401,12 @@ enum Commands {
         temperature: Option<f32>,
         #[arg(long)]
         max_tokens: Option<i32>,
+        /// Output events as JSON (machine-parseable)
+        #[arg(long)]
+        json: bool,
+        /// Default timeout in seconds for operations
+        #[arg(long, default_value = "120")]
+        timeout: u64,
         #[arg(short = 'e', long)]
         env_file: Option<PathBuf>,
     },
@@ -169,6 +445,13 @@ fn print_chat_help() {
     println!("  /use_schema <schema_name> - Switch to a different schema");
     println!("  /use_warehouse <wh_name>  - Switch to a different warehouse");
     println!("  /current                  - Show current database/schema");
+    println!("  /text2sql <prompt>        - Generate SQL from natural language");
+    println!("  /context                  - Show database context with table counts");
+    println!("  /stats                    - Show conversation statistics");
+    println!("  /jobs [--clear]           - List document processing jobs");
+    println!("  /cancel <job_id>          - Cancel a document processing job");
+    println!("  /timeout [seconds]        - Get or set operation timeout");
+    println!("  /tools                    - List available AI tools");
     println!("  /exit                     - Exit chat");
     println!();
 }
@@ -496,6 +779,8 @@ const MODEL_PREFERENCE_KEY: &str = "model_preference";
 const TEMPERATURE_PREFERENCE_KEY: &str = "temperature_preference";
 const MAX_TOKENS_PREFERENCE_KEY: &str = "max_tokens_preference";
 const LABEL_PREFERENCE_KEY: &str = "conversation_label";
+const DATABASE_PREFERENCE_KEY: &str = "database_preference";
+const SCHEMA_PREFERENCE_KEY: &str = "schema_preference";
 
 fn normalize_context_string(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
@@ -551,12 +836,18 @@ async fn fetch_context_map(
     Ok(map)
 }
 
+/// Context preferences to restore when loading a conversation
+struct RestoredContext {
+    database: Option<String>,
+    schema: Option<String>,
+}
+
 async fn apply_context_preferences(
     engine: &SnowflakeEngine,
     conversation_id: &str,
     config: &mut ConversationConfig,
     overrides: &ConversationOverrides,
-) -> Result<(), String> {
+) -> Result<RestoredContext, String> {
     let context_map = fetch_context_map(engine, conversation_id).await?;
 
     if !overrides.model {
@@ -591,7 +882,17 @@ async fn apply_context_preferences(
         }
     }
 
-    Ok(())
+    // Extract database/schema preferences to be applied by caller
+    let database = context_map
+        .get(DATABASE_PREFERENCE_KEY)
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string());
+    let schema = context_map
+        .get(SCHEMA_PREFERENCE_KEY)
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string());
+
+    Ok(RestoredContext { database, schema })
 }
 
 async fn set_context_value(
@@ -666,13 +967,36 @@ async fn persist_context_preferences(
         let _ = delete_context_value(engine, conversation_id, MAX_TOKENS_PREFERENCE_KEY).await;
     }
 
-    match config.label.as_ref().map(|label| label.trim()).filter(|s| !s.is_empty()) {
+    match config
+        .label
+        .as_ref()
+        .map(|label| label.trim())
+        .filter(|s| !s.is_empty())
+    {
         Some(label) => {
             set_context_value(engine, conversation_id, LABEL_PREFERENCE_KEY, label).await?;
         }
         None => {
             let _ = delete_context_value(engine, conversation_id, LABEL_PREFERENCE_KEY).await;
         }
+    }
+
+    Ok(())
+}
+
+/// Save the current database/schema context to the conversation
+async fn save_database_context(
+    engine: &SnowflakeEngine,
+    conversation_id: &str,
+) -> Result<(), String> {
+    let database = engine.get_database().await.unwrap_or_default();
+    let schema = engine.get_schema().await.unwrap_or_default();
+
+    if !database.is_empty() {
+        set_context_value(engine, conversation_id, DATABASE_PREFERENCE_KEY, &database).await?;
+    }
+    if !schema.is_empty() {
+        set_context_value(engine, conversation_id, SCHEMA_PREFERENCE_KEY, &schema).await?;
     }
 
     Ok(())
@@ -770,7 +1094,44 @@ async fn prompt_for_sql_input(lines: &mut StdinLines) -> Option<String> {
     }
 }
 
-async fn handle_document_commands(input: &str, engine: &mut SnowflakeEngine) -> bool {
+/// Prompt for SQL input using rustyline editor
+fn prompt_for_sql_input_rl<H: Helper>(
+    rl: &mut Editor<H, rustyline::history::DefaultHistory>,
+) -> Option<String> {
+    println!("Enter SQL (terminate with ';' and an empty line):");
+    let mut buffer = String::new();
+    loop {
+        match rl.readline("sql> ") {
+            Ok(line) => {
+                let trimmed = line.trim_end().to_string();
+                if trimmed.is_empty() && buffer.trim_end().ends_with(';') {
+                    break;
+                }
+                buffer.push_str(&trimmed);
+                buffer.push('\n');
+            }
+            Err(ReadlineError::Interrupted) => {
+                println!("^C - Cancelled");
+                return None;
+            }
+            Err(ReadlineError::Eof) => break,
+            Err(_) => return None,
+        }
+    }
+    let cleaned = buffer.trim().trim_end_matches(';').trim().to_string();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+async fn handle_document_commands(
+    input: &str,
+    engine: &mut SnowflakeEngine,
+    job_manager: &mut JobManager,
+    emitter: &EventEmitter,
+) -> bool {
     if input == "/stages" {
         match engine.execute_statement("SHOW STAGES").await {
             Ok(rows) => {
@@ -885,16 +1246,100 @@ async fn handle_document_commands(input: &str, engine: &mut SnowflakeEngine) -> 
         let file_name = path
             .file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or("upload.bin");
-        match fs::read(&path) {
-            Ok(bytes) => match engine.upload_bytes_to_stage(&bytes, file_name, None).await {
-                Ok(stage_path) => {
-                    println!("✓ Uploaded {} to {}\n", file_name, stage_path);
-                }
-                Err(err) => println!("✗ Upload failed: {}\n", err),
-            },
-            Err(err) => println!("✗ Failed to read file: {}\n", err),
+            .unwrap_or("upload.bin")
+            .to_string();
+
+        // Create job for tracking
+        let (job_id, cancel_token) = job_manager.create_job(&file_name);
+
+        // Ensure jobs table exists
+        if let Err(e) = jobs::ensure_jobs_table(engine).await {
+            println!("✗ Failed to initialize jobs table: {}\n", e);
+            return true;
         }
+
+        println!("📤 Starting upload job {} for {}", &job_id[..8], file_name);
+        emitter.job_status(
+            &job_id,
+            &file_name,
+            "pending",
+            Some("Reading file..."),
+            None,
+        );
+
+        // Read file
+        let bytes = match fs::read(&path) {
+            Ok(b) => b,
+            Err(err) => {
+                println!("✗ Failed to read file: {}\n", err);
+                job_manager.remove_job(&job_id);
+                return true;
+            }
+        };
+
+        // Check for cancellation
+        if cancel_token.is_cancelled() {
+            println!("⊘ Upload cancelled.\n");
+            job_manager.remove_job(&job_id);
+            return true;
+        }
+
+        emitter.job_status(
+            &job_id,
+            &file_name,
+            "processing",
+            Some("Uploading to stage..."),
+            None,
+        );
+
+        // Upload to stage
+        match engine.upload_bytes_to_stage(&bytes, &file_name, None).await {
+            Ok(stage_path) => {
+                // Insert job record in database
+                if let Err(e) = jobs::insert_job(engine, &job_id, &file_name, &stage_path).await {
+                    println!("⚠ Upload succeeded but failed to record job: {}", e);
+                }
+
+                // Update job status to complete
+                let _ = jobs::update_job_status(
+                    engine,
+                    &job_id,
+                    jobs::JobStatus::Complete,
+                    Some("Upload complete"),
+                    None,
+                )
+                .await;
+
+                println!("✓ Uploaded {} to {}", file_name, stage_path);
+                println!("  Job ID: {}", job_id);
+                println!("  Use /parse {} to process the document.\n", stage_path);
+
+                emitter.job_status(
+                    &job_id,
+                    &file_name,
+                    "complete",
+                    Some("Upload complete"),
+                    None,
+                );
+            }
+            Err(err) => {
+                // Record failure
+                let _ = jobs::insert_job(engine, &job_id, &file_name, "").await;
+                let _ = jobs::update_job_status(
+                    engine,
+                    &job_id,
+                    jobs::JobStatus::Failed,
+                    None,
+                    Some(&err),
+                )
+                .await;
+
+                println!("✗ Upload failed: {}\n", err);
+                emitter.job_status(&job_id, &file_name, "failed", None, Some(&err));
+            }
+        }
+
+        job_manager.remove_job(&job_id);
         return true;
     }
 
@@ -904,15 +1349,105 @@ async fn handle_document_commands(input: &str, engine: &mut SnowflakeEngine) -> 
             println!("✗ Usage: /parse <stage_path>\n");
             return true;
         }
+
+        // Extract filename from stage path for display
+        let file_name = stage_path
+            .split('/')
+            .last()
+            .unwrap_or(stage_path)
+            .to_string();
+
+        // Create job for tracking
+        let (job_id, cancel_token) = job_manager.create_job(&file_name);
+
+        // Ensure jobs table exists
+        if let Err(e) = jobs::ensure_jobs_table(engine).await {
+            println!("✗ Failed to initialize jobs table: {}\n", e);
+            return true;
+        }
+
+        // Insert job record
+        if let Err(e) = jobs::insert_job(engine, &job_id, &file_name, stage_path).await {
+            println!("⚠ Failed to record job: {}", e);
+        }
+
+        println!("📄 Starting parse job {} for {}", &job_id[..8], file_name);
+        emitter.job_status(
+            &job_id,
+            &file_name,
+            "processing",
+            Some("Parsing document..."),
+            None,
+        );
+
+        // Update status to processing
+        let _ = jobs::update_job_status(
+            engine,
+            &job_id,
+            jobs::JobStatus::Processing,
+            Some("Parsing document..."),
+            None,
+        )
+        .await;
+
+        // Check for cancellation
+        if cancel_token.is_cancelled() {
+            let _ = jobs::update_job_status(
+                engine,
+                &job_id,
+                jobs::JobStatus::Cancelled,
+                None,
+                Some("Cancelled by user"),
+            )
+            .await;
+            println!("⊘ Parse cancelled.\n");
+            job_manager.remove_job(&job_id);
+            return true;
+        }
+
         match engine.ai_parse_document(stage_path, Some("LAYOUT")).await {
             Ok(result) => {
+                // Update job status to complete
+                let _ = jobs::update_job_status(
+                    engine,
+                    &job_id,
+                    jobs::JobStatus::Complete,
+                    Some("Parse complete"),
+                    None,
+                )
+                .await;
+
                 println!(
-                    "✓ Parsed document. Result preview (first 500 chars):\n{}\n",
+                    "✓ Parsed document. Job ID: {}\n  Result preview (first 500 chars):\n{}\n",
+                    job_id,
                     &result.chars().take(500).collect::<String>()
                 );
+
+                emitter.job_status(
+                    &job_id,
+                    &file_name,
+                    "complete",
+                    Some("Parse complete"),
+                    None,
+                );
             }
-            Err(err) => println!("✗ Document parsing failed: {}\n", err),
+            Err(err) => {
+                // Record failure
+                let _ = jobs::update_job_status(
+                    engine,
+                    &job_id,
+                    jobs::JobStatus::Failed,
+                    None,
+                    Some(&err),
+                )
+                .await;
+
+                println!("✗ Document parsing failed: {}\n", err);
+                emitter.job_status(&job_id, &file_name, "failed", None, Some(&err));
+            }
         }
+
+        job_manager.remove_job(&job_id);
         return true;
     }
 
@@ -1153,7 +1688,7 @@ async fn sync_conversation_metadata(
     persist_context_preferences(engine, conversation_id, config).await
 }
 
-async fn build_system_prompt(engine: &SnowflakeEngine) -> String {
+async fn build_system_prompt(engine: &SnowflakeEngine, tool_executor: &ToolExecutor) -> String {
     let database = engine
         .get_database()
         .await
@@ -1164,13 +1699,57 @@ async fn build_system_prompt(engine: &SnowflakeEngine) -> String {
         .unwrap_or_else(|_| "UNKNOWN".to_string());
     let user_schema = engine.user_schema_name();
 
+    // Get tool JSON definitions for the LLM
+    let tools_json = tool_executor.registry().get_tools_json();
+    let tools_json_str = serde_json::to_string_pretty(&tools_json).unwrap_or_default();
+
     format!(
-        "You are the OpenBB Cortex Analyst acting against the Snowflake environment. \
-Database context: {database}.{schema}. \
-Conversations, context objects, and attachments must be stored in OPENBB_AGENTS.{user_schema}.AGENTS_CONVERSATIONS, \
-OPENBB_AGENTS.{user_schema}.AGENTS_MESSAGES, and OPENBB_AGENTS.{user_schema}.AGENTS_CONTEXT_OBJECTS. \
-Only reference documents available via DOCUMENT_PARSE_RESULTS, CORTEX_UPLOADS, or AGENTS_CONTEXT_OBJECTS. \
-Always provide concise, accurate answers grounded in Snowflake data."
+        r#"You are an AI assistant with a specific focus on the Snowflake dialect of SQL. Your goal is to help the user by directly answering their questions using the available tools.
+
+🚨 CRITICAL: NEVER MAKE UP DATA OR EMBELLISH TOOL RESULTS
+- Tool results contain REAL data from Snowflake - display it EXACTLY as returned
+- DO NOT add fake descriptions, made-up explanations, or embellished details
+- Your job is to PRESENT data accurately, not to CREATE fictional content
+
+DATABASE CONTEXT:
+- Current database: {database}
+- Current schema: {schema}
+- User schema: OPENBB_AGENTS.{user_schema}
+
+🚨 TOOL SELECTION:
+
+FOR GETTING DATA / ANSWERING QUESTIONS:
+- Use execute_query - write SQL yourself and execute it to get results
+- Use list_tables_in - to see what tables exist in a schema  
+- Use list_semantic_views - to see what semantic views exist
+- Use get_table_schema - to see column definitions
+- Use get_table_sample_data - to see sample rows
+
+FOR GENERATING SQL CODE AS OUTPUT (user wants the SQL, not results):
+- Use text2sql ONLY when user says "write me a query", "generate SQL", "create a query for me"
+- text2sql returns SQL code for the user to review - it does NOT execute anything
+
+FOR RENDERING CHARTS:
+- Use render_chart AFTER execute_query returns data
+- You MUST pass the actual data array from the query result, NOT just column names
+
+SNOWFLAKE SQL SYNTAX:
+- ALWAYS use double quotes ("") for column names to preserve exact case
+- ALWAYS use fully qualified table names: DATABASE.SCHEMA.TABLE
+- Snowflake converts unquoted identifiers to UPPERCASE
+
+AVAILABLE TOOLS (JSON SCHEMA):
+{tools_json_str}
+
+TO CALL A TOOL, output ONLY this exact JSON format (no other text before or after):
+{{"tool": "<tool_name>", "arguments": {{<args>}}}}
+
+Example: {{"tool": "list_schemas", "arguments": {{"database": "MY_DB"}}}}
+Example: {{"tool": "list_databases", "arguments": {{}}}}
+Example: {{"tool": "execute_query", "arguments": {{"sql": "SELECT * FROM MY_TABLE LIMIT 10"}}}}
+
+CRITICAL: When the user asks for data, OUTPUT THE TOOL CALL JSON IMMEDIATELY. Do not ask questions or explain - just call the tool.
+"#
     )
 }
 
@@ -1319,8 +1898,20 @@ async fn main() {
             model,
             temperature,
             max_tokens,
+            json,
+            timeout,
             ..
         } => {
+            // Create event emitter based on --json flag
+            let emitter = create_emitter(json);
+
+            // Create job manager with configured timeout
+            let mut job_manager = JobManager::new();
+            job_manager.set_timeout(timeout);
+
+            // Create tool executor
+            let tool_executor = ToolExecutor::new();
+
             match SnowflakeEngine::new(
                 &user, &password, &account, &role, &warehouse, &database, &schema,
             )
@@ -1428,7 +2019,7 @@ async fn main() {
                         .unwrap_or_else(|_| config.to_metadata());
 
                     config.absorb_metadata(&stored_metadata, &overrides);
-                    if let Err(err) = apply_context_preferences(
+                    match apply_context_preferences(
                         &engine,
                         &active_conversation_id,
                         &mut config,
@@ -1436,7 +2027,22 @@ async fn main() {
                     )
                     .await
                     {
-                        println!("✗ Failed to load conversation preferences: {}", err);
+                        Ok(restored) => {
+                            // Restore database/schema context
+                            if let Some(db) = restored.database {
+                                if let Err(e) = engine.use_database(&db).await {
+                                    println!("✗ Failed to restore database context: {}", e);
+                                }
+                            }
+                            if let Some(schema) = restored.schema {
+                                if let Err(e) = engine.use_schema(&schema).await {
+                                    println!("✗ Failed to restore schema context: {}", e);
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            println!("✗ Failed to load conversation preferences: {}", err);
+                        }
                     }
                     if let Err(err) =
                         sync_conversation_metadata(&engine, &active_conversation_id, &config).await
@@ -1459,7 +2065,7 @@ async fn main() {
                     agent_client.set_conversation_history(history);
 
                     if agent_client.get_conversation_history().is_empty() {
-                        let system_prompt = build_system_prompt(&engine).await;
+                        let system_prompt = build_system_prompt(&engine, &tool_executor).await;
                         agent_client.add_system_message(&system_prompt);
                     }
 
@@ -1471,26 +2077,157 @@ async fn main() {
                     println!("Model: {}", config.model);
                     print_chat_help();
 
-                    let mut lines = io::BufReader::new(io::stdin()).lines();
+                    // Initialize completer with current context
+                    let mut helper = ChatHelper::new();
+
+                    // Pre-populate completions - always fetch databases for completion
+                    match engine.list_databases().await {
+                        Ok(dbs) => {
+                            if !dbs.is_empty() {
+                                println!("📋 Loaded {} databases for tab completion", dbs.len());
+                            }
+                            helper.update_databases(dbs);
+                        }
+                        Err(e) => {
+                            eprintln!("⚠ Could not load database list for completions: {}", e);
+                        }
+                    }
+                    let current_db = engine.get_database().await.unwrap_or_default();
+                    if !current_db.is_empty() {
+                        if let Ok(schemas) = engine.list_schemas(Some(&current_db)).await {
+                            helper.update_schemas(schemas);
+                        }
+                    }
+                    let current_schema = engine.get_schema().await.unwrap_or_default();
+                    if !current_db.is_empty() && !current_schema.is_empty() {
+                        if let Ok(tables) =
+                            engine.list_tables_in(&current_db, &current_schema).await
+                        {
+                            helper.update_tables(tables);
+                        }
+                    }
+
+                    // Pre-populate models for completion
+                    if let Ok(models) = engine.get_available_models().await {
+                        let model_names: Vec<String> =
+                            models.iter().map(|(name, _)| name.clone()).collect();
+                        helper.update_models(model_names);
+                    }
+
+                    // Pre-populate warehouses for completion
+                    if let Ok(warehouses) = engine.list_warehouses().await {
+                        helper.update_warehouses(warehouses);
+                    }
+
+                    // Pre-populate conversations for completion
+                    if let Ok(summaries) = fetch_conversation_summaries(&engine).await {
+                        let conv_ids: Vec<String> =
+                            summaries.iter().map(|s| s.id.clone()).collect();
+                        helper.update_conversations(conv_ids);
+                    }
+
+                    // Use rustyline with custom completer for tab completion
+                    let rl_config = Config::builder()
+                        .completion_type(rustyline::CompletionType::List)
+                        .edit_mode(rustyline::EditMode::Emacs)
+                        .auto_add_history(false) // We add manually for non-empty lines
+                        .build();
+                    let mut rl: Editor<ChatHelper, rustyline::history::DefaultHistory> =
+                        match Editor::with_config(rl_config) {
+                            Ok(editor) => editor,
+                            Err(e) => {
+                                eprintln!("Failed to initialize line editor: {}", e);
+                                return;
+                            }
+                        };
+                    rl.set_helper(Some(helper));
+
+                    // Try to load history from file
+                    let history_file = dirs::home_dir()
+                        .map(|h| h.join(".snowflake_ai_history"))
+                        .unwrap_or_else(|| PathBuf::from(".snowflake_ai_history"));
+                    let _ = rl.load_history(&history_file);
+
                     let mut last_sql_snippet: Option<String> = None;
 
                     loop {
                         let prompt_label =
                             config.label.as_deref().unwrap_or(&active_conversation_id);
-                        print!("You ({}): ", prompt_label);
-                        std::io::stdout().flush().unwrap();
+                        let prompt = format!("You ({}): ", prompt_label);
 
-                        let input = match lines.next_line().await {
-                            Ok(Some(line)) => line.trim().to_string(),
-                            _ => break,
+                        let input = match rl.readline(&prompt) {
+                            Ok(line) => {
+                                let trimmed = line.trim().to_string();
+                                if !trimmed.is_empty() {
+                                    let _ = rl.add_history_entry(&trimmed);
+                                }
+                                trimmed
+                            }
+                            Err(ReadlineError::Interrupted) => {
+                                println!("^C");
+                                continue;
+                            }
+                            Err(ReadlineError::Eof) => {
+                                println!("Goodbye!");
+                                break;
+                            }
+                            Err(err) => {
+                                eprintln!("Error: {:?}", err);
+                                break;
+                            }
                         };
 
                         if input.is_empty() {
                             continue;
                         }
 
-                        if handle_document_commands(&input, &mut engine).await {
+                        if handle_document_commands(&input, &mut engine, &mut job_manager, &emitter)
+                            .await
+                        {
                             continue;
+                        }
+
+                        // Check for context-changing commands and update completions + save context
+                        if input.starts_with("/use_database ") {
+                            if handle_common_slash_commands(&input, &mut engine).await {
+                                // Refresh schema completions for new database
+                                let new_db = engine.get_database().await.unwrap_or_default();
+                                if !new_db.is_empty() {
+                                    if let Some(h) = rl.helper_mut() {
+                                        if let Ok(schemas) =
+                                            engine.list_schemas(Some(&new_db)).await
+                                        {
+                                            h.update_schemas(schemas);
+                                        }
+                                        h.update_tables(Vec::new()); // Clear tables until schema is selected
+                                    }
+                                }
+                                // Save database context to conversation
+                                let _ =
+                                    save_database_context(&engine, &active_conversation_id).await;
+                                continue;
+                            }
+                        }
+
+                        if input.starts_with("/use_schema ") {
+                            if handle_common_slash_commands(&input, &mut engine).await {
+                                // Refresh table completions for new schema
+                                let db = engine.get_database().await.unwrap_or_default();
+                                let schema = engine.get_schema().await.unwrap_or_default();
+                                if !db.is_empty() && !schema.is_empty() {
+                                    if let Some(h) = rl.helper_mut() {
+                                        if let Ok(tables) =
+                                            engine.list_tables_in(&db, &schema).await
+                                        {
+                                            h.update_tables(tables);
+                                        }
+                                    }
+                                }
+                                // Save schema context to conversation
+                                let _ =
+                                    save_database_context(&engine, &active_conversation_id).await;
+                                continue;
+                            }
                         }
 
                         if handle_common_slash_commands(&input, &mut engine).await {
@@ -1498,6 +2235,9 @@ async fn main() {
                         }
 
                         if input == "/exit" {
+                            // Save history and database context before exit
+                            let _ = save_database_context(&engine, &active_conversation_id).await;
+                            let _ = rl.save_history(&history_file);
                             println!("Goodbye!");
                             break;
                         }
@@ -1546,7 +2286,7 @@ async fn main() {
                                     }
                                     Err(err) => println!("✗ Query execution failed: {}\n", err),
                                 }
-                            } else if let Some(sql) = prompt_for_sql_input(&mut lines).await {
+                            } else if let Some(sql) = prompt_for_sql_input_rl(&mut rl) {
                                 match engine.execute_query(&sql, None, None, None).await {
                                     Ok(results) => println!(
                                         "{}\n",
@@ -1584,7 +2324,8 @@ async fn main() {
                             {
                                 Ok(_) => {
                                     agent_client.reset_conversation();
-                                    let system_prompt = build_system_prompt(&engine).await;
+                                    let system_prompt =
+                                        build_system_prompt(&engine, &tool_executor).await;
                                     agent_client.add_system_message(&system_prompt);
                                     println!("✓ Conversation history cleared.\n");
                                 }
@@ -1645,7 +2386,7 @@ async fn main() {
                                             &metadata,
                                             &ConversationOverrides::default(),
                                         );
-                                        if let Err(err) = apply_context_preferences(
+                                        match apply_context_preferences(
                                             &engine,
                                             &active_conversation_id,
                                             &mut config,
@@ -1653,10 +2394,52 @@ async fn main() {
                                         )
                                         .await
                                         {
-                                            println!(
-                                                "✗ Failed to load conversation preferences: {}",
-                                                err
-                                            );
+                                            Ok(restored) => {
+                                                // Restore database/schema context
+                                                if let Some(db) = restored.database {
+                                                    if let Err(e) = engine.use_database(&db).await {
+                                                        println!("✗ Failed to restore database context: {}", e);
+                                                    }
+                                                }
+                                                if let Some(schema) = restored.schema {
+                                                    if let Err(e) = engine.use_schema(&schema).await
+                                                    {
+                                                        println!("✗ Failed to restore schema context: {}", e);
+                                                    }
+                                                }
+                                                // Update completions after context change
+                                                if let Some(h) = rl.helper_mut() {
+                                                    let db = engine
+                                                        .get_database()
+                                                        .await
+                                                        .unwrap_or_default();
+                                                    if !db.is_empty() {
+                                                        if let Ok(schemas) =
+                                                            engine.list_schemas(Some(&db)).await
+                                                        {
+                                                            h.update_schemas(schemas);
+                                                        }
+                                                    }
+                                                    let schema = engine
+                                                        .get_schema()
+                                                        .await
+                                                        .unwrap_or_default();
+                                                    if !db.is_empty() && !schema.is_empty() {
+                                                        if let Ok(tables) = engine
+                                                            .list_tables_in(&db, &schema)
+                                                            .await
+                                                        {
+                                                            h.update_tables(tables);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            Err(err) => {
+                                                println!(
+                                                    "✗ Failed to load conversation preferences: {}",
+                                                    err
+                                                );
+                                            }
                                         }
                                         if let Err(err) = sync_conversation_metadata(
                                             &engine,
@@ -1690,7 +2473,8 @@ async fn main() {
                                         }
 
                                         if agent_client.get_conversation_history().is_empty() {
-                                            let system_prompt = build_system_prompt(&engine).await;
+                                            let system_prompt =
+                                                build_system_prompt(&engine, &tool_executor).await;
                                             agent_client.add_system_message(&system_prompt);
                                         }
 
@@ -1792,6 +2576,114 @@ async fn main() {
                             continue;
                         }
 
+                        // /text2sql - Generate SQL from natural language
+                        if let Some(prompt) = input.strip_prefix("/text2sql ") {
+                            let prompt = prompt.trim();
+                            if prompt.is_empty() {
+                                println!("✗ Usage: /text2sql <natural language prompt>\n");
+                            } else {
+                                match engine.execute_with_cortex_context(prompt, false).await {
+                                    Ok(result) => {
+                                        let sql_str = if let Some(s) = result.as_str() {
+                                            s.to_string()
+                                        } else {
+                                            result.to_string()
+                                        };
+                                        println!("\n📝 Generated SQL:\n```sql\n{}\n```\n", sql_str);
+                                        last_sql_snippet = Some(sql_str);
+                                    }
+                                    Err(e) => println!("✗ Failed to generate SQL: {}\n", e),
+                                }
+                            }
+                            continue;
+                        }
+
+                        // /context - Show database context
+                        if input == "/context" {
+                            let db = current_database_name(&engine).await;
+                            let schema = current_schema_name(&engine).await;
+                            println!("\n📊 Database Context:");
+                            println!("  Database: {}", db);
+                            println!("  Schema: {}", schema);
+
+                            // Count tables
+                            match engine.list_tables_in(&db, &schema).await {
+                                Ok(tables) => println!("  Tables: {}", tables.len()),
+                                Err(_) => println!("  Tables: (unable to count)"),
+                            }
+                            println!();
+                            continue;
+                        }
+
+                        // /stats - Show conversation statistics
+                        if input == "/stats" {
+                            let usage_stats = agent_client.get_usage_stats();
+                            let history_len = agent_client.get_conversation_history().len();
+
+                            println!("\n📈 Conversation Statistics:");
+                            println!("  Conversation ID: {}", active_conversation_id);
+                            if let Some(label) = &config.label {
+                                println!("  Label: {}", label);
+                            }
+                            println!("  Model: {}", config.model);
+                            println!("  Messages: {}", history_len);
+                            println!("  Total Requests: {}", usage_stats.total_requests);
+                            println!("  Prompt Tokens: {}", usage_stats.total_prompt_tokens);
+                            println!(
+                                "  Completion Tokens: {}",
+                                usage_stats.total_completion_tokens
+                            );
+                            println!("  Total Tokens: {}", usage_stats.total_tokens);
+                            println!();
+                            continue;
+                        }
+
+                        // /jobs - List document processing jobs
+                        if input == "/jobs" || input.starts_with("/jobs ") {
+                            let args = input.strip_prefix("/jobs").unwrap_or("").trim();
+                            if let Err(e) = jobs::handle_jobs_command(&engine, args, &emitter).await
+                            {
+                                println!("✗ {}\n", e);
+                            }
+                            continue;
+                        }
+
+                        // /cancel - Cancel a document processing job
+                        if let Some(job_id) = input.strip_prefix("/cancel ") {
+                            if let Err(e) = jobs::handle_cancel_command(
+                                &engine,
+                                &mut job_manager,
+                                job_id,
+                                &emitter,
+                            )
+                            .await
+                            {
+                                println!("✗ {}\n", e);
+                            }
+                            continue;
+                        }
+
+                        // /timeout - Get or set operation timeout
+                        if input == "/timeout" || input.starts_with("/timeout ") {
+                            let args = input.strip_prefix("/timeout").unwrap_or("").trim();
+                            if let Err(e) = jobs::handle_timeout_command(&mut job_manager, args) {
+                                println!("✗ {}\n", e);
+                            }
+                            continue;
+                        }
+
+                        // /tools - List available AI tools
+                        if input == "/tools" {
+                            println!("\n🔧 Available Tools:");
+                            for tool_name in tool_executor.registry().list_tools() {
+                                if let Some(tool) = tool_executor.registry().get_tool(tool_name) {
+                                    println!("  {} - {}", tool.name, tool.description);
+                                }
+                            }
+                            println!();
+                            continue;
+                        }
+
                         if input.starts_with('/') {
                             println!("✗ Unrecognized command: {}", input);
                             println!("Type /help to see the list of available commands.\n");
@@ -1813,69 +2705,89 @@ async fn main() {
                             println!("✗ Failed to record user message: {}", err);
                         }
 
-                        print!("\n🤖 Assistant: ");
-                        std::io::stdout().flush().unwrap();
+                        if !emitter.is_json_mode() {
+                            print!("\n🤖 Assistant: ");
+                            std::io::stdout().flush().unwrap();
+                        }
 
-                        match agent_client
-                            .stream_complete(
-                                &config.model,
-                                request_messages,
-                                config.temperature,
-                                None,
-                                config.max_tokens,
-                                None,
-                            )
-                            .await
-                        {
-                            Ok((mut stream, metadata)) => {
-                                let mut full_response = String::new();
-                                while let Some(chunk_result) = stream.next().await {
-                                    match chunk_result {
-                                        Ok(chunk) => {
-                                            for choice in chunk.choices {
-                                                if let Some(content) = &choice.delta.text {
-                                                    print!("{}", content);
-                                                    std::io::stdout().flush().unwrap();
-                                                    full_response.push_str(content);
-                                                }
-                                            }
-                                        }
-                                        Err(err) => {
-                                            println!("\n✗ Stream error: {}", err);
-                                            break;
-                                        }
-                                    }
+                        // Run the agentic loop with tool calling support
+                        // We need to wrap engine temporarily for the agentic loop
+                        let engine_arc = std::sync::Arc::new(tokio::sync::Mutex::new(engine));
+
+                        let agentic_result = run_agentic_loop(
+                            engine_arc.clone(),
+                            &mut agent_client,
+                            &tool_executor,
+                            &emitter,
+                            &mut job_manager,
+                            &config.model,
+                            config.temperature,
+                            config.max_tokens,
+                            request_messages,
+                            None, // No cancellation token for now
+                        )
+                        .await;
+
+                        // Restore engine from Arc<Mutex>
+                        // This is safe because we're the only owner at this point
+                        engine = match std::sync::Arc::try_unwrap(engine_arc) {
+                            Ok(mutex) => mutex.into_inner(),
+                            Err(_) => {
+                                panic!("Engine Arc should have single owner after agentic loop");
+                            }
+                        };
+
+                        match agentic_result {
+                            Ok(result) => {
+                                if !emitter.is_json_mode() {
+                                    println!("\n");
                                 }
-                                println!("\n");
-                                agent_client.update_metadata_and_stats(metadata);
-                                if !full_response.is_empty() {
-                                    agent_client.add_assistant_response(full_response.clone());
-                                    if let Err(err) = persist_conversation_message(
-                                        &engine,
-                                        &active_conversation_id,
-                                        "assistant",
-                                        &full_response,
-                                    )
-                                    .await
-                                    {
-                                        println!("✗ Failed to record assistant message: {}", err);
-                                    }
-                                    if let Err(err) = sync_conversation_metadata(
-                                        &engine,
-                                        &active_conversation_id,
-                                        &config,
-                                    )
-                                    .await
-                                    {
-                                        println!("✗ Failed to update metadata: {}", err);
-                                    }
-                                    if let Some(snippet) = extract_last_sql_snippet(&full_response)
-                                    {
-                                        last_sql_snippet = Some(snippet);
+
+                                if !result.cancelled && !result.response_text.is_empty() {
+                                    agent_client
+                                        .add_assistant_response(result.response_text.clone());
+
+                                    // Persist message in background - don't block the UI
+                                    // We clone the necessary data and spawn the persistence
+                                    let response_text = result.response_text.clone();
+                                    let conv_id = active_conversation_id.clone();
+
+                                    // Fire and forget - persist asynchronously
+                                    // Errors will be silently ignored but that's OK for UX
+                                    tokio::spawn({
+                                        let engine_clone = engine.clone();
+                                        let config_clone = config.clone();
+                                        async move {
+                                            let _ = persist_conversation_message(
+                                                &engine_clone,
+                                                &conv_id,
+                                                "assistant",
+                                                &response_text,
+                                            )
+                                            .await;
+                                            let _ = sync_conversation_metadata(
+                                                &engine_clone,
+                                                &conv_id,
+                                                &config_clone,
+                                            )
+                                            .await;
+                                        }
+                                    });
+
+                                    // Extract SQL snippets from response
+                                    let snippets = extract_sql_snippets(&result.response_text);
+                                    if let Some(snippet) = snippets.last() {
+                                        last_sql_snippet = Some(snippet.clone());
                                     }
                                 }
                             }
-                            Err(err) => println!("\n✗ Error: {}\n", err),
+                            Err(err) => {
+                                if emitter.is_json_mode() {
+                                    emitter.error(&err, Some("AGENTIC_ERROR"));
+                                } else {
+                                    println!("\n✗ Error: {}\n", err);
+                                }
+                            }
                         }
                     }
                 }

@@ -39,12 +39,11 @@ async def load_conversation_history(
     # Load existing messages from the agent's database
     cached_messages = await run_in_thread(client.get_messages, conv_id)
 
-    if os.environ.get("SNOWFLAKE_DEBUG"):
-        logger.debug(
-            "Loaded %d messages from database for conversation %s",
-            len(cached_messages),
-            conv_id,
-        )
+    logger.debug(
+        "Loaded %d messages from database for conversation %s",
+        len(cached_messages),
+        conv_id,
+    )
 
     # Build history from cached messages
     for message_id, role, content in cached_messages:
@@ -90,10 +89,7 @@ async def load_conversation_history(
                 msg_dict["content"],
             )
 
-    if os.environ.get("SNOWFLAKE_DEBUG"):
-        logger.debug(
-            "After processing: %d total messages", len(final_conversation_history)
-        )
+    logger.debug("After processing: %d total messages", len(final_conversation_history))
 
     return final_conversation_history
 
