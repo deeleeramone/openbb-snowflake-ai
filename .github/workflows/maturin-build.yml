@@ -53,10 +53,10 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          \$paths = @("wheelhouse","dist","release-archives")
-          foreach (\$p in \$paths) {
-            if (Test-Path \$p) {
-              Remove-Item -Recurse -Force \$p
+          $paths = @("wheelhouse","dist","release-archives")
+          foreach ($p in $paths) {
+            if (Test-Path $p) {
+              Remove-Item -Recurse -Force $p
             }
           }
 
@@ -64,7 +64,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-          architecture: \${{ matrix.python-architecture || 'x64' }}
+          architecture: ${{ matrix.python-architecture || 'x64' }}
 
       - run: pip install -U ruff typing_extensions setuptools
 
@@ -72,7 +72,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
-          targets: \${{ matrix.os == 'linux' && (matrix.target == 'aarch64' && 'aarch64-unknown-linux-gnu' || 'x86_64-unknown-linux-gnu') || matrix.os == 'macos' && (matrix.target == 'x86_64' && 'x86_64-apple-darwin' || 'aarch64-apple-darwin') || matrix.os == 'windows' && (matrix.target == 'aarch64' && 'aarch64-pc-windows-msvc' || 'x86_64-pc-windows-msvc') }}
+          targets: ${{ matrix.os == 'linux' && (matrix.target == 'aarch64' && 'aarch64-unknown-linux-gnu' || 'x86_64-unknown-linux-gnu') || matrix.os == 'macos' && (matrix.target == 'x86_64' && 'x86_64-apple-darwin' || 'aarch64-apple-darwin') || matrix.os == 'windows' && (matrix.target == 'aarch64' && 'aarch64-pc-windows-msvc' || 'x86_64-pc-windows-msvc') }}
 
       - name: Install maturin
         run: pip install maturin
@@ -86,7 +86,7 @@ jobs:
           sudo apt-get install -y build-essential pkg-config curl gcc g++ make
 
           # Determine target and build
-          if [ "\${{ matrix.target }}" = "x86_64" ] || [ "\${{ matrix.target }}" = "amd64" ]; then
+          if [ "${{ matrix.target }}" = "x86_64" ] || [ "${{ matrix.target }}" = "amd64" ]; then
             RUST_TARGET="x86_64-unknown-linux-gnu"
           else
             # Cross-compilation for aarch64
@@ -100,12 +100,12 @@ jobs:
 
           # Build wheels for each Python version
           sdist_flag="--sdist"
-          for py in \${{ matrix.interpreter }}; do
-            echo "Building for Python \${py} on \${RUST_TARGET}"
-            if [ -n "\$RUST_TARGET" ] && [ "\$RUST_TARGET" != "x86_64-unknown-linux-gnu" ]; then
-              maturin build --release --target \${RUST_TARGET} --interpreter \${py} \${sdist_flag}
+          for py in ${{ matrix.interpreter }}; do
+            echo "Building for Python ${py} on ${RUST_TARGET}"
+            if [ -n "$RUST_TARGET" ] && [ "$RUST_TARGET" != "x86_64-unknown-linux-gnu" ]; then
+              maturin build --release --target ${RUST_TARGET} --interpreter ${py} ${sdist_flag}
             else
-              maturin build --release --interpreter \${py} \${sdist_flag}
+              maturin build --release --interpreter ${py} ${sdist_flag}
             fi
             sdist_flag=""
           done
@@ -120,7 +120,7 @@ jobs:
         if: matrix.os == 'macos'
         run: |
           # Determine target
-          case "\${{ matrix.target }}" in
+          case "${{ matrix.target }}" in
             x86_64)
               RUST_TARGET="x86_64-apple-darwin"
               ;;
@@ -131,9 +131,9 @@ jobs:
 
           # Build wheels for each Python version
           sdist_flag="--sdist"
-          for py in \${{ matrix.interpreter }}; do
-            echo "Building for Python \${py} on \${RUST_TARGET}"
-            maturin build --release --target \${RUST_TARGET} --interpreter \${py} \${sdist_flag}
+          for py in ${{ matrix.interpreter }}; do
+            echo "Building for Python ${py} on ${RUST_TARGET}"
+            maturin build --release --target ${RUST_TARGET} --interpreter ${py} ${sdist_flag}
             sdist_flag=""
           done
 
@@ -148,24 +148,24 @@ jobs:
         shell: pwsh
         run: |
           # Determine Rust target
-          switch ("\${{ matrix.target }}") {
+          switch ("${{ matrix.target }}") {
             "x86_64" {
-              \$rustTarget = "x86_64-pc-windows-msvc"
+              $rustTarget = "x86_64-pc-windows-msvc"
             }
             "aarch64" {
-              \$rustTarget = "aarch64-pc-windows-msvc"
+              $rustTarget = "aarch64-pc-windows-msvc"
             }
           }
 
           # Build wheels for each Python version
-          \$pythonVersions = "\${{ matrix.interpreter }}".Split()
-          \$emitSdist = \$true
-          foreach (\$py in \$pythonVersions) {
-            Write-Host "Building for Python \$py on \$rustTarget"
-            \$args = @("--release", "--target", \$rustTarget, "--interpreter", \$py)
-            if (\$emitSdist) {
-              \$args += "--sdist"
-              \$emitSdist = \$false
+          $pythonVersions = "${{ matrix.interpreter }}".Split()
+          $emitSdist = $true
+          foreach ($py in $pythonVersions) {
+            Write-Host "Building for Python $py on $rustTarget"
+            $args = @("--release", "--target", $rustTarget, "--interpreter", $py)
+            if ($emitSdist) {
+              $args += "--sdist"
+              $emitSdist = $false
             }
             maturin build @args
           }
@@ -174,11 +174,11 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist
           Get-ChildItem -Path target -Recurse -Include *.whl,*.tar.gz | Move-Item -Destination dist
 
-      - run: \${{ (matrix.os == 'windows' && 'dir') || 'ls -lh' }} dist/
+      - run: ${{ (matrix.os == 'windows' && 'dir') || 'ls -lh' }} dist/
 
       - uses: actions/upload-artifact@v4
         with:
-          name: pypi_files_\${{ matrix.os }}_\${{ matrix.target }}_\${{ matrix.interpreter || 'all' }}
+          name: pypi_files_${{ matrix.os }}_${{ matrix.target }}_${{ matrix.interpreter || 'all' }}
           path: dist
 
   # =================== COLLECT AND PACKAGE ===================
@@ -204,10 +204,10 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          \$paths = @("wheelhouse","dist","release-archives")
-          foreach (\$p in \$paths) {
-            if (Test-Path \$p) {
-              Remove-Item -Recurse -Force \$p
+          $paths = @("wheelhouse","dist","release-archives")
+          foreach ($p in $paths) {
+            if (Test-Path $p) {
+              Remove-Item -Recurse -Force $p
             }
           }
 
@@ -245,16 +245,16 @@ jobs:
           
           # Create per-file .sha256 and master CHECKSUMS.sha256
           for file in *.whl *.tar.gz; do
-            if [ -f "\$file" ]; then
-              sha256sum "\$file" > "\$file.sha256"
-              echo "Generated hash for \$file"
+            if [ -f "$file" ]; then
+              sha256sum "$file" > "$file.sha256"
+              echo "Generated hash for $file"
             fi
           done
           
           # Create master checksums file
           {
             echo "# SHA256 Checksums"
-            echo "Generated on: \$(date -u)"
+            echo "Generated on: $(date -u)"
             echo ""
             sha256sum *.whl *.tar.gz 2>/dev/null || true
           } > CHECKSUMS.sha256
