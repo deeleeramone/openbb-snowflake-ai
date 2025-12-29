@@ -1,5 +1,7 @@
 """LLM streaming response handler for Snowflake AI."""
 
+# pylint: disable=C0302,R1702,W0212
+
 import asyncio
 import json
 import os
@@ -12,7 +14,7 @@ from openbb_ai.models import Citation, CitationHighlightBoundingBox, SourceInfo
 
 from ._snowflake_ai import FunctionCall, SnowflakeAI, ToolCall
 from .document_processor import DocumentProcessor
-from .helpers import to_sse
+from .helpers import extract_markdown_tables, to_sse
 from .logger import get_logger
 
 logger = get_logger(__name__)
@@ -29,7 +31,8 @@ def sanitize_citation_text(text: str) -> str:
     This ensures that text with markdown blockquotes, emphasis, etc. can still
     match against the original PDF text content.
     """
-    # Remove citation markers [N] that pollute the text from previous citations
+    # Remove citation markers [|cite:N|] and legacy [N] that pollute the text
+    text = re.sub(r"\s*\[\|cite:\d+\|\]\s*", " ", text)
     text = re.sub(r"\s*\[\d+\]\s*", " ", text)
 
     # Remove markdown table pipes and clean up table formatting
@@ -124,8 +127,7 @@ async def iterate_sync_generator(generator: Iterator):
                     asyncio.run_coroutine_threadsafe(queue.put(chunk), loop)
         except Exception as e:
             thread_exception = e
-            if os.environ.get("SNOWFLAKE_DEBUG"):
-                logger.error("Error in generator thread: %s", e)
+            logger.error("Error in generator thread: %s", e)
         finally:
             asyncio.run_coroutine_threadsafe(queue.put(None), loop)
 
@@ -143,6 +145,9 @@ async def iterate_sync_generator(generator: Iterator):
             yield chunk
         except asyncio.TimeoutError:
             logger.debug("Stream timeout - terminating")
+            break
+        except asyncio.CancelledError:
+            logger.debug("Stream cancelled - terminating")
             break
 
 
@@ -180,20 +185,24 @@ async def stream_llm_with_tools(
 
         while True:
             if not inside_sql_block:
-                lower_buffer = sql_scan_buffer.lower()
-                start_idx = lower_buffer.find("```sql")
-                if start_idx == -1:
-                    if len(sql_scan_buffer) > 5:
-                        safe = sql_scan_buffer[:-5]
+                # Look for ```sql or ``` sql (case insensitive)
+                match = re.search(r"```\s*sql", sql_scan_buffer, re.IGNORECASE)
+                if not match:
+                    # Keep enough buffer for a partial tag (``` + spaces + sql)
+                    if len(sql_scan_buffer) > 20:
+                        safe = sql_scan_buffer[:-20]
                         if safe:
                             segments.append(("text", safe))
-                        sql_scan_buffer = sql_scan_buffer[-5:]
+                        sql_scan_buffer = sql_scan_buffer[-20:]
                     break
+
+                start_idx = match.start()
+                end_idx = match.end()
 
                 if start_idx > 0:
                     segments.append(("text", sql_scan_buffer[:start_idx]))
 
-                sql_scan_buffer = sql_scan_buffer[start_idx + 5 :]
+                sql_scan_buffer = sql_scan_buffer[end_idx:]
                 sql_scan_buffer = sql_scan_buffer.lstrip("\r\n")
                 inside_sql_block = True
                 pending_sql_buffer = ""
@@ -237,16 +246,15 @@ async def stream_llm_with_tools(
         prompt_text += content + " "  # Accumulate for token estimation
 
     # DEBUG: Print message sequence to identify invalid sequences
-    if os.environ.get("SNOWFLAKE_DEBUG"):
-        logger.debug("=== Message sequence being sent to Cortex ===")
-        for i, (role, content) in enumerate(filtered_messages):
-            preview = (
-                content[:100].replace("\n", " ") + "..."
-                if len(content) > 100
-                else content.replace("\n", " ")
-            )
-            logger.debug(f"  [{i}] {role}: {preview}")
-        logger.debug("=== End message sequence ===")
+    logger.debug("=== Message sequence being sent to Cortex ===")
+    for i, (role, content) in enumerate(filtered_messages):
+        preview = (
+            content[:100].replace("\n", " ") + "..."
+            if len(content) > 100
+            else content.replace("\n", " ")
+        )
+        logger.debug("  [%s] %s: %s", i, role, preview)
+    logger.debug("=== End message sequence ===")
 
     # Fix message sequence - Cortex requires alternating user/assistant (after system)
     # Merge consecutive same-role messages to prevent "invalid message role sequence" error
@@ -384,13 +392,12 @@ async def stream_llm_with_tools(
 
             # Transient Cortex hiccup—back off briefly before retrying
             backoff_delay = 1 + attempt  # 1s, 2s, ...
-            if os.environ.get("SNOWFLAKE_DEBUG"):
-                logger.debug(
-                    "Cortex error '%s'. Retry %d/3 after %ds",
-                    e,
-                    attempt + 1,
-                    backoff_delay,
-                )
+            logger.debug(
+                "Cortex error '%s'. Retry %d/3 after %ds",
+                e,
+                attempt + 1,
+                backoff_delay,
+            )
             await asyncio.sleep(backoff_delay)
 
     if response_stream is None:
@@ -410,6 +417,10 @@ async def stream_llm_with_tools(
     # State for handling <think>...</think> blocks from deepseek-r1
     inside_think_block = False
     think_buffer = ""
+
+    # State for handling [start_artifact]...[end_artifact] blocks
+    inside_artifact_block = False
+    artifact_buffer = ""
 
     def _get_attr(source, *names, default=None):
         for name in names:
@@ -492,20 +503,19 @@ async def stream_llm_with_tools(
 
     try:
         async for chunk in iterate_sync_generator(response_stream):
-            if os.environ.get("SNOWFLAKE_DEBUG"):
-                # Try different ways to extract data from the chunk
-                if hasattr(chunk, "__dict__"):
-                    logger.debug("RAW SSE: %s", chunk.__dict__)
-                elif hasattr(chunk, "to_dict"):
-                    logger.debug("RAW SSE: %s", chunk.to_dict())
-                else:
-                    # Try to serialize it as JSON if possible
-                    dumped = (
-                        chunk.to_json_string()
-                        if hasattr(chunk, "to_json_string")
-                        else str(chunk.dict())
-                    )
-                    logger.debug("RAW SSE: %s", dumped)
+            # Try different ways to extract data from the chunk
+            if hasattr(chunk, "__dict__"):
+                logger.debug("RAW SSE: %s", chunk.__dict__)
+            elif hasattr(chunk, "to_dict"):
+                logger.debug("RAW SSE: %s", chunk.to_dict())
+            else:
+                # Try to serialize it as JSON if possible
+                dumped = (
+                    chunk.to_json_string()
+                    if hasattr(chunk, "to_json_string")
+                    else str(chunk.dict())
+                )
+                logger.debug("RAW SSE: %s", dumped)
 
             if hasattr(chunk, "usage") and chunk.usage:
                 usage_data = chunk.usage
@@ -586,10 +596,13 @@ async def stream_llm_with_tools(
                     text_piece = "".join(parts)
 
                 if text_piece:
-                    # Handle <think>...</think> blocks from deepseek-r1
-                    # Accumulate think content silently, then emit as ONE reasoning event when block closes
-                    # This prevents token-by-token reasoning events
-
+                    # Log raw text from LLM to debug citation issues
+                    if "[" in text_piece or "]" in text_piece:
+                        logger.debug(
+                            "[LLM RAW TEXT] Bracket chars detected: '%s'",
+                            text_piece[:100],
+                        )
+                    # Handle <think>...</think> blocks
                     remaining_text = text_piece
                     output_text = ""
 
@@ -602,7 +615,7 @@ async def stream_llm_with_tools(
                                 final_think_content = remaining_text[:end_idx]
                                 if final_think_content:
                                     think_buffer += final_think_content
-                                # Emit the COMPLETE think block as ONE reasoning event
+
                                 if think_buffer.strip():
                                     yield ("reasoning_complete", think_buffer.strip())
                                 think_buffer = ""
@@ -645,7 +658,128 @@ async def stream_llm_with_tools(
                     # Only process non-think text through citation handling
                     if output_text:
                         cleaned = cleanup_text(output_text)
-                        for segment_type, segment_value in split_sql_segments(cleaned):
+
+                        # Check for artifact blocks in the cleaned text
+                        # IMPORTANT: Prepend any partial artifact tag from previous chunk
+                        processed_text = ""
+                        artifact_remaining = artifact_buffer + cleaned
+                        artifact_buffer = ""  # Reset after prepending
+                        while artifact_remaining:
+                            if inside_artifact_block:
+                                # Look for closing tag
+                                end_idx = artifact_remaining.find("[end_artifact]")
+                                end_tag_len = 14
+                                if end_idx == -1:
+                                    end_idx = artifact_remaining.find("|end_artifact|")
+                                    end_tag_len = 14
+                                if end_idx == -1:
+                                    end_idx = artifact_remaining.find(
+                                        "|end_artifact_id|"
+                                    )
+                                    end_tag_len = 17
+                                if end_idx == -1:
+                                    end_idx = artifact_remaining.find(
+                                        "|end_artifact_id|>"
+                                    )
+                                    end_tag_len = 18
+
+                                if end_idx != -1:
+                                    # Found end - capture artifact content
+                                    artifact_buffer += artifact_remaining[:end_idx]
+                                    inside_artifact_block = False
+
+                                    # Parse and yield the artifact
+                                    try:
+                                        # Clean up the artifact content (remove > prefix if present)
+                                        artifact_content = artifact_buffer.strip()
+                                        if artifact_content.startswith(">"):
+                                            artifact_content = artifact_content[1:]
+                                        if artifact_content.endswith(">"):
+                                            artifact_content = artifact_content[:-1]
+
+                                        artifact_json = json.loads(artifact_content)
+                                        artifact_type = artifact_json.get("type", "")
+
+                                        if artifact_type == "chart":
+                                            # Yield a chart artifact event
+                                            yield ("artifact_chart", artifact_json)
+                                    except (json.JSONDecodeError, KeyError) as e:
+                                        logger.warning(
+                                            "Failed to parse artifact: %s", e
+                                        )
+
+                                    artifact_buffer = ""
+                                    artifact_remaining = artifact_remaining[
+                                        end_idx + end_tag_len :
+                                    ]
+                                else:
+                                    # Still accumulating artifact
+                                    artifact_buffer += artifact_remaining
+                                    artifact_remaining = ""
+                            else:
+                                # Look for opening tag
+                                start_idx = artifact_remaining.find("[start_artifact]")
+                                start_tag_len = 16
+                                if start_idx == -1:
+                                    start_idx = artifact_remaining.find(
+                                        "|start_artifact|"
+                                    )
+                                    start_tag_len = 16
+                                if start_idx == -1:
+                                    start_idx = artifact_remaining.find(
+                                        "|start_artifact_id|"
+                                    )
+                                    start_tag_len = 19
+                                if start_idx == -1:
+                                    start_idx = artifact_remaining.find(
+                                        "|start_artifact_id|>"
+                                    )
+                                    start_tag_len = 20
+
+                                if start_idx != -1:
+                                    # Found start - output text before it
+                                    processed_text += artifact_remaining[:start_idx]
+                                    inside_artifact_block = True
+                                    artifact_buffer = ""
+                                    artifact_remaining = artifact_remaining[
+                                        start_idx + start_tag_len :
+                                    ]
+                                else:
+                                    # No artifact tag - check for partial tag at end
+                                    partial_check = False
+                                    # Check for all possible tag starts
+                                    possible_tags = [
+                                        "[start_artifact]",
+                                        "|start_artifact|",
+                                        "|start_artifact_id|",
+                                        "|start_artifact_id|>",
+                                    ]
+
+                                    for tag in possible_tags:
+                                        for i in range(
+                                            1,
+                                            min(len(tag), len(artifact_remaining) + 1),
+                                        ):
+                                            if artifact_remaining.endswith(tag[:i]):
+                                                processed_text += artifact_remaining[
+                                                    :-i
+                                                ]
+                                                artifact_buffer = artifact_remaining[
+                                                    -i:
+                                                ]
+                                                partial_check = True
+                                                break
+                                        if partial_check:
+                                            break
+
+                                    if not partial_check:
+                                        processed_text += artifact_remaining
+                                    artifact_remaining = ""
+
+                        # Process non-artifact text through SQL segments
+                        for segment_type, segment_value in split_sql_segments(
+                            processed_text
+                        ):
                             if segment_type == "sql":
                                 sql_body = segment_value.strip()
                                 if sql_body:
@@ -655,35 +789,81 @@ async def stream_llm_with_tools(
                                 buffer += segment_value
                                 full_text += segment_value
 
-                    # Process buffer for citations
+                    # Process buffer for citations using unique [|cite:N|] markers
+                    # This format is unambiguous - won't match normal brackets
                     while True:
-                        # Look for [N] pattern
-                        match = re.search(r"\[(\d+)\]", buffer)
+                        # Look for [|cite:N|] pattern (unique citation markers)
+                        match = re.search(r"\[\|cite:(\d+)\|\]", buffer)
+                        if match:
+                            logger.debug(
+                                "[CITATION FOUND] Pattern '%s' at pos %d-%d in buffer: '%s'",
+                                match.group(0),
+                                match.start(),
+                                match.end(),
+                                buffer[:100],
+                            )
                         if not match:
-                            # No citation found yet - check if we should yield accumulated buffer
-                            # Only yield if buffer is getting long (>200 chars) to allow [N] patterns to accumulate
-                            # Keep last 10 chars to prevent pattern splitting at boundary
-                            if len(buffer) > 200:
-                                yield ("text", buffer[:-10])
-                                buffer = buffer[-10:]
-                            # Otherwise, keep accumulating buffer across streaming chunks
+                            # No complete [|cite:N|] citation found yet
+                            # Check for partial citation pattern at end of buffer
+                            # Must handle: "[", "[|", "[|c", "[|cite", "[|cite:", "[|cite:1", "[|cite:1|"
+                            # The pattern must match any prefix of "[|cite:N|]" at the end
+                            partial_patterns = [
+                                r"\[$",  # Just "["
+                                r"\[\|$",  # "[|"
+                                r"\[\|c$",  # "[|c"
+                                r"\[\|ci$",  # "[|ci"
+                                r"\[\|cit$",  # "[|cit"
+                                r"\[\|cite$",  # "[|cite"
+                                r"\[\|cite:$",  # "[|cite:"
+                                r"\[\|cite:\d+$",  # "[|cite:1", "[|cite:12", etc.
+                                r"\[\|cite:\d+\|$",  # "[|cite:1|"
+                            ]
+
+                            partial_match = None
+                            for pattern in partial_patterns:
+                                partial_match = re.search(pattern, buffer)
+                                if partial_match:
+                                    break
+
+                            if partial_match:
+                                # Found incomplete citation marker at end - hold it
+                                before_partial = buffer[: partial_match.start()]
+                                if before_partial:
+                                    yield ("text", before_partial)
+                                buffer = buffer[partial_match.start() :]
+                                logger.debug(
+                                    "[PARTIAL CITATION HELD] Holding buffer: '%s'",
+                                    buffer[:30],
+                                )
+                            elif len(buffer) > 0:
+                                # No partial pattern, safe to yield all buffer
+                                yield ("text", buffer)
+                                buffer = ""
+                            # Exit the while loop to get more chunks
                             break
 
                         citation_num = int(match.group(1))
                         text_before = buffer[: match.start()]
 
                         if text_before:
+                            logger.debug(
+                                "[CITATION TEXT_BEFORE] Yielding text before [%d]: '%s'",
+                                citation_num,
+                                (
+                                    text_before[-50:]
+                                    if len(text_before) > 50
+                                    else text_before
+                                ),
+                            )
                             yield ("text", text_before)
 
-                        # ENFORCE CITATION CAP FIRST - before any processing
-                        # This counts SUCCESSFUL citations only (ones in citation_objects)
                         if len(citation_objects) >= MAX_CITATIONS:
-                            # Already have max citations - silently drop all remaining markers
+                            # Too many citations - drop the marker
                             buffer = buffer[match.end() :]
                             continue
 
-                        # Skip duplicate citation numbers
                         if citation_num in citations_created:
+                            # Already processed this citation - drop duplicate
                             buffer = buffer[match.end() :]
                             continue
 
@@ -757,7 +937,6 @@ async def stream_llm_with_tools(
                                         )
                                     )
 
-                                # CRITICAL: If no match found, DROP the citation
                                 # We require actual document matches for citations
                                 if not selected_position or not selected_position.get(
                                     "text"
@@ -771,6 +950,7 @@ async def stream_llm_with_tools(
                                             else "N/A"
                                         ),
                                     )
+                                    # Drop the citation marker - citations are only for widgets
                                     buffer = buffer[match.end() :]
                                     continue
 
@@ -918,19 +1098,34 @@ async def stream_llm_with_tools(
                                     citation_num,
                                 )
 
-                        # ALWAYS yield citation inline at this position (replacing [N])
+                        # Yield citation inline at this position (replacing [N])
                         if citation_num in citation_objects:
+                            logger.debug(
+                                "[CITATION YIELD] Yielding citation object for [%d]",
+                                citation_num,
+                            )
                             yield (
                                 "citation",
                                 citation_objects[citation_num],
                             )
-                        elif os.environ.get("SNOWFLAKE_DEBUG"):
+                        else:
+                            # Citation lookup failed - drop the marker
                             logger.debug(
-                                "Citation [%d] not found in citation_objects",
+                                "[CITATION DROP] Citation [%d] not found in citation_objects, dropping. Widget=%s",
                                 citation_num,
+                                widget is not None,
                             )
 
                         # Continue with rest of buffer
+                        logger.debug(
+                            "[CITATION CONTINUE] Buffer after [%d]: '%s'",
+                            citation_num,
+                            (
+                                buffer[match.end() :][:50]
+                                if len(buffer) > match.end()
+                                else buffer[match.end() :]
+                            ),
+                        )
                         buffer = buffer[match.end() :]
 
     except CitationMatchError as citation_error:
@@ -957,6 +1152,11 @@ async def stream_llm_with_tools(
 
     # Yield any remaining buffer - no citation processing here since it should have been done in the loop
     if buffer:
+        logger.debug(
+            "[FINAL BUFFER] Yielding remaining buffer (%d chars): '%s'",
+            len(buffer),
+            buffer[:100] if len(buffer) > 100 else buffer,
+        )
         yield ("text", buffer)
 
     # Build tool calls
@@ -993,19 +1193,162 @@ async def stream_llm_with_tools(
     )
 
 
+def _strip_artifact_tags(text: str) -> str:
+    """Remove artifact boundary tags from LLM response text to prevent UI duplication.
+
+    Note: Uses specific patterns to avoid stripping markdown table pipes (|) or
+    citation brackets ([1], [2], etc.).
+    """
+    original = text
+
+    # Remove full artifact blocks with content - bracket format
+    text = re.sub(r"\[start_artifact\].*?\[end_artifact\]", "", text, flags=re.DOTALL)
+
+    # Remove full artifact blocks with content - pipe format (must have start/end keywords)
+    text = re.sub(r"\|start_artifact\|.*?\|end_artifact\|", "", text, flags=re.DOTALL)
+
+    # Remove artifact_id blocks - bracket format
+    text = re.sub(
+        r"\[start_artifact_id[^\]]*\].*?\[end_artifact_id\]", "", text, flags=re.DOTALL
+    )
+
+    # Remove artifact_id blocks - pipe format
+    text = re.sub(
+        r"\|start_artifact_id[^\|]*\|.*?\|end_artifact_id\|", "", text, flags=re.DOTALL
+    )
+
+    # Remove standalone artifact tags - be specific to avoid matching table pipes or citations
+    # Bracket format: [start_artifact], [end_artifact], [start_artifact_id...], [end_artifact_id]
+    text = re.sub(r"\[start_artifact(?:_id[^\]]*)?\]", "", text)
+    text = re.sub(r"\[end_artifact(?:_id)?\]", "", text)
+
+    # Pipe format: |start_artifact|, |end_artifact|, etc. (must have complete tag)
+    text = re.sub(r"\|start_artifact(?:_id[^\|]*)?\|>?", "", text)
+    text = re.sub(r"\|end_artifact(?:_id)?\|>?", "", text)
+
+    if original != text:
+        logger.debug(
+            "[ARTIFACT TAG STRIP] Removed %d chars. Original preview: %s",
+            len(original) - len(text),
+            original[:200],
+        )
+
+    return text
+
+
 async def generate_sse_events(stream_generator, stream_state: dict):
     """Consume the stream generator and yield SSE events."""
+    # pylint: disable=import-outside-toplevel
     from openbb_ai import reasoning_step
+    from openbb_ai.helpers import chart, table
 
     stream_state.setdefault("citation_count", 0)
     stream_state.setdefault("citation_summaries", [])
     stream_state.setdefault("fatal_error", None)
 
+    # Buffer for accumulating text to detect complete markdown tables
+    pending_table_buffer = ""
+
     try:
         async for event_type, data in stream_generator:
             if event_type == "text" and isinstance(data, str):
-                yield to_sse(message_chunk(data))
-                stream_state["full_text"] += data
+                cleaned_data = _strip_artifact_tags(data)
+
+                # Accumulate text to detect markdown tables
+                pending_table_buffer += cleaned_data
+
+                # Check if buffer contains complete markdown tables
+                # Look for table patterns (lines with |) followed by non-table content
+                if "|" in pending_table_buffer:
+                    # Try to extract tables from accumulated buffer
+                    modified_text, extracted_tables = extract_markdown_tables(
+                        pending_table_buffer
+                    )
+
+                    if extracted_tables:
+                        # We found tables - emit the modified text and table artifacts
+                        for tbl in extracted_tables:
+                            placeholder = tbl["placeholder"]
+
+                            # Split text at placeholder and emit parts
+                            parts = modified_text.split(placeholder, 1)
+
+                            # Emit text before table
+                            if parts[0].strip():
+                                logger.debug(
+                                    "[TEXT CHUNK] Length: %d, Preview: %s",
+                                    len(parts[0]),
+                                    parts[0][:150],
+                                )
+                                yield to_sse(message_chunk(parts[0]))
+                                stream_state["full_text"] += parts[0]
+
+                            # Emit table artifact
+                            try:
+                                table_artifact = table(
+                                    data=tbl["data"],
+                                    name=tbl["name"],
+                                    description=f"Table with {len(tbl['data'])} rows",
+                                )
+                                yield to_sse(table_artifact)
+                                stream_state[
+                                    "full_text"
+                                ] += f"\n[Table: {tbl['name']}]\n"
+                                logger.debug(
+                                    "[TABLE ARTIFACT] Emitted table '%s' with %d rows",
+                                    tbl["name"],
+                                    len(tbl["data"]),
+                                )
+                            except Exception as table_err:
+                                logger.warning(
+                                    "Failed to create table artifact: %s", table_err
+                                )
+                                # Fall back to original markdown
+                                yield to_sse(message_chunk(pending_table_buffer))
+                                stream_state["full_text"] += pending_table_buffer
+
+                            # Update modified_text for next iteration
+                            if len(parts) > 1:
+                                modified_text = parts[1]
+                            else:
+                                modified_text = ""
+
+                        # Emit any remaining text after all tables
+                        if modified_text.strip():
+                            logger.debug(
+                                "[TEXT CHUNK] Length: %d, Preview: %s",
+                                len(modified_text),
+                                modified_text[:150],
+                            )
+                            yield to_sse(message_chunk(modified_text))
+                            stream_state["full_text"] += modified_text
+
+                        pending_table_buffer = ""
+                        continue
+
+                # No complete tables found - check if we might be mid-table
+                lines = pending_table_buffer.split("\n")
+                last_lines_have_pipes = (
+                    any("|" in line for line in lines[-3:])
+                    if len(lines) >= 3
+                    else False
+                )
+
+                if last_lines_have_pipes and len(pending_table_buffer) < 5000:
+                    # Might be building a table, keep buffering
+                    continue
+
+                # No table detected, emit the buffer as regular text
+                if pending_table_buffer:
+                    logger.debug(
+                        "[TEXT CHUNK] Length: %d, Preview: %s",
+                        len(pending_table_buffer),
+                        pending_table_buffer[:150],
+                    )
+                    yield to_sse(message_chunk(pending_table_buffer))
+                    stream_state["full_text"] += pending_table_buffer
+                    pending_table_buffer = ""
+
             elif event_type == "sql" and isinstance(data, str):
                 block = f"```sql\n{data.strip()}\n```"
                 yield to_sse(message_chunk(block))
@@ -1013,6 +1356,126 @@ async def generate_sse_events(stream_generator, stream_state: dict):
             elif event_type == "reasoning_complete" and isinstance(data, str):
                 # Emit complete think block as a single reasoning event
                 yield to_sse(reasoning_step(data, event_type="INFO"))
+            elif event_type == "artifact_chart":
+                try:
+                    artifact_data = data if isinstance(data, dict) else {}
+                    chart_type = artifact_data.get("chart_type", "bar")
+                    title = artifact_data.get("title", "Chart")
+                    chart_data_spec = artifact_data.get("data", {})
+
+                    # The LLM outputs data as {"label_column": "X", "value_column": "Y"}
+                    # Get column names
+                    label_col = (
+                        chart_data_spec.get("label_column")
+                        if isinstance(chart_data_spec, dict)
+                        else None
+                    )
+                    value_col = (
+                        chart_data_spec.get("value_column")
+                        if isinstance(chart_data_spec, dict)
+                        else None
+                    )
+
+                    # If LLM provided actual labels/values arrays, use those
+                    labels = (
+                        chart_data_spec.get("labels", [])
+                        if isinstance(chart_data_spec, dict)
+                        else []
+                    )
+                    values = (
+                        chart_data_spec.get("values", [])
+                        if isinstance(chart_data_spec, dict)
+                        else []
+                    )
+
+                    # If no actual data but we have column names, try to use cached query results
+                    if not labels and not values and label_col and value_col:
+                        # Import and check cached data from tool_executor
+                        try:
+                            from . import tool_executor
+
+                            # Use the most recent query result (any conversation)
+                            if (
+                                hasattr(tool_executor, "_last_query_results")
+                                and tool_executor._last_query_results
+                            ):
+                                # Get the most recent result
+                                cached_data = (
+                                    list(tool_executor._last_query_results.values())[-1]
+                                    if tool_executor._last_query_results
+                                    else []
+                                )
+                                for row in cached_data:
+                                    if isinstance(row, dict):
+                                        lv = (
+                                            row.get(label_col)
+                                            or row.get(label_col.upper())
+                                            or row.get(label_col.lower())
+                                        )
+                                        vv = (
+                                            row.get(value_col)
+                                            or row.get(value_col.upper())
+                                            or row.get(value_col.lower())
+                                        )
+                                        if lv is not None:
+                                            labels.append(str(lv))
+                                        if vv is not None:
+                                            try:
+                                                values.append(float(vv))
+                                            except (ValueError, TypeError):
+                                                values.append(0)
+                        except Exception as cache_err:
+                            logger.debug(
+                                "Could not access cached query results: %s", cache_err
+                            )
+
+                    if labels and values and len(labels) == len(values):
+                        # Build chart data
+                        chart_data = [
+                            {"label": str(label), "value": float(val) if val else 0}
+                            for label, val in zip(labels, values)
+                        ]
+
+                        type_map = {
+                            "pie": "pie",
+                            "donut": "donut",
+                            "bar": "bar",
+                            "line": "line",
+                        }
+                        openbb_type = type_map.get(chart_type, "bar")
+
+                        if openbb_type in ("pie", "donut"):
+                            chart_artifact = chart(
+                                type=openbb_type,
+                                data=chart_data,
+                                angle_key="value",
+                                callout_label_key="label",
+                                name=title,
+                                description=f"{chart_type.capitalize()} chart",
+                            )
+                        else:
+                            chart_artifact = chart(
+                                type=openbb_type,  # type: ignore
+                                data=chart_data,
+                                x_key="label",
+                                y_keys=["value"],
+                                name=title,
+                                description=f"{chart_type.capitalize()} chart",
+                            )
+
+                        yield to_sse(chart_artifact)
+                        stream_state[
+                            "full_text"
+                        ] += f"\n✅ Rendered {chart_type} chart: {title}"
+                    else:
+                        # No actual data - just note the intent
+                        stream_state[
+                            "full_text"
+                        ] += f"\n[Chart requested: {title} - no data available]"
+
+                except Exception as chart_err:
+                    logger.warning("Failed to render chart artifact: %s", chart_err)
+                    stream_state["full_text"] += f"\n[Chart render failed: {chart_err}]"
             elif event_type == "citation":
                 # Citation model uses 'details' list, not 'extra_details'
                 if hasattr(data, "details") and data.details:
@@ -1035,6 +1498,55 @@ async def generate_sse_events(stream_generator, stream_state: dict):
                 yield to_sse(message_chunk(f"❌ Citation failure: {failure_message}"))
                 break
             elif event_type == "complete":
+                # Flush any remaining table buffer before completing
+                if pending_table_buffer:
+                    # Try to extract tables from remaining buffer
+                    modified_text, extracted_tables = extract_markdown_tables(
+                        pending_table_buffer
+                    )
+
+                    if extracted_tables:
+                        for tbl in extracted_tables:
+                            placeholder = tbl["placeholder"]
+                            parts = modified_text.split(placeholder, 1)
+
+                            if parts[0].strip():
+                                yield to_sse(message_chunk(parts[0]))
+                                stream_state["full_text"] += parts[0]
+
+                            try:
+                                table_artifact = table(
+                                    data=tbl["data"],
+                                    name=tbl["name"],
+                                    description=f"Table with {len(tbl['data'])} rows",
+                                )
+                                yield to_sse(table_artifact)
+                                stream_state[
+                                    "full_text"
+                                ] += f"\n[Table: {tbl['name']}]\n"
+                            except Exception as table_err:
+                                logger.warning(
+                                    "Failed to create final table artifact: %s",
+                                    table_err,
+                                )
+                                yield to_sse(message_chunk(pending_table_buffer))
+                                stream_state["full_text"] += pending_table_buffer
+
+                            if len(parts) > 1:
+                                modified_text = parts[1]
+                            else:
+                                modified_text = ""
+
+                        if modified_text.strip():
+                            yield to_sse(message_chunk(modified_text))
+                            stream_state["full_text"] += modified_text
+                    else:
+                        # No tables, just emit buffer
+                        yield to_sse(message_chunk(pending_table_buffer))
+                        stream_state["full_text"] += pending_table_buffer
+
+                    pending_table_buffer = ""
+
                 if isinstance(data, dict):
                     stream_state["full_text"] = data.get("text", "")
                     stream_state["tool_calls"] = data.get("tool_calls", [])
@@ -1050,6 +1562,25 @@ async def generate_sse_events(stream_generator, stream_state: dict):
         # Yield error message
         yield to_sse(message_chunk(f"Stream error: {str(e)}"))
     finally:
+        # Flush any remaining buffer in finally block
+        if pending_table_buffer:
+            # Try table extraction one more time
+            modified_text, extracted_tables = extract_markdown_tables(
+                pending_table_buffer
+            )
+            if extracted_tables:
+                for tbl in extracted_tables:
+                    try:
+                        table_artifact = table(
+                            data=tbl["data"],
+                            name=tbl["name"],
+                            description=f"Table with {len(tbl['data'])} rows",
+                        )
+                        yield to_sse(table_artifact)
+                    except Exception:
+                        pass
+            # Note: we can't easily emit remaining text here due to async generator constraints
+
         # Ensure stream_state always has termination markers
         if "fatal_error" not in stream_state:
             stream_state.setdefault("full_text", "")

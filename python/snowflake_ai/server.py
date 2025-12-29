@@ -12,18 +12,11 @@ import traceback
 from pathlib import Path
 from typing import Any, AsyncGenerator
 
-from .logger import get_logger
-
-logger = get_logger(__name__)
-
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from openbb_ai import (
     QueryRequest,
-    citations,
-    message_chunk,
-    reasoning_step,
 )
 from sse_starlette import EventSourceResponse
 
@@ -31,9 +24,8 @@ from sse_starlette import EventSourceResponse
 from ._snowflake_ai import (
     SnowflakeAgent,
     SnowflakeAI,
-    ToolCall,
-    FunctionCall,
 )
+from .logger import get_logger
 from .slash_commands import handle_slash_command
 from .helpers import (
     seed_message_signatures,
@@ -42,6 +34,8 @@ from .helpers import (
     run_in_thread,
 )
 from .widgets import router as widgets_router
+
+logger = get_logger(__name__)
 
 AGENT_BASE_URL = os.environ.get("AGENT_BASE_URL", "http://127.0.0.1:8000")
 
@@ -70,6 +64,8 @@ max_tokens_preferences: dict[str, int] = {}
 client_pool: dict[str, SnowflakeAI] = {}
 # Track token usage per conversation
 token_usage: dict[str, dict[str, int]] = {}
+# Cache last query results per conversation for charting
+last_query_results: dict[str, list] = {}
 MAX_TOOL_ITERATIONS = 10
 
 NON_TOOL_CALLING_MODELS = {
@@ -155,6 +151,11 @@ def get_or_create_agent(conversation_id: str = "default") -> SnowflakeAgent:
             if result:
                 try:
                     existing_settings = json.loads(result)
+                    logger.debug(
+                        "Loaded conversation settings for %s: %s",
+                        conversation_id,
+                        existing_settings,
+                    )
                     if "model" in existing_settings:
                         model_preferences[conversation_id] = existing_settings["model"]
                     if "temperature" in existing_settings:
@@ -168,25 +169,24 @@ def get_or_create_agent(conversation_id: str = "default") -> SnowflakeAgent:
                     if "token_usage" in existing_settings:
                         token_usage[conversation_id] = existing_settings["token_usage"]
                     # Restore database and schema context
-                    if "database" in existing_settings or "schema" in existing_settings:
-                        db = existing_settings.get("database")
-                        sch = existing_settings.get("schema")
-                        if db or sch:
-                            client.use_conversation_context(db, sch)
-                            if os.environ.get("SNOWFLAKE_DEBUG"):
-                                logger.debug(
-                                    "Restored context for conversation %s: database=%s, schema=%s",
-                                    conversation_id,
-                                    db,
-                                    sch,
-                                )
-                except (json.JSONDecodeError, ValueError, TypeError):
-                    pass
+                    db = existing_settings.get("database")
+                    sch = existing_settings.get("schema")
+                    if db or sch:
+                        logger.debug(
+                            "Restoring context for conversation %s: database=%s, schema=%s",
+                            conversation_id,
+                            db,
+                            sch,
+                        )
+                        client.use_conversation_context(db, sch)
+                except (json.JSONDecodeError, ValueError, TypeError) as e:
+                    logger.debug(
+                        "Error parsing conversation settings for %s: %s",
+                        conversation_id,
+                        e,
+                    )
         except Exception as e:
-            if os.environ.get("SNOWFLAKE_DEBUG"):
-                logger.debug(
-                    "Error initializing conversation %s: %s", conversation_id, e
-                )
+            logger.debug("Error initializing conversation %s: %s", conversation_id, e)
 
         # Load preferences from AGENTS_CONTEXT_OBJECTS if not already loaded
         try:
@@ -231,12 +231,11 @@ def get_or_create_agent(conversation_id: str = "default") -> SnowflakeAgent:
                     pass
 
         except Exception as e:
-            if os.environ.get("SNOWFLAKE_DEBUG"):
-                logger.debug(
-                    "Error loading preferences from cache for %s: %s",
-                    conversation_id,
-                    e,
-                )
+            logger.debug(
+                "Error loading preferences from cache for %s: %s",
+                conversation_id,
+                e,
+            )
 
     return agent_pool[conversation_id]
 
@@ -247,8 +246,7 @@ async def shutdown_event():
         try:
             await run_in_thread(client.close)
         except Exception as e:
-            if os.environ.get("SNOWFLAKE_DEBUG"):
-                logger.error("Error closing client connection: %s", e)
+            logger.error("Error closing client connection: %s", e)
 
 
 app.add_event_handler(event_type="shutdown", func=shutdown_event)
@@ -334,9 +332,24 @@ async def upload_image(conversation_id: str, file: UploadFile = File(...)):
 @app.post("/query")
 async def stream(request_obj: Request, request: QueryRequest):
     """Query endpoint with SSE streaming."""
+    import time
+
+    request_start_time = time.time()
+    logger.debug("[REQUEST START] New /query request at %s", request_start_time)
+
+    if request.messages:
+        last_msg = request.messages[-1]
+        content = (
+            getattr(last_msg, "content", "")[:100]
+            if hasattr(last_msg, "content")
+            else ""
+        )
+        logger.debug("[REQUEST START] Last message: %s...", content)
 
     # Extract conversation ID IMMEDIATELY when request comes in
     conv_id = request_obj.headers.get("x-trace-id") or "default"
+
+    logger.debug("[REQUEST START] Conversation ID: %s", conv_id)
 
     # Ensure agent and preferences are loaded from cache BEFORE reading them
     get_or_create_agent(conv_id)
@@ -348,6 +361,12 @@ async def stream(request_obj: Request, request: QueryRequest):
 
     async def execution_loop():
         """Main execution loop."""
+        exec_id = str(uuid.uuid4())[:8]
+
+        logger.debug(
+            "[EXEC %s] execution_loop started for conv_id=%s", exec_id, conv_id
+        )
+
         # Check for slash commands FIRST
         if request.messages and request.messages[-1].role in ["human", "user"]:
             last_message = request.messages[-1]
@@ -376,538 +395,118 @@ async def stream(request_obj: Request, request: QueryRequest):
             else:
                 # Process normal query
                 async for event in process_normal_query():
+                    if (
+                        isinstance(event, dict)
+                        and event.get("event") == "copilotMessageArtifact"
+                    ):
+                        data_str = str(event.get("data", ""))[:400]
+                        logger.debug(
+                            "[EXEC %s] YIELDING ARTIFACT from process_normal_query: %s",
+                            exec_id,
+                            data_str,
+                        )
                     yield event
         else:
             # Process normal query
             async for event in process_normal_query():
+                if (
+                    isinstance(event, dict)
+                    and event.get("event") == "copilotMessageArtifact"
+                ):
+                    data_str = str(event.get("data", ""))[:400]
+                    logger.debug(
+                        "[EXEC %s] YIELDING ARTIFACT from process_normal_query: %s",
+                        exec_id,
+                        data_str,
+                    )
                 yield event
 
     async def process_normal_query() -> AsyncGenerator[dict[str, Any], None]:
         """Process normal query (non-slash-command)."""
-        from openbb_ai import get_widget_data
-        from openbb_ai.models import WidgetRequest
-        from .conversation_manager import format_messages_for_llm
-        from .tool_executor import execute_tool, get_tool_definitions
-        from .streaming_handler import stream_llm_with_tools, generate_sse_events
-
-        def format_tool_overview(tool_defs: list[dict] | None) -> str:
-            """Create a human-readable summary of available tools."""
-
-            if not tool_defs:
-                return ""
-
-            lines: list[str] = []
-            for tool in tool_defs:
-                if not isinstance(tool, dict):
-                    continue
-
-                function = tool.get("function")
-                if not isinstance(function, dict):
-                    continue
-
-                name = function.get("name")
-                if not name:
-                    continue
-
-                description = (function.get("description") or "").strip()
-                parameters = function.get("parameters")
-                arg_bits: list[str] = []
-
-                if isinstance(parameters, dict):
-                    props = parameters.get("properties")
-                    if isinstance(props, dict):
-                        for param_name, schema in props.items():
-                            if not isinstance(schema, dict):
-                                continue
-                            param_text = param_name
-                            param_type = schema.get("type")
-                            param_desc = (schema.get("description") or "").strip()
-                            if param_type:
-                                param_text += f" ({param_type})"
-                            if param_desc:
-                                param_text += f": {param_desc}"
-                            arg_bits.append(param_text)
-
-                arg_text = f" Args: {'; '.join(arg_bits)}" if arg_bits else ""
-                lines.append(f"- {name}: {description}{arg_text}".strip())
-
-            return "\n".join(lines)
-
-        # CHECK IF WE NEED TO FETCH WIDGET DATA (EARLY EXIT)
-        last_message = request.messages[-1] if request.messages else None
-
-        selected_widget_stage_path = None  # Initialize widget context variables
-        widget_context_str = ""
-        widget_for_citations = None
-        widget_input_args_for_citations = None
-        widget_context_metadata: dict[str, Any] | None = None
-
-        # Check if we have PRIMARY widgets explicitly added to context by the user
-        # Secondary widgets are NOT used - only primary widgets are explicitly added
-        has_primary_widgets = (
-            request.widgets
-            and request.widgets.primary
-            and len(request.widgets.primary) > 0
+        from .query_processing import (
+            handle_primary_widgets,
+            load_conversation_history,
+            process_incoming_messages,
+            prepare_llm_context,
+            stream_response_no_tools,
+            execute_single_tool,
         )
-        if (
-            last_message
-            and last_message.role in ["human", "user"]
-            and has_primary_widgets
-        ):
-            from .document_processor import DocumentProcessor
+        from .helpers import format_tool_overview
+        from .tool_executor import get_tool_definitions
+        from openbb_ai import reasoning_step
+        from .streaming_handler import message_chunk, stream_llm_with_tools, citations
+        from ._snowflake_ai import ToolCall, FunctionCall
 
-            # Emit reasoning step BEFORE document processing starts
-            yield to_sse(
-                reasoning_step(
-                    "Reading document and metadata...",
-                    event_type="INFO",
-                )
-            )
+        # 1. Handle Primary Widgets
+        client = client_pool[conv_id]
 
-            client = client_pool[conv_id]
-            doc_proc = DocumentProcessor.instance()
-
-            # Prepare document widgets (handles all document-specific logic)
-            # Only pass primary widgets - secondary are not explicitly added by user
-            doc_result = await doc_proc.prepare_document_widgets(
-                request.widgets.primary,
-                None,  # Don't use secondary widgets
-                conv_id,
-                client,
-            )
-
-            if doc_result["is_document"]:
-                # Document widget found and processed
-                widget_context_str = doc_result["widget_context_str"]
-                widget_for_citations = doc_result["widget_for_citations"]
-                widget_input_args_for_citations = doc_result[
-                    "widget_input_args_for_citations"
-                ]
-                widget_context_metadata = doc_result["widget_context_metadata"]
-                selected_widget_stage_path = doc_result["stage_path"]
+        widget_context_result = None
+        async for event in handle_primary_widgets(request, conv_id, client):
+            if "should_return" in event:
+                widget_context_result = event
             else:
-                # If document not ready or not found, proceed with original widget logic
-                # Only call get_widget_data if there are actual widgets to request
-                widget_requests = []
-                for widget in request.widgets.primary or []:
-                    widget_req = WidgetRequest(
-                        widget=widget,
-                        input_arguments=(
-                            {p.name: p.current_value for p in widget.params}
-                            if hasattr(widget, "params")
-                            else {}
-                        ),
-                    )
-                    widget_requests.append(widget_req)
+                yield event
 
-                # Only yield get_widget_data if there are actual requests
-                if widget_requests:
-                    yield to_sse(
-                        reasoning_step(
-                            f"Calling tool, get_widget_data, with arguments -> {{'widget_requests': [{', '.join([str(req.widget.uuid) for req in widget_requests])}]}}",
-                            event_type="INFO",
-                        )
-                    )
-                    result = get_widget_data(widget_requests)
-                    yield result.model_dump()
-                    # Must return immediately after yielding get_widget_data to close the connection
-                    # The widget data will come back in a subsequent request as a tool message
-                    return
-                # If no widget requests, fall through to normal message processing
-                pass  # Continue to normal message processing below
+        if widget_context_result and widget_context_result.get("should_return"):
+            return
 
-        # Normal message processing - ALWAYS runs (after widget handling if any)
-        # This handles both: messages with widgets AND simple messages without widgets
+        # Extract context variables
+        widget_context_str = (
+            widget_context_result.get("widget_context_str", "")
+            if widget_context_result
+            else ""
+        )
+        widget_for_citations = (
+            widget_context_result.get("widget_for_citations")
+            if widget_context_result
+            else None
+        )
+        widget_input_args_for_citations = (
+            widget_context_result.get("widget_input_args_for_citations")
+            if widget_context_result
+            else None
+        )
+        widget_context_metadata = (
+            widget_context_result.get("widget_context_metadata")
+            if widget_context_result
+            else None
+        )
+        selected_widget_stage_path = (
+            widget_context_result.get("selected_widget_stage_path")
+            if widget_context_result
+            else None
+        )
+
+        # 2. Normal Message Processing
         try:
             _ = get_or_create_agent(conv_id)
-            client = client_pool[conv_id]
+            # client is already retrieved above
 
-            current_messages = []
-            # Widget context variables now initialized at top of function scope
+            # 3. Load Conversation History
+            all_messages = await load_conversation_history(
+                client, conv_id, refresh_client
+            )
 
-            # LOAD CONVERSATION HISTORY FROM CACHE FIRST
-            # Retry once if session expired
-            try:
-                cached_messages = await run_in_thread(client.get_messages, conv_id)
-            except Exception as e:
-                if is_session_expired_error(e):
-                    logger.warning("Session expired, refreshing client...")
-                    client = refresh_client(conv_id)
-                    cached_messages = await run_in_thread(client.get_messages, conv_id)
-                else:
-                    raise
-
-            # Build complete conversation history INCLUDING tool results
-            all_messages = []
-            for msg_id, role, content in cached_messages:
-                # Check if this is a tool result message
-                is_tool_result = "[Tool Result" in content
-                all_messages.append(
-                    {
-                        "role": role,
-                        "content": content,
-                        "details": (
-                            {"is_tool_result": is_tool_result}
-                            if is_tool_result
-                            else None
-                        ),
-                    }
-                )
-
-            # Prime the deduplication cache with existing history
-            seed_message_signatures(conv_id, all_messages)
-
-            request_messages_to_add = []
-            has_new_user_message = False
-            needs_response = False
-            all_widgets: list[Any] = []
-            if getattr(request, "widgets", None):
-                all_widgets = list(request.widgets.primary or []) + list(
-                    request.widgets.secondary or []
-                )
-
-            def find_widget_by_uuid(target_uuid: str | None):
-                if not target_uuid:
-                    return None
-                for widget in all_widgets:
-                    if str(widget.uuid) == target_uuid:
-                        return widget
-                return None
-
-            for idx, message in enumerate(request.messages):
-                # Handle tool messages (widget data comes back as tool messages)
-                if message.role == "tool":
-                    # Only process if it has data
-                    if hasattr(message, "data") and message.data:
-                        message_input_args = getattr(message, "input_arguments", None)
-                        if not isinstance(message_input_args, dict):
-                            message_input_args = None
-                        data_sources = (message_input_args or {}).get(
-                            "data_sources", []
-                        ) or []
-
-                        # Get the target widget to determine processing strategy
-                        target_widget = None
-                        known_filename = None
-                        if message_input_args and data_sources and all_widgets:
-                            target_widget = find_widget_by_uuid(
-                                data_sources[0].get("widget_uuid")
-                            )
-
-                        # Process based on widget type
-                        from .widget_handler import WidgetHandler
-
-                        widget_handler = await WidgetHandler.instance()
-
-                        if target_widget and widget_handler.is_document_widget(
-                            target_widget
-                        ):
-                            doc_proc = DocumentProcessor.instance()
-                            known_filename = doc_proc.extract_filename_from_widget(
-                                target_widget
-                            )
-
-                            parsed_data = widget_handler.parse_widget_data(
-                                message.data, conv_id, client, known_filename
-                            )
-                            doc_proc.trigger_snowflake_upload_for_widget_pdf(
-                                client, conv_id
-                            )
-                        else:
-                            parsed_data = message.data
-                            if target_widget:
-                                widget_result = (
-                                    await widget_handler.process_widget_response(
-                                        target_widget, message.data, conv_id, client
-                                    )
-                                )
-                                parsed_data = widget_result.get("data", message.data)
-
-                        # Store tabular/JSON widget data in Snowflake for reference
-                        if message_input_args and data_sources:
-                            for data_source in data_sources:
-                                widget_uuid = data_source.get("widget_uuid")
-                                if widget_uuid and request.widgets:
-                                    # Find widget name
-                                    widget_name = widget_uuid
-                                    target_widget = find_widget_by_uuid(widget_uuid)
-                                    if target_widget:
-                                        widget_name = getattr(
-                                            target_widget, "name", widget_uuid
-                                        )
-
-                                    # Store widget data in Snowflake (async, non-blocking)
-                                    doc_proc = DocumentProcessor.instance()
-                                    asyncio.create_task(
-                                        doc_proc.store_widget_data_in_snowflake(
-                                            client=client,
-                                            widget_uuid=widget_uuid,
-                                            widget_name=widget_name,
-                                            data_content=parsed_data,
-                                            conversation_id=conv_id,
-                                            data_type="json",
-                                        )
-                                    )
-
-                        # Only add context if it's the last message
-                        if idx == len(request.messages) - 1:
-                            widget_data_request = (
-                                data_sources[0] if data_sources else {}
-                            )
-                            target_uuid = (
-                                widget_data_request.get("widget_uuid")
-                                if isinstance(widget_data_request, dict)
-                                else None
-                            )
-                            target_widget = find_widget_by_uuid(target_uuid)
-                            widget_display_name = None
-                            widget_description = None
-                            widget_type = None
-                            document_label = None
-                            widget_label = None
-
-                            if target_widget:
-                                widget_display_name = getattr(
-                                    target_widget, "name", None
-                                ) or getattr(target_widget, "title", None)
-                                widget_description = getattr(
-                                    target_widget, "description", None
-                                )
-                                widget_type = getattr(
-                                    target_widget, "type", None
-                                ) or getattr(target_widget, "kind", None)
-
-                            widget_input_args_dict = None
-                            if isinstance(widget_data_request, dict):
-                                widget_input_args_dict = dict(
-                                    widget_data_request.get("input_args", {}) or {}
-                                )
-                                widget_input_args_dict.setdefault(
-                                    "conversation_id", conv_id
-                                )
-
-                            document_label = (
-                                known_filename
-                                or (widget_input_args_dict or {}).get("file_name")
-                                or (widget_input_args_dict or {}).get("document_name")
-                            )
-                            if not document_label:
-                                for candidate_key in (
-                                    "dataset_name",
-                                    "table_name",
-                                    "sheet_name",
-                                    "source_name",
-                                ):
-                                    candidate_value = (
-                                        widget_input_args_dict or {}
-                                    ).get(candidate_key)
-                                    if candidate_value:
-                                        document_label = candidate_value
-                                        break
-
-                            stage_path = (
-                                (widget_input_args_dict or {}).get("stage_path")
-                                or (widget_data_request or {}).get("stage_path")
-                                or selected_widget_stage_path
-                            )
-                            if widget_input_args_dict is not None and stage_path:
-                                widget_input_args_dict.setdefault(
-                                    "stage_path", stage_path
-                                )
-
-                            widget_type = (
-                                widget_type
-                                or (widget_data_request or {}).get("widget_type")
-                                or (widget_data_request or {}).get("widget_kind")
-                            )
-                            widget_display_name = (
-                                widget_display_name
-                                or (widget_data_request or {}).get("widget_name")
-                                or (widget_data_request or {}).get("widget_title")
-                            )
-                            widget_description = (
-                                widget_description
-                                or (widget_data_request or {}).get("description")
-                                or (widget_input_args_dict or {}).get("description")
-                            )
-
-                            widget_label = (
-                                widget_display_name
-                                or document_label
-                                or target_uuid
-                                or "widget"
-                            )
-                            if widget_input_args_dict is not None:
-                                widget_input_args_dict.setdefault(
-                                    "widget_label", widget_label
-                                )
-                                if target_widget:
-                                    widget_input_args_dict.setdefault(
-                                        "widget_uuid", str(target_widget.uuid)
-                                    )
-                                widget_input_args_dict.setdefault(
-                                    "widget_title", widget_display_name
-                                )
-                                widget_input_args_for_citations = widget_input_args_dict
-
-                            metadata_lines = [
-                                "The user is explicitly referring to this widget data. Do NOT ask which widget or document; cite this source directly."
-                            ]
-                            if widget_display_name:
-                                metadata_lines.append(
-                                    f"Widget Name: {widget_display_name}"
-                                )
-                            if target_uuid:
-                                metadata_lines.append(f"Widget UUID: {target_uuid}")
-                            if document_label:
-                                metadata_lines.append(
-                                    f"Document/File: {document_label}"
-                                )
-                            if stage_path:
-                                metadata_lines.append(f"Stage Path: {stage_path}")
-                            if widget_type:
-                                metadata_lines.append(f"Widget Type: {widget_type}")
-                            if widget_description:
-                                metadata_lines.append(
-                                    f"Widget Description: {widget_description}"
-                                )
-
-                            data_label = (
-                                widget_display_name or document_label or "Widget Data"
-                            )
-                            widget_context_str = (
-                                "\n".join(metadata_lines)
-                                + f"\n\n--- Widget Data: {data_label} ---\n{parsed_data}\n------\n"
-                            )
-
-                            # Extract widget info for citations
-                            if target_widget:
-                                widget_for_citations = target_widget
-
-                            widget_context_metadata = {
-                                "widget_label": widget_label,
-                                "widget_uuid": target_uuid,
-                                "document_label": document_label,
-                                "stage_path": stage_path,
-                            }
-                    # Skip adding tool message to current_messages
-                    continue
-
-                elif hasattr(message, "content") and message.content:
-                    # Check if this is a new message not in cache
-                    is_new = True
-                    if all_messages:
-                        message_content = (
-                            message.content
-                            if isinstance(message.content, str)
-                            else str(message.content)
-                        )
-
-                        # Prevent duplicates by checking entire content
-                        for cached_msg in all_messages:
-                            if (
-                                cached_msg["role"] == message.role
-                                and cached_msg["content"] == message_content
-                            ):
-                                is_new = False
-                                break
-
-                    if is_new:
-                        request_messages_to_add.append(message)
-                        # Track if we have a new user message
-                        if message.role in ["human", "user"]:
-                            has_new_user_message = True
-                            needs_response = True
-
-                    else:
-                        # Even if message is cached, check if it's the last user message
-                        # and whether it has been responded to
-                        if (
-                            message.role in ["human", "user"]
-                            and idx == len(request.messages) - 1
-                        ):
-                            # Treat a last human message as an intentional send/resend.
-                            # Always require a fresh response when the user explicitly sent (or resent) the message.
-                            has_new_user_message = True
-                            needs_response = True
-                            if os.environ.get("SNOWFLAKE_DEBUG"):
-                                logger.debug(
-                                    "Last user message is resend - forcing fresh response"
-                                )
-
-                            # Note: we intentionally do NOT append the duplicate to request_messages_to_add
-                            # to avoid duplicating stored messages in the cache.
-                        else:
-                            has_response = False
-                            found_this_msg = False
-
-                            for i, cached_msg in enumerate(all_messages):
-                                if not found_this_msg:
-                                    # Find this specific user message in cache
-                                    if cached_msg["role"] in [
-                                        "human",
-                                        "user",
-                                    ] and cached_msg["content"] == (
-                                        message.content
-                                        if isinstance(message.content, str)
-                                        else str(message.content)
-                                    ):
-                                        found_this_msg = True
-                                elif found_this_msg:
-                                    # After finding the user message, check if there's an assistant response
-                                    if cached_msg["role"] == "assistant":
-                                        has_response = True
-                                        break
-                                    elif (
-                                        cached_msg["role"] in ["human", "user"]
-                                        and "[Tool Result" not in cached_msg["content"]
-                                    ):
-                                        # Another user message without tool result means no response to previous
-                                        break
-
-                            if not has_response:
-                                needs_response = True
-                                if os.environ.get("SNOWFLAKE_DEBUG"):
-                                    logger.debug("Last user message needs a response")
-
-            if widget_for_citations:
-                if widget_input_args_for_citations is None:
-                    widget_input_args_for_citations = {"conversation_id": conv_id}
-                else:
-                    widget_input_args_for_citations.setdefault(
-                        "conversation_id", conv_id
-                    )
-
-            # Store new messages FIRST before any early returns
-            # Only add truly new unique messages from request and store them
-            if request_messages_to_add:
-                for message in request_messages_to_add:
-                    msg_dict = {
-                        "role": message.role,
-                        "content": (
-                            message.content
-                            if isinstance(message.content, str)
-                            else str(message.content)
-                        ),
-                        "details": None,
-                    }
-                    if should_store_message(
-                        conv_id,
-                        msg_dict["role"],
-                        msg_dict["content"],
-                        details=msg_dict["details"],
-                    ):
-                        msg_id = str(uuid.uuid4())
-                        all_messages.append(msg_dict)
-
-                        # Store new messages in Snowflake
-                        await run_in_thread(
-                            client.add_message,
-                            conv_id,
-                            msg_id,
-                            msg_dict["role"],
-                            msg_dict["content"],
-                        )
+            # 4. Process Incoming Messages
+            (
+                all_messages,
+                has_new_user_message,
+                needs_response,
+                widget_for_citations,
+                widget_input_args_for_citations,
+                widget_context_str,
+                widget_context_metadata,
+            ) = await process_incoming_messages(
+                request,
+                all_messages,
+                conv_id,
+                client,
+                selected_widget_stage_path,
+                existing_widget_context_str=widget_context_str,
+                existing_widget_context_metadata=widget_context_metadata,
+                existing_widget_for_citations=widget_for_citations,
+                existing_widget_input_args=widget_input_args_for_citations,
+            )
 
             # Only process if we have a new user message OR need to respond to existing one
             if (
@@ -928,337 +527,138 @@ async def stream(request_obj: Request, request: QueryRequest):
                     )
                 )
                 return
-            # Get the CURRENT user message from the request (not from cached history)
-            current_request_user_msg = None
+
+            # 5. Prepare LLM Context
+            supports_tools = selected_model not in NON_TOOL_CALLING_MODELS
+            tools = get_tool_definitions(client) if supports_tools else None
+
+            # Check for tool capability query
+            last_user_msg_lower = ""
             for msg in reversed(request.messages):
                 if msg.role in ["human", "user"]:
                     content = getattr(msg, "content", None)
                     if content:
-                        current_request_user_msg = (
+                        last_user_msg_lower = (
                             content if isinstance(content, str) else str(content)
-                        )
+                        ).lower()
                     break
 
-            # Keep a sliding window of recent messages, but the full history is available if needed
-            current_messages = []
+            tool_overview = format_tool_overview(tools)
+            TOOL_CAPABILITY_PHRASES = [
+                "what tools",
+                "which tools",
+                "tool do you have",
+                "tooling",
+                "capabilities",
+                "available tools",
+                "available functions",
+                "what functions",
+                "tool access",
+                "list your tools",
+                "what can you do",
+                "show your tools",
+            ]
 
-            # Determine if we need full history based on the user's query
-            # Use the CURRENT request message, not old cached history
-            last_user_msg_raw = current_request_user_msg or ""
-            last_user_msg_lower = last_user_msg_raw.lower()
-
-            # Check if user is asking about conversation history or previous data
-            # Expanded keywords to catch more cases where full history is needed
-            needs_full_history = any(
-                phrase in last_user_msg_lower
-                for phrase in [
-                    "earlier",
-                    "previous",
-                    "history",
-                    "conversation",
-                    "what did",
-                    "what was",
-                    "what is",
-                    "you said",
-                    "we discussed",
-                    "remember",
-                    "recall",
-                    "mentioned",
-                    "show me again",
-                    "repeat",
-                    "before",
-                    "ago",
-                    "extract",
-                    "table",
-                    "data from",
-                    "message",
-                    "context",
-                    "cached",
-                    "stored",
-                    "available",
-                    "access",
-                    "tool output",
-                    "last active",
-                    "reassess",
-                    "situation",
-                    "improved",
-                    "context map",
-                    "what tool",
-                ]
-            )
-
-            if needs_full_history:
-                # User is asking about history - include ALL messages
-                MAX_LLM_CONTEXT_MESSAGES = 200  # Increased to ensure we get everything
-                if os.environ.get("SNOWFLAKE_DEBUG"):
-                    logger.debug(
-                        "User query references history - including up to %d messages",
-                        MAX_LLM_CONTEXT_MESSAGES,
-                    )  # Include all messages for history queries
-                current_messages = all_messages[-MAX_LLM_CONTEXT_MESSAGES:]
-            else:
-                # Normal query - use sliding window for efficiency
-                SLIDING_WINDOW_SIZE = 30
-                MAX_TOOL_RESULTS_FOR_CONTEXT = 10
-                all_tool_results = []
-                for msg in all_messages:
-                    if msg["role"] in ["user"] and "[Tool Result" in msg["content"]:
-                        all_tool_results.append(msg)
-
-                if len(all_tool_results) > MAX_TOOL_RESULTS_FOR_CONTEXT:
-                    all_tool_results = all_tool_results[-MAX_TOOL_RESULTS_FOR_CONTEXT:]
-
-                # Get recent conversation messages
-                recent_conversation = []
-                for msg in all_messages[-(SLIDING_WINDOW_SIZE):]:
-                    if msg not in all_tool_results:
-                        recent_conversation.append(msg)
-
-                # Combine: ALL tool results + recent conversation
-                current_messages = all_tool_results + recent_conversation
-
-                # Sort by original order
-                current_messages = sorted(
-                    current_messages,
-                    key=lambda x: all_messages.index(x) if x in all_messages else 0,
+            if tool_overview and any(
+                phrase in last_user_msg_lower for phrase in TOOL_CAPABILITY_PHRASES
+            ):
+                capability_response = (
+                    "Here are the tools I have available right now:\n\n" + tool_overview
                 )
+                yield to_sse(message_chunk(capability_response))
 
-            # Rebuild the current user turn to avoid contaminating future turns with old context
-            enriched_user_message = None
-            if current_request_user_msg:
-                enriched_user_message = current_request_user_msg
-            elif widget_context_str:
-                # No explicit user text but widget data exists (e.g., tool follow-up)
-                enriched_user_message = "[User Context inferred from widget selection]"
-
-            if enriched_user_message is not None:
-                if widget_context_str:
-                    enriched_user_message += "\n\n" + widget_context_str
-                elif widget_context_metadata:
-                    # Widget selected but no full context string built yet - inject explicit selection
-                    doc_name = widget_context_metadata.get("document_label", "unknown")
-                    stage = widget_context_metadata.get("stage_path", "")
-                    enriched_user_message += f"\n\nWidget provided document: {doc_name}"
-                    if stage:
-                        enriched_user_message += f" ({stage})"
-            elif widget_context_metadata:
-                # No user message at all but widget is selected
-                doc_name = widget_context_metadata.get("document_label", "unknown")
-                stage = widget_context_metadata.get("stage_path", "")
-                enriched_user_message = f"Widget provided document: {doc_name}"
-                if stage:
-                    enriched_user_message += f" ({stage})"
-                enriched_user_message += "\n\nPlease analyze this document."
-
-                # Remove any trailing user/human messages that mirror this content to prevent duplication
-                while current_messages and current_messages[-1]["role"] in [
-                    "human",
-                    "user",
-                ]:
-                    last_content = current_messages[-1].get("content", "")
-                    if last_content.strip() == enriched_user_message.strip() or (
-                        current_request_user_msg
-                        and last_content.strip() == current_request_user_msg.strip()
-                    ):
-                        current_messages.pop()
-                    else:
-                        break
-
-                current_messages.append(
-                    {
-                        "role": "user",
-                        "content": enriched_user_message,
-                        "details": None,
-                    }
-                )
-
-            # Get user schema for document storage - ALWAYS OPENBB_AGENTS.USER_{username}
-            snowflake_user = await run_in_thread(client.get_current_user)
-            sanitized_user = "".join(c if c.isalnum() else "_" for c in snowflake_user)
-            user_schema = f"USER_{sanitized_user}".upper()
-
-            # Validate that we have messages to send
-            if not current_messages:
-                logger.error("No messages to process for conversation %s", conv_id)
-                yield to_sse(message_chunk("❌ No messages to process"))
-            else:
-                supports_tools = selected_model not in NON_TOOL_CALLING_MODELS
-                tools = get_tool_definitions(client) if supports_tools else None
-
-                # Validate message structure when using tools
-                if supports_tools and tools and current_messages:
-                    # Remove trailing assistant messages when using tools
-                    while current_messages and current_messages[-1]["role"] in (
-                        "assistant",
-                        "ai",
-                    ):
-                        current_messages.pop()
-
-                    # Also ensure we're not sending tool results as the last message
-                    while current_messages and "[Tool Result" in current_messages[
-                        -1
-                    ].get("content", ""):
-                        current_messages.pop()
-
-                    # If we removed everything, we need to ensure there's at least the latest user message
-                    if not current_messages or current_messages[-1]["role"] not in [
-                        "human",
-                        "user",
-                    ]:
-                        # Use the CURRENT request's user message, not old history
-                        if current_request_user_msg:
-                            current_messages.append(
-                                {
-                                    "role": "user",
-                                    "content": current_request_user_msg,
-                                    "details": None,
-                                }
-                            )
-                        else:
-                            # Fallback to finding from all_messages
-                            for msg in reversed(all_messages):
-                                if msg["role"] in [
-                                    "human",
-                                    "user",
-                                ] and "[Tool Result" not in msg.get("content", ""):
-                                    current_messages.append(msg)
-                                    break
-
-                    # CRITICAL: Ensure the CURRENT request message is the last user message
-                    # This handles the case where user resends a previous question
-                    if current_request_user_msg:
-                        last_msg = current_messages[-1] if current_messages else None
-                        if (
-                            not last_msg
-                            or last_msg.get("content") != current_request_user_msg
-                        ):
-                            # The current request message is different from the last message
-                            # Remove any trailing messages that come after what should be answered
-                            # and ensure current request is last
-                            current_messages.append(
-                                {
-                                    "role": "user",
-                                    "content": current_request_user_msg,
-                                    "details": None,
-                                }
-                            )
-
-                tool_overview = format_tool_overview(tools)
-
-                TOOL_CAPABILITY_PHRASES = [
-                    "what tools",
-                    "which tools",
-                    "tool do you have",
-                    "tooling",
-                    "capabilities",
-                    "available tools",
-                    "available functions",
-                    "what functions",
-                    "tool access",
-                    "list your tools",
-                    "what can you do",
-                    "show your tools",
-                ]
-
-                if tool_overview and any(
-                    phrase in last_user_msg_lower for phrase in TOOL_CAPABILITY_PHRASES
+                # Store response
+                assistant_entry = {
+                    "role": "assistant",
+                    "content": capability_response,
+                    "details": {"message_type": "assistant_final"},
+                }
+                if should_store_message(
+                    conv_id,
+                    assistant_entry["role"],
+                    assistant_entry["content"],
+                    details=assistant_entry["details"],
                 ):
-                    capability_response = (
-                        "Here are the tools I have available right now:\n\n"
-                        + tool_overview
-                    )
-                    yield to_sse(message_chunk(capability_response))
-
-                    assistant_entry = {
-                        "role": "assistant",
-                        "content": capability_response,
-                        "details": {"message_type": "assistant_final"},
-                    }
-                    if should_store_message(
+                    ai_msg_id = str(uuid.uuid4())
+                    all_messages.append(assistant_entry)
+                    await run_in_thread(
+                        client.add_message,
                         conv_id,
+                        ai_msg_id,
                         assistant_entry["role"],
                         assistant_entry["content"],
-                        details=assistant_entry["details"],
-                    ):
-                        ai_msg_id = str(uuid.uuid4())
-                        all_messages.append(assistant_entry)
-                        await run_in_thread(
-                            client.add_message,
-                            conv_id,
-                            ai_msg_id,
-                            assistant_entry["role"],
-                            assistant_entry["content"],
+                    )
+                return
+
+            ai_messages_formatted_tuples, tool_overview = await prepare_llm_context(
+                request,
+                all_messages,
+                widget_context_str,
+                widget_context_metadata,
+                conv_id,
+                client,
+                selected_model,
+                supports_tools,
+                tools,
+            )
+
+            # Shared state for streaming
+            stream_state = {
+                "full_text": "",
+                "tool_calls": [],
+                "usage": None,
+                "citation_count": 0,
+                "citation_summaries": [],
+                "fatal_error": None,
+            }
+
+            # 6. Stream Response
+            if not supports_tools:
+                async for event in stream_response_no_tools(
+                    client,
+                    ai_messages_formatted_tuples,
+                    selected_model,
+                    selected_temperature,
+                    selected_max_tokens,
+                    conv_id,
+                    widget_for_citations,
+                    widget_input_args_for_citations,
+                    token_usage,
+                    all_messages,
+                ):
+                    yield event
+            else:
+                # Tool-calling flow
+                for iteration in range(MAX_TOOL_ITERATIONS):
+                    if iteration == MAX_TOOL_ITERATIONS - 1:
+                        yield to_sse(
+                            reasoning_step(
+                                "Max tool iterations reached, aborting to prevent a loop.",
+                                event_type="ERROR",
+                            )
                         )
-                    return
+                        yield to_sse(
+                            message_chunk(
+                                "❌ I seem to be stuck in a loop. Please try rephrasing your request."
+                            )
+                        )
+                        break
 
-                from .system_prompt import build_system_prompt
-                from .document_processor import DocumentProcessor
-
-                try:
-                    available_docs = await run_in_thread(client.list_cortex_documents)
-                except Exception:
-                    available_docs = None
-
-                # Get document structure if available for this conversation
-                doc_proc = DocumentProcessor.instance()
-                document_structure = doc_proc.format_document_structure_for_llm(conv_id)
-
-                system_prompt = build_system_prompt(
-                    total_messages=len(all_messages),
-                    current_messages=len(current_messages),
-                    user_schema=user_schema,
-                    widget_context_metadata=widget_context_metadata,
-                    available_docs=available_docs,
-                    tool_overview=(tool_overview if supports_tools and tools else None),
-                    supports_tools=supports_tools and bool(tools),
-                    document_structure=document_structure,
-                )
-
-                # Prepare the final message stream
-                ai_messages_formatted_tuples = format_messages_for_llm(
-                    current_messages,
-                    system_prompt,
-                    inject_widget_data=False,
-                )
-
-                if supports_tools and tools and ai_messages_formatted_tuples:
-                    while (
-                        ai_messages_formatted_tuples
-                        and ai_messages_formatted_tuples[-1][0] == "assistant"
-                    ):
-                        ai_messages_formatted_tuples.pop()
-
-                    # Ensure we still have messages after cleanup
-                    if (
-                        not ai_messages_formatted_tuples
-                        or ai_messages_formatted_tuples[-1][0] == "assistant"
-                    ):
-                        # Find the last user message and ensure it's in the list
-                        for msg in reversed(current_messages):
-                            if msg["role"] in [
-                                "human",
-                                "user",
-                            ] and "[Tool Result" not in msg.get("content", ""):
-                                ai_messages_formatted_tuples.append(
-                                    ("user", msg["content"])
-                                )
-                                break
-
-                # Shared state for streaming
-                stream_state = {
-                    "full_text": "",
-                    "tool_calls": [],
-                    "usage": None,
-                    "citation_count": 0,
-                    "citation_summaries": [],
-                    "fatal_error": None,
-                }
-
-                # Stream LLM response
-                if not supports_tools:
-                    # For non-tool-calling models
                     stream_state["full_text"] = ""
                     stream_state["tool_calls"] = []
+                    stream_state["citation_count"] = 0
+                    stream_state["citation_summaries"] = []
+                    stream_state["fatal_error"] = None
+                    buffered_text_chunks = []
+                    buffered_events = []
+
+                    if iteration == 0:
+                        yield to_sse(
+                            reasoning_step(
+                                "Analyzing request and determining required tools...",
+                                event_type="INFO",
+                            )
+                        )
 
                     generator = stream_llm_with_tools(
                         client,
@@ -1266,33 +666,99 @@ async def stream(request_obj: Request, request: QueryRequest):
                         selected_model,
                         selected_temperature,
                         selected_max_tokens,
-                        tools=None,
+                        tools=tools,
                         conv_id=conv_id,
                         widget=widget_for_citations,
                         widget_input_args=widget_input_args_for_citations,
                     )
 
-                    # Iterate with timeout to prevent indefinite hangs
-                    sse_timeout = float(os.environ.get("SSE_EVENT_TIMEOUT", "120"))
-                    try:
-                        async for event in generate_sse_events(generator, stream_state):
-                            yield event
-                            # Check if stream marked as failed
-                            if stream_state.get("fatal_error"):
-                                break
-                    except asyncio.TimeoutError:
-                        logger.error(
-                            "SSE stream timed out after %s seconds", sse_timeout
-                        )
-                        stream_state["fatal_error"] = (
-                            f"Stream timeout after {sse_timeout}s"
-                        )
-                        yield to_sse(
-                            message_chunk(f"❌ Stream timed out after {sse_timeout}s")
-                        )
+                    # Track if response looks like a JSON tool call (suppress streaming in that case)
+                    looks_like_tool_call = False
 
-                    # Update token usage after completion
-                    if stream_state.get("usage"):
+                    async for event in generator:
+                        if not event:
+                            continue
+                        event_type, event_data = event
+
+                        if event_type == "text":
+                            if isinstance(event_data, str):
+                                buffered_text_chunks.append(event_data)
+                                buffered_events.append(("text", event_data))
+                                stream_state["full_text"] += event_data
+
+                                # Check early if this looks like a JSON tool call
+                                # If so, don't stream - we'll handle it after loop
+                                current_text = stream_state["full_text"].strip()
+                                if not looks_like_tool_call:
+                                    # Check for JSON object start or tool pattern
+                                    if (
+                                        current_text.startswith("{")
+                                        or '"tool"' in current_text
+                                    ):
+                                        looks_like_tool_call = True
+                                        logger.debug(
+                                            "Detected potential tool call JSON, suppressing stream"
+                                        )
+
+                                # Only stream if NOT a tool call
+                                if not looks_like_tool_call:
+                                    # Stream immediately for real-time rendering
+                                    yield to_sse(message_chunk(event_data))
+                        elif event_type == "sql":
+                            if isinstance(event_data, str):
+                                sql_block = event_data.strip()
+                                if sql_block:
+                                    formatted_sql = f"```sql\n{sql_block}\n```"
+                                    buffered_text_chunks.append(formatted_sql)
+                                    buffered_events.append(("text", formatted_sql))
+                                    stream_state["full_text"] += formatted_sql
+                                    if not looks_like_tool_call:
+                                        yield to_sse(message_chunk(formatted_sql))
+                        elif event_type == "reasoning_complete":
+                            if isinstance(event_data, str) and event_data.strip():
+                                yield to_sse(
+                                    reasoning_step(event_data, event_type="INFO")
+                                )
+                        elif event_type == "citation":
+                            buffered_events.append(("citation", event_data))
+                            stream_state["citation_count"] = (
+                                stream_state.get("citation_count", 0) + 1
+                            )
+                            summary_payload = dict(
+                                getattr(event_data, "extra_details", {}) or {}
+                            )
+                            summary_payload.setdefault(
+                                "citation_id", getattr(event_data, "citation_id", None)
+                            )
+                            stream_state.setdefault("citation_summaries", []).append(
+                                summary_payload
+                            )
+                            # Only stream citation if NOT a tool call
+                            if not looks_like_tool_call:
+                                yield to_sse(citations([event_data]))
+                        elif event_type == "tool_call":
+                            stream_state["tool_calls"].append(event_data)
+                        elif event_type == "complete":
+                            if isinstance(event_data, dict):
+                                stream_state["tool_calls"] = event_data.get(
+                                    "tool_calls", []
+                                )
+                                stream_state["usage"] = event_data.get("usage", None)
+                                stream_state["full_text"] = event_data.get(
+                                    "text", stream_state["full_text"]
+                                )
+                            break
+                        else:
+                            message = (
+                                event_data
+                                if isinstance(event_data, str)
+                                else str(event_data)
+                            )
+                            yield to_sse(reasoning_step(message, event_type="INFO"))
+
+                    # Update token usage
+                    usage = stream_state.get("usage")
+                    if isinstance(usage, dict):
                         if conv_id not in token_usage:
                             token_usage[conv_id] = {
                                 "prompt_tokens": 0,
@@ -1300,8 +766,6 @@ async def stream(request_obj: Request, request: QueryRequest):
                                 "total_tokens": 0,
                                 "api_requests": 0,
                             }
-
-                        usage = stream_state["usage"]
                         token_usage[conv_id]["prompt_tokens"] += usage.get(
                             "prompt_tokens", 0
                         )
@@ -1312,8 +776,6 @@ async def stream(request_obj: Request, request: QueryRequest):
                             "total_tokens", 0
                         )
                         token_usage[conv_id]["api_requests"] += 1
-
-                        # Store in cache
                         try:
                             await run_in_thread(
                                 client.set_conversation_data,
@@ -1323,23 +785,267 @@ async def stream(request_obj: Request, request: QueryRequest):
                             )
                         except Exception as e:
                             logger.error(
-                                "Non-tool path - ERROR storing token_usage: %s", e
+                                "Error storing token_usage for %s: %s", conv_id, e
                             )
 
-                    if stream_state["full_text"].strip() and not stream_state.get(
-                        "fatal_error"
-                    ):
-                        # Check if this assistant response is already in cache
-                        response_already_cached = False
-                        for cached_msg in all_messages[-5:]:  # Check last few messages
-                            if (
-                                cached_msg["role"] == "assistant"
-                                and cached_msg["content"] == stream_state["full_text"]
-                            ):
-                                response_already_cached = True
+                    # Check for tool calls in text if not explicit
+                    if not stream_state["tool_calls"]:
+                        full_text = stream_state["full_text"].strip()
+                        logger.info(
+                            "Checking for JSON tool call. Has '\"tool\"': %s, text len: %d, preview: %s",
+                            '"tool"' in full_text,
+                            len(full_text),
+                            full_text[:200] if full_text else "(empty)",
+                        )
+                        # Look for JSON tool call pattern: {"tool": "...", "arguments": {...}}
+                        if '"tool"' in full_text:
+                            logger.info("Found '\"tool\"' in text, attempting to parse")
+
+                            # Try to fix common LLM JSON mistakes before parsing
+                            fixed_text = full_text
+                            # Fix missing [ before array values like "key": 1, 2]
+                            import re as fix_re
+
+                            # Pattern: "key": value, value] -> "key": [value, value]
+                            fixed_text = fix_re.sub(
+                                r'("page_numbers"\s*:\s*)(\d+(?:\s*,\s*\d+)*)\]',
+                                r"\1[\2]",
+                                fixed_text,
+                            )
+                            # Also fix other array-like patterns
+                            fixed_text = fix_re.sub(
+                                r'("[\w_]+"\s*:\s*)(\d+(?:\s*,\s*\d+)+)\]',
+                                r"\1[\2]",
+                                fixed_text,
+                            )
+
+                            if fixed_text != full_text:
+                                logger.info(
+                                    "Fixed malformed JSON: %s", fixed_text[:200]
+                                )
+
+                            # Try to parse the (possibly fixed) text as JSON
+                            try:
+                                parsed = json.loads(fixed_text)
+                                tool_name = parsed.get("tool")
+                                args = parsed.get("arguments", {})
+                                if tool_name:
+                                    logger.info(
+                                        "JSON parse succeeded: tool=%s", tool_name
+                                    )
+                                    stream_state["tool_calls"] = [
+                                        ToolCall(
+                                            id=str(uuid.uuid4()),
+                                            tool_type="function",
+                                            function=FunctionCall(
+                                                name=tool_name,
+                                                arguments=(
+                                                    json.dumps(args)
+                                                    if isinstance(args, dict)
+                                                    else str(args)
+                                                ),
+                                            ),
+                                        )
+                                    ]
+                                    buffered_text_chunks.clear()
+                                    buffered_events.clear()
+                            except json.JSONDecodeError as je:
+                                logger.warning(
+                                    "JSON parse failed even after fixes: %s", je
+                                )
+                                # Try to extract JSON from text with brace matching
+                                tool_pos = fixed_text.find('"tool"')
+                                if tool_pos > 0:
+                                    start = fixed_text.rfind("{", 0, tool_pos)
+                                    if start != -1:
+                                        depth = 0
+                                        end = start
+                                        for i in range(start, len(fixed_text)):
+                                            if fixed_text[i] == "{":
+                                                depth += 1
+                                            elif fixed_text[i] == "}":
+                                                depth -= 1
+                                                if depth == 0:
+                                                    end = i + 1
+                                                    break
+                                        json_str = fixed_text[start:end]
+                                        logger.info(
+                                            "Trying brace-matched JSON: %s",
+                                            json_str[:200],
+                                        )
+                                        try:
+                                            parsed = json.loads(json_str)
+                                            tool_name = parsed.get("tool")
+                                            args = parsed.get("arguments", {})
+                                            if tool_name:
+                                                logger.info(
+                                                    "Brace-matched parse succeeded: tool=%s",
+                                                    tool_name,
+                                                )
+                                                stream_state["tool_calls"] = [
+                                                    ToolCall(
+                                                        id=str(uuid.uuid4()),
+                                                        tool_type="function",
+                                                        function=FunctionCall(
+                                                            name=tool_name,
+                                                            arguments=(
+                                                                json.dumps(args)
+                                                                if isinstance(
+                                                                    args, dict
+                                                                )
+                                                                else str(args)
+                                                            ),
+                                                        ),
+                                                    )
+                                                ]
+                                                buffered_text_chunks.clear()
+                                                buffered_events.clear()
+                                        except json.JSONDecodeError as je2:
+                                            logger.warning(
+                                                "Brace-matched parse also failed: %s",
+                                                je2,
+                                            )
+
+                    # Fallback intent detection
+                    if not stream_state["tool_calls"]:
+                        full_text_lower = stream_state["full_text"].lower()
+                        tool_intent_patterns = [
+                            (
+                                r"(?:i'll|let me|i will|going to)\s+(?:re)?run\s+(?:the\s+)?ocr",
+                                "ocr_image",
+                            ),
+                            (
+                                r"(?:i'll|let me|i will|going to)\s+(?:re)?run\s+ocr_image",
+                                "ocr_image",
+                            ),
+                            (
+                                r"(?:i'll|let me|i will|going to)\s+try\s+(?:the\s+)?ocr\s+again",
+                                "ocr_image",
+                            ),
+                            (
+                                r"(?:i'll|let me|i will|going to)\s+extract.*(?:chart|image|graph)",
+                                "ocr_image",
+                            ),
+                        ]
+                        import re as re_module
+
+                        for pattern, inferred_tool in tool_intent_patterns:
+                            if re_module.search(pattern, full_text_lower):
+                                last_tool_args = None
+                                for msg in reversed(all_messages):
+                                    content = msg.get("content", "")
+                                    if (
+                                        isinstance(content, str)
+                                        and "ocr_image" in content.lower()
+                                    ):
+                                        stage_match = re_module.search(
+                                            r"@[\w.]+\.[\w.]+\.[\w_]+/[^\s\)]+\.(?:jpeg|jpg|png)",
+                                            content,
+                                            re_module.IGNORECASE,
+                                        )
+                                        if stage_match:
+                                            last_tool_args = {
+                                                "image_stage_path": stage_match.group(
+                                                    0
+                                                ),
+                                                "return_as_chart": True,
+                                            }
+                                            break
+                                if last_tool_args:
+                                    logger.debug(
+                                        "[auto-tool] Detected intent to run %s, injecting tool call",
+                                        inferred_tool,
+                                    )
+                                    stream_state["tool_calls"] = [
+                                        ToolCall(
+                                            id=str(uuid.uuid4()),
+                                            tool_type="function",
+                                            function=FunctionCall(
+                                                name=inferred_tool,
+                                                arguments=json.dumps(last_tool_args),
+                                            ),
+                                        )
+                                    ]
+                                    buffered_text_chunks.clear()
+                                    buffered_events.clear()
                                 break
 
-                        if not response_already_cached:
+                    # Detect if LLM output planning/reasoning instead of tool call
+                    # This is REASONING, not final output - emit as reasoning_step and continue
+                    if not stream_state["tool_calls"]:
+                        full_text = stream_state["full_text"].strip()
+                        planning_patterns = [
+                            r"(?:let'?s|i'?ll|i will|i need to|going to)\s+(?:inspect|check|look at|examine|retrieve|fetch|get|query|run|use|call)",
+                            r"(?:let me|allow me to)\s+(?:inspect|check|look|examine|retrieve|fetch|get|query|run)",
+                            r"to (?:proceed|continue|answer|find|get|query).*(?:i need|we need|let's|i'll)",
+                            r"(?:first|next),?\s+(?:i'?ll|let'?s|i need to|we need to)",
+                            r"we'?ll use (?:these|those|the)",
+                            r"once i have (?:those|these|the)",
+                        ]
+                        is_planning_text = False
+                        import re as re_mod
+
+                        for pattern in planning_patterns:
+                            if re_mod.search(pattern, full_text.lower()):
+                                is_planning_text = True
+                                break
+
+                        if is_planning_text and iteration < MAX_TOOL_ITERATIONS - 2:
+                            # This is REASONING - emit as reasoning event, not final text
+                            yield to_sse(reasoning_step(full_text, event_type="INFO"))
+
+                            # Add to messages and nudge LLM to call the tool
+                            ai_messages_formatted_tuples.append(
+                                ("assistant", full_text)
+                            )
+                            ai_messages_formatted_tuples.append(
+                                (
+                                    "user",
+                                    'Now call the tool. Output ONLY: {"tool": "...", "arguments": {...}}',
+                                )
+                            )
+                            buffered_text_chunks.clear()
+                            buffered_events.clear()
+                            continue  # Re-run to get the actual tool call
+
+                    # Log tool call state before final decision
+                    logger.debug(
+                        "Tool call state: has_tool_calls=%s, full_text_preview=%s",
+                        bool(stream_state["tool_calls"]),
+                        (
+                            stream_state["full_text"][:100]
+                            if stream_state["full_text"]
+                            else "(empty)"
+                        ),
+                    )
+
+                    if not stream_state["tool_calls"]:
+                        # Final response - no tool calls detected
+                        logger.info(
+                            "No tool calls detected after all checks, outputting as final response. Text preview: %s",
+                            (
+                                stream_state["full_text"][:100]
+                                if stream_state["full_text"]
+                                else "(empty)"
+                            ),
+                        )
+                        # Only yield buffered events if we suppressed streaming (thought it was a tool call but wasn't)
+                        if buffered_events and looks_like_tool_call:
+                            logger.info(
+                                "Yielding %d buffered events as final text (was suppressed as potential tool call)",
+                                len(buffered_events),
+                            )
+                            for event_type, event_data in buffered_events:
+                                if event_type == "text":
+                                    yield to_sse(message_chunk(event_data))
+                                elif event_type == "citation":
+                                    yield to_sse(citations([event_data]))
+                            buffered_events.clear()
+                            buffered_text_chunks.clear()
+
+                        if stream_state["full_text"].strip() and not stream_state.get(
+                            "fatal_error"
+                        ):
                             assistant_entry = {
                                 "role": "assistant",
                                 "content": stream_state["full_text"],
@@ -1360,586 +1066,120 @@ async def stream(request_obj: Request, request: QueryRequest):
                                     assistant_entry["role"],
                                     assistant_entry["content"],
                                 )
-                else:
-                    # Tool-calling flow
-                    for iteration in range(MAX_TOOL_ITERATIONS):
-                        if iteration == MAX_TOOL_ITERATIONS - 1:
-                            yield to_sse(
-                                reasoning_step(
-                                    "Max tool iterations reached, aborting to prevent a loop.",
-                                    event_type="ERROR",
-                                )
-                            )
-                            yield to_sse(
-                                message_chunk(
-                                    "❌ I seem to be stuck in a loop. Please try rephrasing your request."
-                                )
-                            )
-                            break
+                        break
 
-                        stream_state["full_text"] = ""
-                        stream_state["tool_calls"] = []
-                        stream_state["citation_count"] = 0
-                        stream_state["citation_summaries"] = []
-                        stream_state["fatal_error"] = None
-                        buffered_text_chunks = (
-                            []
-                        )  # Buffer text until we know if there's a tool call
-                        buffered_events = (
-                            []
-                        )  # Buffer both text and citations to preserve inline order
+                    # Process Tool Calls
+                    has_tool_calls = len(stream_state["tool_calls"]) > 0
+                    tool_names_in_batch = [
+                        tc.function.name for tc in stream_state["tool_calls"]
+                    ]
+                    text2sql_will_auto_execute = "text2sql" in tool_names_in_batch
 
-                        # First, yield that we're thinking about what to do
-                        if iteration == 0:
-                            yield to_sse(
-                                reasoning_step(
-                                    "Analyzing request and determining required tools...",
-                                    event_type="INFO",
-                                )
-                            )
+                    logger.info(
+                        "Executing %d tool calls: %s",
+                        len(stream_state["tool_calls"]),
+                        tool_names_in_batch,
+                    )
 
-                        generator = stream_llm_with_tools(
+                    for tool_call in stream_state["tool_calls"]:
+                        logger.info(
+                            "Starting execution of tool: %s with args: %s",
+                            tool_call.function.name,
+                            (
+                                tool_call.function.arguments[:200]
+                                if tool_call.function.arguments
+                                else "(none)"
+                            ),
+                        )
+                        async for event in execute_single_tool(
+                            tool_call,
                             client,
+                            conv_id,
+                            request,
+                            all_messages,
                             ai_messages_formatted_tuples,
-                            selected_model,
-                            selected_temperature,
-                            selected_max_tokens,
-                            tools=tools,
-                            conv_id=conv_id,
-                            widget=widget_for_citations,
-                            widget_input_args=widget_input_args_for_citations,
+                            text2sql_will_auto_execute,
+                        ):
+                            yield event
+                        logger.info(
+                            "Finished execution of tool: %s", tool_call.function.name
                         )
 
-                        # Consume the generator and handle events immediately
-                        async for event in generator:
-                            if not event:
-                                continue
-
-                            event_type, event_data = event
-
-                            if event_type == "text":
-                                if isinstance(event_data, str):
-                                    # ALWAYS buffer text - we need to check if it's a tool call first
-                                    buffered_text_chunks.append(event_data)
-                                    buffered_events.append(("text", event_data))
-                                    stream_state["full_text"] += event_data
-                            elif event_type == "sql":
-                                if isinstance(event_data, str):
-                                    sql_block = event_data.strip()
-                                    if sql_block:
-                                        formatted_sql = f"```sql\n{sql_block}\n```"
-                                        buffered_text_chunks.append(formatted_sql)
-                                        buffered_events.append(("text", formatted_sql))
-                                        stream_state["full_text"] += formatted_sql
-                            elif event_type == "reasoning_complete":
-                                # Emit complete think block as a single reasoning event
-                                if isinstance(event_data, str) and event_data.strip():
-                                    yield to_sse(
-                                        reasoning_step(event_data, event_type="INFO")
-                                    )
-                            elif event_type == "citation":
-                                # Buffer citation to maintain inline order with text
-                                buffered_events.append(("citation", event_data))
-                                stream_state["citation_count"] = (
-                                    stream_state.get("citation_count", 0) + 1
-                                )
-                                summary_payload = dict(
-                                    getattr(event_data, "extra_details", {}) or {}
-                                )
-                                summary_payload.setdefault(
-                                    "citation_id",
-                                    getattr(event_data, "citation_id", None),
-                                )
-                                stream_state.setdefault(
-                                    "citation_summaries", []
-                                ).append(summary_payload)
-                            elif event_type == "tool_call":
-                                stream_state["tool_calls"].append(event_data)
-                            elif event_type == "complete":
-                                if isinstance(event_data, dict):
-                                    stream_state["tool_calls"] = event_data.get(
-                                        "tool_calls", []
-                                    )
-                                    stream_state["usage"] = event_data.get(
-                                        "usage", None
-                                    )
-                                    stream_state["full_text"] = event_data.get(
-                                        "text", stream_state["full_text"]
-                                    )
-                                break
-                            else:
-                                # Yield any other events (like reasoning steps from handler)
-                                message = (
-                                    event_data
-                                    if isinstance(event_data, str)
-                                    else str(event_data)
-                                )
-                                yield to_sse(reasoning_step(message, event_type="INFO"))
-
-                        # Update token usage after completion
-                        usage = stream_state.get("usage")
-                        if isinstance(usage, dict):
-                            if conv_id not in token_usage:
-                                token_usage[conv_id] = {
-                                    "prompt_tokens": 0,
-                                    "completion_tokens": 0,
-                                    "total_tokens": 0,
-                                    "api_requests": 0,
-                                }
-
-                            token_usage[conv_id]["prompt_tokens"] += usage.get(
-                                "prompt_tokens", 0
+                    if has_tool_calls:
+                        yield to_sse(
+                            reasoning_step(
+                                "Processing results and generating response...",
+                                event_type="INFO",
                             )
-                            token_usage[conv_id]["completion_tokens"] += usage.get(
-                                "completion_tokens", 0
-                            )
-                            token_usage[conv_id]["total_tokens"] += usage.get(
-                                "total_tokens", 0
-                            )
-                            token_usage[conv_id]["api_requests"] += 1
-
-                            # Store in cache
-                            try:
-                                await run_in_thread(
-                                    client.set_conversation_data,
-                                    conv_id,
-                                    "token_usage",
-                                    json.dumps(token_usage[conv_id]),
-                                )
-                            except Exception as e:
-                                if os.environ.get("SNOWFLAKE_DEBUG"):
-                                    logger.error(
-                                        "Error storing token_usage for %s: %s",
-                                        conv_id,
-                                        e,
-                                    )
-
-                        # Check if there are tool calls to process
-                        if not stream_state["tool_calls"]:
-                            # Check if the full_text contains a tool call (JSON format)
-                            # When tools aren't passed to API, LLM outputs tool calls as text
-                            # The JSON may be preceded by explanatory text
-                            full_text = stream_state["full_text"].strip()
-                            if '"tool"' in full_text and "{" in full_text:
-                                # Find the JSON object in the text
-                                start_idx = full_text.find("{")
-                                if start_idx != -1:
-                                    # Count braces to find matching end
-                                    brace_count = 0
-                                    end_idx = start_idx
-                                    for i, char in enumerate(
-                                        full_text[start_idx:], start_idx
-                                    ):
-                                        if char == "{":
-                                            brace_count += 1
-                                        elif char == "}":
-                                            brace_count -= 1
-                                            if brace_count == 0:
-                                                end_idx = i + 1
-                                                break
-
-                                    json_str = full_text[start_idx:end_idx]
-                                    try:
-                                        parsed = json.loads(json_str)
-                                        tool_name = parsed.get("tool")
-                                        args = parsed.get("arguments", {})
-                                        if tool_name:
-                                            stream_state["tool_calls"] = [
-                                                ToolCall(
-                                                    id=str(uuid.uuid4()),
-                                                    tool_type="function",
-                                                    function=FunctionCall(
-                                                        name=tool_name,
-                                                        arguments=(
-                                                            json.dumps(args)
-                                                            if isinstance(args, dict)
-                                                            else str(args)
-                                                        ),
-                                                    ),
-                                                )
-                                            ]
-                                            # Clear the buffered text - it contained a tool call
-                                            buffered_text_chunks.clear()
-                                    except json.JSONDecodeError:
-                                        pass
-
-                        # Fallback: detect when LLM says "I'll run/rerun X" but didn't emit tool JSON
-                        # This handles cases where the model describes intent without calling
-                        if not stream_state["tool_calls"]:
-                            full_text_lower = stream_state["full_text"].lower()
-                            # Patterns like "I'll rerun the OCR", "I'll run ocr_image", "let me try ocr again"
-                            tool_intent_patterns = [
-                                (
-                                    r"(?:i'll|let me|i will|going to)\s+(?:re)?run\s+(?:the\s+)?ocr",
-                                    "ocr_image",
-                                ),
-                                (
-                                    r"(?:i'll|let me|i will|going to)\s+(?:re)?run\s+ocr_image",
-                                    "ocr_image",
-                                ),
-                                (
-                                    r"(?:i'll|let me|i will|going to)\s+try\s+(?:the\s+)?ocr\s+again",
-                                    "ocr_image",
-                                ),
-                                (
-                                    r"(?:i'll|let me|i will|going to)\s+extract.*(?:chart|image|graph)",
-                                    "ocr_image",
-                                ),
-                            ]
-                            import re as re_module
-
-                            for pattern, inferred_tool in tool_intent_patterns:
-                                if re_module.search(pattern, full_text_lower):
-                                    # LLM said it would run a tool - look for args in conversation
-                                    # Find the last ocr_image args from conversation history
-                                    last_tool_args = None
-                                    for msg in reversed(all_messages):
-                                        content = msg.get("content", "")
-                                        if (
-                                            isinstance(content, str)
-                                            and "ocr_image" in content.lower()
-                                        ):
-                                            # Try to find image_stage_path in context
-                                            stage_match = re_module.search(
-                                                r"@[\w.]+\.[\w.]+\.[\w_]+/[^\s\)]+\.(?:jpeg|jpg|png)",
-                                                content,
-                                                re_module.IGNORECASE,
-                                            )
-                                            if stage_match:
-                                                last_tool_args = {
-                                                    "image_stage_path": stage_match.group(
-                                                        0
-                                                    ),
-                                                    "return_as_chart": True,
-                                                }
-                                                break
-
-                                    if last_tool_args:
-                                        logger.info(
-                                            f"[auto-tool] Detected intent to run {inferred_tool}, injecting tool call"
-                                        )
-                                        stream_state["tool_calls"] = [
-                                            ToolCall(
-                                                id=str(uuid.uuid4()),
-                                                tool_type="function",
-                                                function=FunctionCall(
-                                                    name=inferred_tool,
-                                                    arguments=json.dumps(
-                                                        last_tool_args
-                                                    ),
-                                                ),
-                                            )
-                                        ]
-                                        buffered_text_chunks.clear()
-                                        buffered_events.clear()
-                                    break
-
-                        if not stream_state["tool_calls"]:
-                            # No tool calls - this is a final response
-                            # Yield buffered events (text and citations) in order
-                            if buffered_events:
-                                for event_type, event_data in buffered_events:
-                                    if event_type == "text":
-                                        yield to_sse(message_chunk(event_data))
-                                    elif event_type == "citation":
-                                        yield to_sse(citations([event_data]))
-                                buffered_events.clear()
-                                buffered_text_chunks.clear()
-
-                            if stream_state[
-                                "full_text"
-                            ].strip() and not stream_state.get("fatal_error"):
-                                assistant_entry = {
-                                    "role": "assistant",
-                                    "content": stream_state["full_text"],
-                                    "details": {
-                                        "message_type": "assistant_final",
-                                    },
-                                }
-                                if should_store_message(
-                                    conv_id,
-                                    assistant_entry["role"],
-                                    assistant_entry["content"],
-                                    details=assistant_entry["details"],
-                                ):
-                                    ai_msg_id = str(uuid.uuid4())
-                                    all_messages.append(assistant_entry)
-                                    await run_in_thread(
-                                        client.add_message,
-                                        conv_id,
-                                        ai_msg_id,
-                                        assistant_entry["role"],
-                                        assistant_entry["content"],
-                                    )
-                            break
-
-                        # WE HAVE TOOL CALLS - Process them NOW with reasoning steps
-                        has_tool_calls = len(stream_state["tool_calls"]) > 0
-
-                        for tool_call in stream_state["tool_calls"]:
-                            tool_name = tool_call.function.name
-                            tool_args_str = tool_call.function.arguments
-                            # Yield reasoning step with arguments in standard format
-                            yield to_sse(
-                                reasoning_step(
-                                    f"Calling tool, {tool_name}, with arguments -> {tool_args_str}",
-                                    event_type="INFO",
-                                )
-                            )
-
-                            # Execute the tool
-                            # INTERCEPT get_widget_data tool calls
-                            if tool_name == "get_widget_data":
-                                doc_proc = DocumentProcessor.instance()
-
-                                try:
-                                    tool_args = (
-                                        json.loads(tool_args_str)
-                                        if tool_args_str
-                                        else {}
-                                    )
-                                except json.JSONDecodeError:
-                                    tool_args = {}
-
-                                current_tool_output_for_llm, raw_tool_data = (
-                                    await doc_proc.handle_get_widget_data_tool_call(
-                                        tool_args=tool_args,
-                                        widgets_primary=(
-                                            request.widgets.primary
-                                            if request.widgets
-                                            else None
-                                        ),
-                                        widgets_secondary=(
-                                            request.widgets.secondary
-                                            if request.widgets
-                                            else None
-                                        ),
-                                        client=client,
-                                        conversation_id=conv_id,
-                                    )
-                                )
-
-                                # If we got a widget_data_request, yield it for the UI to fetch
-                                if (
-                                    isinstance(raw_tool_data, dict)
-                                    and "widget_data_request" in raw_tool_data
-                                ):
-                                    yield raw_tool_data["widget_data_request"]
-                                    # The actual data will come back in a subsequent request
-                                    # Skip normal tool result processing for this case
-                                    continue
-                            else:
-                                # This is a generator, so we need to iterate
-                                current_tool_output_for_llm = ""
-                                raw_tool_data = None
-                                tool_output_generator = execute_tool(
-                                    tool_call, client, conv_id
-                                )
-                                try:
-                                    async for event in tool_output_generator:
-                                        # The generator will yield reasoning steps first, then the final result
-                                        if isinstance(event, tuple) and len(event) == 2:
-                                            (
-                                                current_tool_output_for_llm,
-                                                raw_tool_data,
-                                            ) = event
-                                        elif (
-                                            isinstance(event, dict)
-                                            and event.get("event") == "reasoning_step"
-                                        ):
-                                            yield event
-                                        elif (
-                                            isinstance(event, dict) and "event" in event
-                                        ):
-                                            # SSE events like chart artifacts, tables, etc.
-                                            # These come from to_sse() wrapped objects
-                                            yield event
-                                        elif hasattr(event, "event") and hasattr(
-                                            event, "data"
-                                        ):
-                                            # MessageArtifactSSE objects (charts, tables) from openbb_ai.helpers
-                                            yield to_sse(event)
-                                        else:
-                                            # Log unexpected event types for debugging
-                                            logger.debug(
-                                                f"Unhandled tool event type: {type(event)}"
-                                            )
-                                except (
-                                    Exception
-                                ) as tool_exc:  # pragma: no cover - defensive
-                                    error_message = (
-                                        f"Error executing tool {tool_name}: {tool_exc}"
-                                    )
-                                    logger.error(
-                                        "Tool execution failure for %s: %s",
-                                        tool_name,
-                                        tool_exc,
-                                        exc_info=True,
-                                    )
-                                    yield to_sse(
-                                        reasoning_step(
-                                            error_message,
-                                            event_type="ERROR",
-                                        )
-                                    )
-                                    current_tool_output_for_llm = error_message
-                                    raw_tool_data = {"error": str(tool_exc)}
-
-                            if not current_tool_output_for_llm:
-                                fallback_msg = f"Error: Tool {tool_name} did not return any output."
-                                yield to_sse(
-                                    reasoning_step(
-                                        fallback_msg,
-                                        event_type="WARNING",
-                                    )
-                                )
-                                current_tool_output_for_llm = fallback_msg
-                                raw_tool_data = raw_tool_data or {
-                                    "error": "empty_result"
-                                }
-
-                            # For text2sql tool, return output directly to user and end conversation
-                            if tool_name == "text2sql":
-                                yield to_sse(message_chunk(current_tool_output_for_llm))
-                                # Store the tool result but don't continue the conversation
-                                tool_result_text = f"[Tool Result from {tool_name}]\n{current_tool_output_for_llm}"
-                                tool_message = {
-                                    "role": "user",
-                                    "content": tool_result_text,
-                                    "details": {
-                                        "is_tool_result": True,
-                                        "message_type": "tool_result",
-                                        "tool_name": tool_name,
-                                    },
-                                }
-                                if should_store_message(
-                                    conv_id,
-                                    tool_message["role"],
-                                    tool_message["content"],
-                                    details=tool_message["details"],
-                                ):
-                                    tool_msg_id = str(uuid.uuid4())
-                                    all_messages.append(tool_message)
-                                    await run_in_thread(
-                                        client.add_message,
-                                        conv_id,
-                                        tool_msg_id,
-                                        tool_message["role"],
-                                        tool_message["content"],
-                                    )
-                                # End the conversation - don't continue to LLM
-                                return
-
-                            # Yield completion reasoning step
-                            if "Error getting" in str(
-                                current_tool_output_for_llm
-                            ) or "Error:" in str(current_tool_output_for_llm):
-                                yield to_sse(
-                                    reasoning_step(
-                                        f"Tool {tool_name} encountered an error.",
-                                        event_type="ERROR",
-                                    )
-                                )
-                            else:
-                                if (
-                                    tool_name
-                                    in ["execute_query", "get_table_sample_data"]
-                                    and isinstance(raw_tool_data, dict)
-                                    and "rowData" in raw_tool_data
-                                ):
-                                    row_count = len(raw_tool_data["rowData"])
-                                    yield to_sse(
-                                        reasoning_step(
-                                            f"Retrieved {row_count} rows.",
-                                            event_type="INFO",
-                                        )
-                                    )
-                                else:
-                                    yield to_sse(
-                                        reasoning_step(
-                                            f"Tool {tool_name} completed successfully.",
-                                            event_type="INFO",
-                                        )
-                                    )
-
-                            # Format tool result for the LLM - apply intelligent compression
-                            tool_result_formatted = f"The result from {tool_name} is:\n{current_tool_output_for_llm}"
-
-                            # Add as a user message to continue conversation
-                            ai_messages_formatted_tuples.append(
-                                ("user", f"[Tool Result]\n{tool_result_formatted}")
-                            )
-
-                            # Store tool result in cache
-                            tool_result_text = f"[Tool Result from {tool_name}]\n{current_tool_output_for_llm}"
-                            tool_message = {
-                                "role": "user",
-                                "content": tool_result_text,
-                                "details": {
-                                    "is_tool_result": True,
-                                    "message_type": "tool_result",
-                                    "tool_name": tool_name,
-                                },
-                            }
-
-                            if should_store_message(
-                                conv_id,
-                                tool_message["role"],
-                                tool_message["content"],
-                                details=tool_message["details"],
-                            ):
-                                tool_msg_id = str(uuid.uuid4())
-                                all_messages.append(tool_message)
-                                await run_in_thread(
-                                    client.add_message,
-                                    conv_id,
-                                    tool_msg_id,
-                                    tool_message["role"],
-                                    tool_message["content"],
-                                )
-
-                                # Store raw data for direct access
-                                if isinstance(raw_tool_data, dict):
-                                    data_key = f"tool_result_{tool_name}_{tool_msg_id}"
-                                    await run_in_thread(
-                                        client.set_conversation_data,
-                                        conv_id,
-                                        data_key,
-                                        json.dumps(raw_tool_data),
-                                    )
-
-                        # Continue to get the final response
-                        if has_tool_calls:
-                            yield to_sse(
-                                reasoning_step(
-                                    "Processing results and generating response...",
-                                    event_type="INFO",
-                                )
-                            )
-
-                            # Continue, LLM will now interpret the tool results.
-                            continue
-                        else:
-                            # No more tool calls - we're done
-                            break
+                        )
+                        continue
+                    else:
+                        break
 
         except Exception as e:
             tb = traceback.format_exc()
             yield to_sse(reasoning_step(f"Error: {str(e)}\n{tb}", event_type="ERROR"))
             yield to_sse(message_chunk(f"❌ An error occurred: {str(e)}"))
 
-        except Exception as e:
-            tb = traceback.format_exc()
-            yield to_sse(
-                reasoning_step(
-                    f"Error in message processing: {str(e)}\n{tb}", event_type="ERROR"
-                )
-            )
-            yield to_sse(message_chunk(f"❌ An error occurred: {str(e)}"))
-
     async def sse_generator():
-        async for event in execution_loop():
-            yield event
+        """SSE generator with logging and cancellation handling."""
+        request_id = str(uuid.uuid4())[:8]
+        event_counter = 0
+        artifact_count = 0
+        logger.debug(
+            "[REQUEST %s] SSE generator started for conv_id=%s",
+            request_id,
+            conv_id,
+        )
+
+        try:
+            async for event in execution_loop():
+                # Check if client disconnected
+                if await request_obj.is_disconnected():
+                    logger.info(
+                        "[REQUEST %s] Client disconnected, stopping stream", request_id
+                    )
+                    break
+
+                event_counter += 1
+                # FINAL SSE OUTPUT: Log every event for tracing
+                event_type = (
+                    event.get("event", "unknown")
+                    if isinstance(event, dict)
+                    else "non-dict"
+                )
+                logger.debug(
+                    "[REQUEST %s] [SSE EVENT #%s] Type: %s",
+                    request_id,
+                    event_counter,
+                    event_type,
+                )
+
+                if (
+                    isinstance(event, dict)
+                    and event.get("event") == "copilotMessageArtifact"
+                ):
+                    artifact_count += 1
+                    data_str = str(event.get("data", ""))[:500]
+                    logger.debug(
+                        "[REQUEST %s] [SSE WIRE ARTIFACT #%s] Sending: %s",
+                        request_id,
+                        artifact_count,
+                        data_str,
+                    )
+                yield event
+        except asyncio.CancelledError:
+            logger.info("[REQUEST %s] Request cancelled by client", request_id)
+            return
+        except Exception as e:
+            logger.error("[REQUEST %s] SSE generator error: %s", request_id, e)
+
+        logger.debug(
+            "[REQUEST %s] [SSE COMPLETE] Total events: %s, artifacts: %s",
+            request_id,
+            event_counter,
+            artifact_count,
+        )
 
     return EventSourceResponse(
         content=sse_generator(),

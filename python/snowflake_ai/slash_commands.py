@@ -96,7 +96,6 @@ async def handle_slash_command(
 - `/clear` - Clear conversation history
 - `/history` - Show conversation history
 - `/context` - Show database context
-- `/suggest <prompt>` - Generate SQL (text2sql) without executing it
 
 Type any command to get started!"""
         yield to_sse(message_chunk(help_text))
@@ -219,11 +218,7 @@ Type any command to get started!"""
             )
             return
 
-        # Use snow if found
-        yield to_sse(message_chunk(f"✅ Found Snowflake CLI at: {snow_cli_binary}"))
-
-        # COPY FILE TO TEMP DIRECTORY TO AVOID MACOS PERMISSION ISSUES
-        yield to_sse(reasoning_step(f"Preparing file for upload..."))
+        yield to_sse(reasoning_step("Preparing file for upload..."))
 
         temp_dir = None
         temp_file_path = None
@@ -269,14 +264,9 @@ Type any command to get started!"""
             # The snow CLI should pick up connection details from env vars
             # like SNOWFLAKE_ACCOUNT, SNOWFLAKE_USER, SNOWFLAKE_PASSWORD etc.
             env = os.environ.copy()
-
             # Ensure current database and schema are used
             env["SNOWFLAKE_DATABASE"] = db_name
             env["SNOWFLAKE_SCHEMA"] = schema_name
-
-            # Build snow command
-            # Note: Database and schema are passed via environment variables
-            # Normalize path separators for Windows to forward slashes as required by PUT command
             temp_file_str = str(temp_file_path).replace("\\", "/")
             # Stage path for PUT command - NO QUOTES around segments: @DB.SCHEMA.STAGE
             unquoted_stage = f"{db_name}.{schema_name}.{stage_name}"
@@ -500,8 +490,8 @@ Type any command to get started!"""
                             ):
                                 row = count_result["rowData"][0]
                                 # The column name from COUNT(*) can be "C" or "COUNT(*)"
-                                num_rows = get_row_value(
-                                    row, "C", "COUNT(*)", default=0
+                                num_rows = (
+                                    get_row_value(row, "C", "COUNT(*)", default=0) or 0
                                 )
 
                             if num_rows > 0:
@@ -544,22 +534,67 @@ Type any command to get started!"""
                 else:
                     yield to_sse(
                         message_chunk(
-                            f"✅ Upload completed, but file not immediately visible in stage.\n\n"
-                            f"File location: `{stage_path}`\n\n"
-                            f"The file may take a moment to appear. You can try to process it with:\n"
-                            f"```\n/parse {stage_path}\n```"
+                            f"✅ Upload completed!\n\n" f"File location: `{stage_path}`"
                         )
                     )
-            except Exception as e:
-                # Don't fail, just inform that verification had issues
+
+                    # Still try to auto-parse even if verification didn't find the file yet
+                    parseable_extensions = [
+                        ".pdf",
+                        ".txt",
+                        ".docx",
+                        ".doc",
+                        ".rtf",
+                        ".md",
+                    ]
+                    file_extension = file_path.suffix.lower()
+                    if file_extension in parseable_extensions:
+                        yield to_sse(
+                            message_chunk(
+                                f"📄 Starting background parsing for `{file_path.name}`.\n"
+                                f"Results will be saved to `DOCUMENT_PARSE_RESULTS`."
+                            )
+                        )
+                        asyncio.create_task(
+                            process_document_background(
+                                client,
+                                stage_path,
+                                file_path.name,
+                                conv_id,
+                                db_name,
+                                schema_name,
+                                embed_images=embed_images,
+                            )
+                        )
+            except Exception:
+                # Don't fail, just inform that verification had issues but still auto-parse
                 yield to_sse(
                     message_chunk(
-                        f"✅ Upload completed!\n\n"
-                        f"File location: `{stage_path}`\n\n"
-                        f"Verification had issues but the file should be available.\n"
-                        f"Try: `/parse {stage_path}`"
+                        f"✅ Upload completed!\n\n" f"File location: `{stage_path}`"
                     )
                 )
+
+                # Still try to auto-parse
+                parseable_extensions = [".pdf", ".txt", ".docx", ".doc", ".rtf", ".md"]
+                file_extension = file_path.suffix.lower()
+                if file_extension in parseable_extensions:
+                    yield to_sse(
+                        message_chunk(
+                            f"📄 Starting background parsing for `{file_path.name}`.\n"
+                            f"Results will be saved to `DOCUMENT_PARSE_RESULTS`."
+                        )
+                    )
+                    asyncio.create_task(
+                        process_document_background(
+                            client,
+                            stage_path,
+                            file_path.name,
+                            conv_id,
+                            db_name,
+                            schema_name,
+                            embed_images=embed_images,
+                        )
+                    )
         return
 
     elif user_command.startswith("/parse "):
@@ -1017,38 +1052,6 @@ Type any command to get started!"""
             yield to_sse(message_chunk(f"✅ Switched to warehouse: {warehouse_name}"))
         except Exception as e:
             yield to_sse(message_chunk(f"❌ Error switching warehouse: {str(e)}"))
-
-    elif user_command.startswith("/suggest "):
-        prompt = user_command[len("/suggest ") :].strip()
-
-        if not prompt:
-            yield to_sse(message_chunk("❌ Please provide a prompt for /suggest."))
-            return
-
-        yield to_sse(
-            reasoning_step("Calling text2sql to generate SQL without executing it...")
-        )
-        try:
-            raw_response = await run_in_thread(client.text2sql, prompt)
-            parsed = json.loads(raw_response)
-
-            sql_text = (parsed.get("sql") or "").strip()
-            explanation = (parsed.get("explanation") or "").strip()
-            request_id = parsed.get("request_id")
-
-            output_parts = []
-            if explanation:
-                output_parts.append(explanation)
-            if sql_text:
-                output_parts.append(f"```sql\n{sql_text}\n```")
-            else:
-                output_parts.append("No SQL was generated.")
-            if request_id:
-                output_parts.append(f"(request_id: {request_id})")
-
-            yield to_sse(message_chunk("\n\n".join(output_parts)))
-        except Exception as e:
-            yield to_sse(message_chunk(f"❌ Error generating SQL suggestion: {str(e)}"))
 
     elif user_command == "/history":
         yield to_sse(reasoning_step("Fetching conversation history..."))

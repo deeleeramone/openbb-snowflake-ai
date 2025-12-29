@@ -25,14 +25,16 @@ snowflake_document_pages = _doc_proc.snowflake_page_store
 _MESSAGE_SIGNATURE_CACHE: dict[str, set[str]] = defaultdict(set)
 _SIGNATURE_LOCK = threading.Lock()
 
-# Pattern to match Cortex citation markers like [cite:0], [cite:1], etc.
-_CITE_MARKER_PATTERN = re.compile(r"\[cite:\d+\]")
+# Pattern to match citation markers:
+# - Cortex native format: [cite:0], [cite:1], etc.
+# - Our unique format: [|cite:0|], [|cite:1|], etc.
+_CITE_MARKER_PATTERN = re.compile(r"\[(?:\|)?cite:\d+(?:\|)?\]")
 
 
 def _normalize_content(value: str | None) -> str:
     """Normalize content for signature comparison.
 
-    Strips Cortex citation markers [cite:N] to prevent duplicates when the same
+    Strips citation markers [cite:N] and [|cite:N|] to prevent duplicates when the same
     response is stored both with and without citation markers.
     """
     if not value:
@@ -382,3 +384,203 @@ async def iterate_sync_generator(generator):
         if chunk is None:
             break
         yield chunk
+
+
+def extract_markdown_tables(text: str) -> tuple[str, list[dict]]:
+    """Extract markdown tables from text and convert to structured data.
+
+    Detects pipe-delimited markdown tables and extracts them as structured
+    data suitable for AgGrid table artifacts.
+
+    Parameters
+    ----------
+    text : str
+        Text containing potential markdown tables
+
+    Returns
+    -------
+    tuple[str, list[dict]]
+        - Modified text with tables replaced by placeholders
+        - List of extracted table dicts with keys:
+          - 'data': list of row dicts (column_name: value)
+          - 'name': auto-generated table name
+          - 'placeholder': the placeholder string inserted in text
+    """
+    tables = []
+    lines = text.split("\n")
+    result_lines = []
+    table_counter = 0
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+
+        # Look for potential table start (line with multiple pipes)
+        if "|" in stripped and stripped.count("|") >= 2:
+            table_lines = []
+            table_start_idx = i
+
+            # Collect consecutive table lines
+            while i < len(lines):
+                current = lines[i].strip()
+                # Stop if empty line or no pipes
+                if not current or "|" not in current:
+                    break
+                table_lines.append(current)
+                i += 1
+
+            # Need at least 2 lines (header + separator or header + data)
+            if len(table_lines) >= 2:
+                headers = []
+                rows = []
+                separator_idx = -1
+
+                # Find separator line (contains only |, -, :, spaces)
+                for idx, tline in enumerate(table_lines):
+                    cleaned = (
+                        tline.replace("|", "")
+                        .replace("-", "")
+                        .replace(":", "")
+                        .replace(" ", "")
+                    )
+                    if not cleaned or all(c in "-:|" for c in tline.replace(" ", "")):
+                        separator_idx = idx
+                        break
+
+                def parse_table_row(line: str) -> list[str]:
+                    """Parse a markdown table row, handling leading/trailing pipes."""
+                    # Strip leading/trailing whitespace and pipes
+                    line = line.strip()
+                    if line.startswith("|"):
+                        line = line[1:]
+                    if line.endswith("|"):
+                        line = line[:-1]
+                    # Split and clean each cell
+                    return [cell.strip() for cell in line.split("|")]
+
+                # Parse headers
+                header_idx = separator_idx - 1 if separator_idx > 0 else 0
+                if 0 <= header_idx < len(table_lines):
+                    headers = parse_table_row(table_lines[header_idx])
+                    # Filter out empty headers
+                    headers = [h for h in headers if h]
+
+                # Parse data rows
+                data_start = separator_idx + 1 if separator_idx >= 0 else 1
+                for row_line in table_lines[data_start:]:
+                    cleaned = (
+                        row_line.replace("|", "")
+                        .replace("-", "")
+                        .replace(":", "")
+                        .replace(" ", "")
+                    )
+                    if not cleaned:
+                        continue
+                    row_values = parse_table_row(row_line)
+                    # Pad or trim to match headers
+                    if headers:
+                        while len(row_values) < len(headers):
+                            row_values.append("")
+                        row_values = row_values[: len(headers)]
+                    if row_values:
+                        rows.append(row_values)
+
+                # Only create artifact if we have headers and rows
+                if headers and rows and len(rows) >= 1:
+                    # Convert to list of dicts
+                    data = []
+                    for row in rows:
+                        row_dict = {}
+                        for col_idx, header in enumerate(headers):
+                            value = row[col_idx] if col_idx < len(row) else ""
+                            # Try to convert numeric values
+                            try:
+                                # Remove commas from numbers
+                                clean_val = (
+                                    value.replace(",", "")
+                                    .replace("$", "")
+                                    .replace("%", "")
+                                )
+                                if "." in clean_val:
+                                    row_dict[header] = float(clean_val)
+                                else:
+                                    row_dict[header] = int(clean_val)
+                            except (ValueError, AttributeError):
+                                row_dict[header] = value
+                        data.append(row_dict)
+
+                    table_counter += 1
+                    placeholder = f"[TABLE_ARTIFACT_{table_counter}]"
+                    table_name = f"Extracted Table {table_counter}"
+
+                    tables.append(
+                        {
+                            "data": data,
+                            "name": table_name,
+                            "placeholder": placeholder,
+                            "headers": headers,
+                        }
+                    )
+
+                    # Replace table with placeholder
+                    result_lines.append(placeholder)
+                    continue
+                else:
+                    # Not a valid table, keep original lines
+                    result_lines.extend(lines[table_start_idx:i])
+                    continue
+            else:
+                # Not enough lines for a table
+                result_lines.append(line)
+                i += 1
+                continue
+        else:
+            result_lines.append(line)
+            i += 1
+
+    return "\n".join(result_lines), tables
+
+
+def format_tool_overview(tool_defs: list[dict] | None) -> str:
+    """Create a human-readable summary of available tools."""
+
+    if not tool_defs:
+        return ""
+
+    lines: list[str] = []
+    for tool in tool_defs:
+        if not isinstance(tool, dict):
+            continue
+
+        function = tool.get("function")
+        if not isinstance(function, dict):
+            continue
+
+        name = function.get("name")
+        if not name:
+            continue
+
+        description = (function.get("description") or "").strip()
+        parameters = function.get("parameters")
+        arg_bits: list[str] = []
+
+        if isinstance(parameters, dict):
+            props = parameters.get("properties")
+            if isinstance(props, dict):
+                for param_name, schema in props.items():
+                    if not isinstance(schema, dict):
+                        continue
+                    param_text = param_name
+                    param_type = schema.get("type")
+                    param_desc = (schema.get("description") or "").strip()
+                    if param_type:
+                        param_text += f" ({param_type})"
+                    if param_desc:
+                        param_text += f": {param_desc}"
+                    arg_bits.append(param_text)
+
+        arg_text = f" Args: {'; '.join(arg_bits)}" if arg_bits else ""
+        lines.append(f"- {name}: {description}{arg_text}".strip())
+
+    return "\n".join(lines)

@@ -198,7 +198,7 @@ async def upload_widget_file(
         # Upload bytes to Snowflake stage
         if not file_name.endswith(".pdf"):
             file_name += ".pdf"
-        print(file_name)
+        logger.debug("Uploading file: %s", file_name)
         stage_path = client.upload_bytes_to_stage(
             list(file_bytes),  # Convert bytes to list for PyO3
             file_name,
@@ -238,82 +238,98 @@ async def upload_widget_file(
     if file_ext in parseable_extensions:
         doc_proc = DocumentProcessor.instance()
 
-        # STEP 1: Extract and store PDF positions/metadata IMMEDIATELY (before returning)
-        # This ensures positions/metadata are always available for AI chat
+        # STEP 1: Extract and store PDF positions/metadata in BACKGROUND
+        # Don't block the response - this can take a long time for large PDFs
         if file_ext == ".pdf" and file_bytes:
+            # Capture bytes for background task
+            pdf_bytes_for_positions = bytes(file_bytes)
+
+            async def extract_and_store_positions_background():
+                """Background task to extract PDF positions and store them."""
+                try:
+                    # Single-pass extraction of positions + metadata
+                    _, text_positions, pdf_metadata = (
+                        doc_proc.extract_pdf_with_positions(
+                            pdf_bytes_for_positions, extract_metadata=True
+                        )
+                    )
+                    logger.info(
+                        "Widget upload: Extracted %d positions and %d outline entries for %s",
+                        len(text_positions) if text_positions else 0,
+                        len(pdf_metadata.get("outline", [])) if pdf_metadata else 0,
+                        file_name,
+                    )
+
+                    # Store positions in Snowflake
+                    if text_positions:
+                        await doc_proc.store_pdf_positions_in_snowflake(
+                            client,
+                            file_name,
+                            stage_path,
+                            text_positions,
+                        )
+                        logger.info(
+                            "Widget upload: Stored %d text positions for %s",
+                            len(text_positions),
+                            file_name,
+                        )
+
+                    # Store document metadata
+                    if pdf_metadata:
+                        await doc_proc.store_document_metadata(
+                            client,
+                            file_name,
+                            stage_path,
+                            pdf_metadata,
+                        )
+                        logger.info(
+                            "Widget upload: Stored document metadata for %s", file_name
+                        )
+                except Exception as bg_err:
+                    logger.warning(
+                        "Widget upload: Background position/metadata extraction failed: %s",
+                        bg_err,
+                    )
+
+            asyncio.create_task(extract_and_store_positions_background())
+
+        # STEP 2 & 3: Create job and start processing in background
+        # Don't block the response with database operations
+        async def process_document_background():
+            """Background task to create job and start document processing."""
             try:
-                # Single-pass extraction of positions + metadata
-                _, text_positions, pdf_metadata = doc_proc.extract_pdf_with_positions(
-                    file_bytes, extract_metadata=True
+                job_id = await doc_proc.create_processing_job(
+                    client, file_name, stage_path, embed_images
                 )
                 logger.info(
-                    "Widget upload: Extracted %d positions and %d outline entries for %s",
-                    len(text_positions) if text_positions else 0,
-                    len(pdf_metadata.get("outline", [])) if pdf_metadata else 0,
+                    "Widget upload: Created processing job %s for %s", job_id, file_name
+                )
+
+                # Now run the document processing with images
+                await _process_document_with_images(
+                    client,
+                    doc_proc,
                     file_name,
+                    stage_path,
+                    db_name,
+                    schema_name,
+                    embed_images,
+                    job_id,
+                    pdf_bytes=file_bytes if embed_images else None,
                 )
-
-                # Store positions immediately
-                if text_positions:
-                    await doc_proc.store_pdf_positions_in_snowflake(
-                        client,
-                        file_name,
-                        stage_path,
-                        text_positions,
-                    )
-                    logger.info(
-                        "Widget upload: Stored %d text positions for %s",
-                        len(text_positions),
-                        file_name,
-                    )
-
-                # Store metadata immediately
-                if pdf_metadata:
-                    await doc_proc.store_document_metadata(
-                        client,
-                        file_name,
-                        stage_path,
-                        pdf_metadata,
-                    )
-                    logger.info(
-                        "Widget upload: Stored document metadata for %s", file_name
-                    )
-
             except Exception as e:
-                logger.warning(
-                    "Widget upload: Failed to extract/store PDF metadata: %s", e
+                logger.error(
+                    "Widget upload: Background processing failed for %s: %s",
+                    file_name,
+                    e,
                 )
 
-        # STEP 2: Create job record
-        job_id = None
-        try:
-            job_id = await doc_proc.create_processing_job(
-                client, file_name, stage_path, embed_images
-            )
-        except Exception as e:
-            logger.warning("Widget upload: Job creation failed: %s", e)
-
-        # STEP 3: Start background task for image upload + stored procedure call
-        # This returns immediately - all heavy work happens in background
-        asyncio.create_task(
-            _process_document_with_images(
-                client,
-                doc_proc,
-                file_name,
-                stage_path,
-                db_name,
-                schema_name,
-                embed_images,
-                job_id,
-                pdf_bytes=file_bytes if embed_images else None,
-            )
-        )
+        asyncio.create_task(process_document_background())
 
         processing_status = "parsing"
-        job_info = f" (job_id: {job_id})" if job_id else ""
         processing_message = (
             f"File uploaded to {stage_path}. "
-            f"Document parsing started in background{job_info}"
+            f"Document parsing started in background"
             + (" with image embedding" if embed_images else "")
             + ". "
             f"Results will be saved to {db_name}.{schema_name}.DOCUMENT_PARSE_RESULTS"

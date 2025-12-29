@@ -452,6 +452,13 @@ class WidgetHandler:
             if hasattr(widget, "params"):
                 input_params = {p.name: p.current_value for p in widget.params}
 
+            # Extract JSON-serializable content from data
+            serializable_data = data
+            if isinstance(data, SingleDataContent):
+                serializable_data = data.content
+            elif isinstance(data, SingleFileReference):
+                serializable_data = {"url": data.url}
+
             await self.store_widget_data(
                 client,
                 conversation_id,
@@ -459,7 +466,7 @@ class WidgetHandler:
                 widget_name,
                 widget_type,
                 input_params,
-                data,
+                serializable_data,
             )
 
             return {"type": "generic", "data": data, "widget_uuid": widget_uuid}

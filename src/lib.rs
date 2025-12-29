@@ -525,6 +525,18 @@ impl SnowflakeAI {
         result.map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
     }
 
+    /// List semantic views in the current database
+    /// Returns a JSON array of semantic view info objects
+    fn list_semantic_views(&self) -> PyResult<String> {
+        let engine = Arc::clone(&self.engine);
+        let result = self.runtime.block_on(async move {
+            let mut engine = engine.lock().await;
+            let views = engine.get_semantic_views().await;
+            serde_json::to_string(&views)
+        });
+        result.map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+    }
+
     /// Get current database
     fn get_current_database(&self) -> PyResult<String> {
         let engine = Arc::clone(&self.engine);
@@ -555,7 +567,11 @@ impl SnowflakeAI {
         result.map_err(|e: String| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
     }
 
-    fn use_conversation_context(&self, database: Option<String>, schema: Option<String>) -> PyResult<()> {
+    fn use_conversation_context(
+        &self,
+        database: Option<String>,
+        schema: Option<String>,
+    ) -> PyResult<()> {
         let engine = Arc::clone(&self.engine);
         let result = self.runtime.block_on(async move {
             let mut engine = engine.lock().await;
@@ -676,7 +692,7 @@ impl SnowflakeAI {
             "type": "function",
             "function": {
                 "name": "list_tables_in",
-                "description": "List tables in a specific database and schema.",
+                "description": "List base TABLES (not views) in a specific database and schema. For semantic views, use list_semantic_views instead.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -690,6 +706,24 @@ impl SnowflakeAI {
                         }
                     },
                     "required": ["database", "schema"]
+                }
+            }
+        });
+        serde_json::to_string(&tool_def)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+    }
+
+    /// Get tool definition for list_semantic_views
+    fn list_semantic_views_tool(&self) -> PyResult<String> {
+        let tool_def = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "list_semantic_views",
+                "description": "List SEMANTIC VIEWS in the current database. Semantic views are AI-powered analytical views that understand business context. They are DIFFERENT from regular tables. Use this to discover what semantic views are available for text2sql queries.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
                 }
             }
         });
@@ -831,13 +865,13 @@ impl SnowflakeAI {
             "type": "function",
             "function": {
                 "name": "text2sql",
-                "description": "PRIMARY TOOL for SQL generation. When the user asks to write SQL, generate SQL, create a query, or asks a question that requires SQL - USE THIS TOOL FIRST. Uses Snowflake Cortex Analyst AI to convert natural language into optimized SQL. Returns SQL query and explanation WITHOUT executing it. The user can review and choose to execute it separately.",
+                "description": "ONLY use when user explicitly asks you to WRITE/GENERATE SQL CODE as the final output. Example: 'Write me a query to find top customers'. Returns SQL code for the user to review. DO NOT use this tool to get data or answer questions - use execute_query, list_tables_in, list_semantic_views, get_table_schema for those.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "prompt": {
                             "type": "string",
-                            "description": "Natural language description of the desired SQL query. Include filters, aggregations, and ordering instructions. Example: 'Show me the top 10 customers by revenue in 2024'"
+                            "description": "The user's request for SQL generation, in natural language."
                         }
                     },
                     "required": ["prompt"]
@@ -877,7 +911,7 @@ impl SnowflakeAI {
             "type": "function",
             "function": {
                 "name": "execute_query",
-                "description": "Execute an ALREADY-WRITTEN SQL query and return results. ONLY use this when you already have valid SQL (e.g., from text2sql tool output, or for simple queries you wrote yourself). For generating SQL from natural language, use text2sql tool instead. IMPORTANT: Always use fully qualified table names: DATABASE.SCHEMA.TABLE",
+                "description": "Execute SQL and return results. Use this to get actual data, answer questions, or perform any database operation. Write the SQL yourself using fully qualified table names (DATABASE.SCHEMA.TABLE). This is your PRIMARY tool for getting data and answering user questions about data.",
                 "parameters": {
                     "type": "object",
                     "properties": {

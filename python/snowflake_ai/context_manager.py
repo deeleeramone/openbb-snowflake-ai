@@ -4,6 +4,8 @@ This module manages the context window to ensure the LLM can properly
 ingest all information without exceeding token limits.
 """
 
+# pylint: disable=C0103
+
 from typing import Any
 from .logger import get_logger
 
@@ -27,8 +29,9 @@ AVAILABLE_FOR_HISTORY = (
 )
 
 # Limits for different content types
-MAX_SINGLE_TOOL_RESULT_TOKENS = 8000  # Single tool result shouldn't exceed this
-MAX_TOTAL_TOOL_RESULTS_TOKENS = 12000  # All tool results combined
+# IMPORTANT: Tool results should NOT be truncated - the AI needs complete data
+MAX_SINGLE_TOOL_RESULT_TOKENS = 20000  # Single tool result - keep it large
+MAX_TOTAL_TOOL_RESULTS_TOKENS = 24000  # All tool results combined - maximize this
 MAX_CONVERSATION_TOKENS = 8000  # Regular conversation history
 
 
