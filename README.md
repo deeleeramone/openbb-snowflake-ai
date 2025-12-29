@@ -18,16 +18,12 @@ Pre-compiled binaries for Linux, macOS, and Windows are found in the `./wheelhou
 - SNOWFLAKE_PASSWORD (P.A.T.)
 - SNOWFLAKE_ACCOUNT
 - SNOWFLAKE_ROLE
+- SNOWFLAKE_WAREHOUSE
 
 ### Optional
 
-- SNOWFLAKE_WAREHOUSE
 - SNOWFLAKE_DATABASE
 - SNOWFLAKE_SCHEMA
-- SNOWFLAKE_CACHE (absolute path to a SQLite3 database)
-  - This holds conversation history, tool outputs, and other context objects.
-  - If None, an in-memory cache is used.
-- SNOWFLAKE_CACHE_KEY (Must be supplied for file-based caches.)
 
 Generate a secure, random key using: `openssl rand -base64 32`
 
@@ -35,8 +31,7 @@ Generate a secure, random key using: `openssl rand -base64 32`
 
 - SNOWFLAKE_DEBUG
 
-Setting this will stream the SSE output to the console,
-along with other debug messages.
+Setting this will stream the SSE output to the console, along with other debug messages.
 
 ## Running
 

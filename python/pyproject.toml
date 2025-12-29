@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "openbb-snowflake-ai"
 version = "0.1.0"
-description = "Python bindings for Snowflake AI_COMPLETE with SSE support"
+description = "A blazingly fast Snowflake AI agent for OpenBB Workspace."
 requires-python = ">=3.10,<3.14"
 dependencies = [
     "sse-starlette",

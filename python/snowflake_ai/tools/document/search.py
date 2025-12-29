@@ -5,9 +5,10 @@ import json
 from typing import TYPE_CHECKING
 
 from openbb_ai import reasoning_step
+from openbb_ai.helpers import table
 
 from ...document_processor import DocumentProcessor
-from ...helpers import to_sse
+from ...helpers import extract_markdown_tables, to_sse
 from ...logger import get_logger
 
 if TYPE_CHECKING:
@@ -35,10 +36,17 @@ async def handle_search_document(ctx: "ToolContext", args: dict):
             word in query.lower()
             for word in ["table", "tables", "tabular", "grid", "matrix"]
         )
+        logger.info(
+            "search_document: query=%s, is_table_search=%s, file_name=%s",
+            query,
+            is_table_search,
+            file_name,
+        )
 
         # STEP 0: For table searches, query DOCUMENT_PARSE_RESULTS for pages with "|"
         # then extract/parse actual table structure from those results
         if is_table_search:
+            logger.info("Entering table search branch")
             yield to_sse(
                 reasoning_step(
                     "Querying parsed documents for pages containing tables...",
@@ -52,6 +60,7 @@ async def handle_search_document(ctx: "ToolContext", args: dict):
                     c if c.isalnum() else "_" for c in snowflake_user
                 )
                 user_schema = f"USER_{sanitized_user}".upper()
+                logger.info("Table search: user_schema=%s", user_schema)
 
                 file_filter = ""
                 if file_name:
@@ -66,10 +75,12 @@ async def handle_search_document(ctx: "ToolContext", args: dict):
                 {file_filter}
                 ORDER BY PAGE_NUMBER
                 """
+                logger.info("Table search SQL: %s", table_sql[:200])
 
                 result = await asyncio.to_thread(ctx.client.execute_query, table_sql)
                 result_json = json.loads(result)
                 row_data = result_json.get("rowData", [])
+                logger.info("Table search: found %d rows with pipes", len(row_data))
 
                 if row_data:
                     yield to_sse(
@@ -79,20 +90,17 @@ async def handle_search_document(ctx: "ToolContext", args: dict):
                         )
                     )
 
-                    # Just return the raw page content - it already has the tables!
+                    # Extract tables from page content and emit as table artifacts
                     output = "**Tables Found in Document**\n\n"
-
+                    all_extracted_tables = []
                     pages_with_tables = []
+
                     for row in row_data:
                         page_content = row.get(
                             "PAGE_CONTENT", row.get("page_content", "")
                         )
                         page_num = row.get("PAGE_NUMBER", row.get("page_number", "?"))
                         fname = row.get("FILE_NAME", row.get("file_name", "Unknown"))
-
-                        output += f"---\n## Page {page_num} ({fname})\n\n"
-                        output += page_content
-                        output += "\n\n"
 
                         pages_with_tables.append(
                             {
@@ -101,11 +109,81 @@ async def handle_search_document(ctx: "ToolContext", args: dict):
                             }
                         )
 
+                        # Extract markdown tables from page content
+                        logger.info(
+                            "Extracting tables from page %s, content len=%d",
+                            page_num,
+                            len(page_content),
+                        )
+                        _, extracted_tables = extract_markdown_tables(page_content)
+                        logger.info(
+                            "Page %s: extracted %d tables",
+                            page_num,
+                            len(extracted_tables),
+                        )
+
+                        for tbl in extracted_tables:
+                            # Rename with page context
+                            tbl["name"] = f"Page {page_num} - {tbl['name']}"
+                            all_extracted_tables.append(tbl)
+
+                            # Emit table artifact
+                            try:
+                                logger.info(
+                                    "Creating table artifact: %s with %d rows",
+                                    tbl["name"],
+                                    len(tbl["data"]),
+                                )
+                                table_artifact = table(
+                                    data=tbl["data"],
+                                    name=tbl["name"],
+                                    description=f"Table from {fname}, page {page_num}",
+                                )
+                                sse_event = to_sse(table_artifact)
+                                logger.info(
+                                    "Yielding table SSE: %s", str(sse_event)[:200]
+                                )
+                                yield sse_event
+                                # Tell LLM the table was displayed and give column summary
+                                headers = tbl.get(
+                                    "headers",
+                                    list(tbl["data"][0].keys()) if tbl["data"] else [],
+                                )
+                                output += (
+                                    f"📊 **{tbl['name']}** - TABLE ARTIFACT DISPLAYED\n"
+                                )
+                                output += f"   Columns: {', '.join(headers)}\n"
+                                output += f"   Rows: {len(tbl['data'])}\n"
+                                output += "   *(Do not re-output this table - it is already visible to the user as an interactive table)*\n\n"
+                            except Exception as table_err:
+                                logger.warning(
+                                    "Failed to create table artifact: %s", table_err
+                                )
+                                # Fall back to text description
+                                output += f"Table on page {page_num}: {len(tbl.get('data', []))} rows\n"
+
+                    if not all_extracted_tables:
+                        # No valid tables found - include raw content for LLM
+                        for row in row_data:
+                            page_content = row.get(
+                                "PAGE_CONTENT", row.get("page_content", "")
+                            )
+                            page_num = row.get(
+                                "PAGE_NUMBER", row.get("page_number", "?")
+                            )
+                            fname = row.get(
+                                "FILE_NAME", row.get("file_name", "Unknown")
+                            )
+                            output += f"---\n## Page {page_num} ({fname})\n\n"
+                            output += page_content
+                            output += "\n\n"
+
                     yield output, {
                         "results": pages_with_tables,
                         "query": query,
                         "search_type": "table_extraction",
                         "result_count": len(row_data),
+                        "tables_extracted": len(all_extracted_tables),
                     }
                     return
 

@@ -183,6 +183,10 @@ async def process_incoming_messages(
     conv_id: str,
     client: SnowflakeAI,
     selected_widget_stage_path: Optional[str],
+    existing_widget_context_str: str = "",
+    existing_widget_context_metadata: Optional[Dict[str, Any]] = None,
+    existing_widget_for_citations: Optional[Any] = None,
+    existing_widget_input_args: Optional[Dict[str, Any]] = None,
 ) -> Tuple[
     List[Dict[str, Any]],
     bool,
@@ -196,15 +200,22 @@ async def process_incoming_messages(
     Process incoming messages from the request, handle tool results, and update history.
     Returns updated all_messages, has_new_user_message, needs_response, widget_for_citations,
     widget_input_args_for_citations, widget_context_str, widget_context_metadata
+
+    Args:
+        existing_widget_context_str: Context string from primary widget processing (preserve if set)
+        existing_widget_context_metadata: Metadata from primary widget processing
+        existing_widget_for_citations: Widget for citations from primary widget processing
+        existing_widget_input_args: Widget input args from primary widget processing
     """
     request_messages_to_add = []
     has_new_user_message = False
     needs_response = False
 
-    widget_for_citations = None
-    widget_input_args_for_citations = None
-    widget_context_str = ""
-    widget_context_metadata = None
+    # Preserve existing widget context from handle_primary_widgets, only overwrite if tool message provides new data
+    widget_for_citations = existing_widget_for_citations
+    widget_input_args_for_citations = existing_widget_input_args
+    widget_context_str = existing_widget_context_str
+    widget_context_metadata = existing_widget_context_metadata
 
     all_widgets: list[Any] = []
     if getattr(request, "widgets", None):

@@ -345,8 +345,10 @@ WORKFLOW FOR DOCUMENT QUESTIONS:
 CITATION_REQUIREMENTS = """
 🚨 CITATION RULES 🚨
 
-Place [1], [2], [3], etc. at the END of paragraphs or bullet points that contain facts from the document.
+Place [|cite:1|], [|cite:2|], [|cite:3|], etc. at the END of paragraphs or bullet points that contain facts from the document.
 The system will show page number and section header automatically.
+
+⚠️ IMPORTANT: Use the EXACT format [|cite:N|] - the pipe characters are required for the UI to render citations correctly.
 
 ⚠️ IMPORTANT: QUOTATION MARK RULES:
 - ONLY use quotation marks ("...") when copying EXACT, VERBATIM text from the document
@@ -355,22 +357,22 @@ The system will show page number and section header automatically.
 
 EXAMPLE FORMAT (correct):
 
-The 2025 CEO Performance Award grants Elon Musk 423,743,904 shares of Tesla stock, structured as 12 tranches that vest upon achievement of market capitalization and operational milestones over a ten-year period. [1]
+The 2025 CEO Performance Award grants Elon Musk 423,743,904 shares of Tesla stock, structured as 12 tranches that vest upon achievement of market capitalization and operational milestones over a ten-year period. [|cite:1|]
 
-Each tranche requires both a Market Capitalization Milestone (starting at $2 trillion) and Operational Milestones including vehicle delivery and revenue targets. Musk must remain as CEO or approved executive throughout the vesting period. [2]
+Each tranche requires both a Market Capitalization Milestone (starting at $2 trillion) and Operational Milestones including vehicle delivery and revenue targets. Musk must remain as CEO or approved executive throughout the vesting period. [|cite:2|]
 
 ❌ WRONG (fake quotes):
-"The company performed well this quarter" [1]  ← Only use quotes if this EXACT text appears in the document!
+"The company performed well this quarter" [|cite:1|]  ← Only use quotes if this EXACT text appears in the document!
 
 ✅ CORRECT (paraphrase without quotes):
-The company reported strong quarterly performance with revenue increases across segments. [1]
+The company reported strong quarterly performance with revenue increases across segments. [|cite:1|]
 
 ✅ CORRECT (verbatim quote):
-The filing states: "Revenue increased 15% year-over-year to $4.2 billion" [1]  ← Use quotes ONLY if this exact text exists!
+The filing states: "Revenue increased 15% year-over-year to $4.2 billion" [|cite:1|]  ← Use quotes ONLY if this exact text exists!
 
 RULES:
-✅ Put [N] at the end of paragraphs or list items with facts
-✅ Use sequential numbers [1], [2], [3], etc.
+✅ Put [|cite:N|] at the end of paragraphs or list items with facts
+✅ Use sequential numbers [|cite:1|], [|cite:2|], [|cite:3|], etc.
 ✅ You can use up to 6 citations if needed
 🛑 STOP after your last paragraph - NO additional text about citations
 🛑 NEVER add "(Note: Citations...)" or similar explanations
@@ -380,11 +382,11 @@ RULES:
 
 CITATION_OUTPUT_FORMAT = """
 ⚠️ CRITICAL - END YOUR RESPONSE PROPERLY:
-- End with your final content paragraph containing [N] marker
-- The [N] markers automatically become clickable page buttons
+- End with your final content paragraph containing [|cite:N|] marker
+- The [|cite:N|] markers automatically become clickable page buttons
 - DO NOT add ANY text after your last content paragraph
 - NO "Note:", NO "Citations map to:", NO page number lists
-- Just end cleanly after your final point with its [N] citation
+- Just end cleanly after your final point with its [|cite:N|] citation
 """
 
 
@@ -427,8 +429,8 @@ PROPER WORKFLOW FOR THIS DOCUMENT:
    → NEVER call read_document without page_numbers on large documents!
 
 - Use this widget document as the ONLY source for answering - it's already been selected by the user
-- Every fact from this document MUST include a citation [N]
-- CRITICAL CITATION RULE: DO NOT write phrases like 'Here are the key takeaways' or 'Let me summarize' followed by [N]
+- Every fact from this document MUST include a citation [|cite:N|]
+- CRITICAL CITATION RULE: DO NOT write phrases like 'Here are the key takeaways' or 'Let me summarize' followed by [|cite:N|]
 - DO NOT use quotation marks unless you are copying EXACT verbatim text from the document
 - Paraphrased summaries should NOT be in quotes - quotes imply exact text!
 - Example: Write 'Investment reached $1.3 trillion by 2024 [1]' NOT '"Investment grew significantly" [1]' (unless that exact phrase appears)

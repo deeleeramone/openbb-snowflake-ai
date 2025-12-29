@@ -3900,7 +3900,7 @@ class DocumentProcessor:
     def extract_quotes_from_llm_response(response_text: str) -> list[tuple[str, int]]:
         """Extract quotes and citation numbers from LLM response text.
 
-        Supports formats like "text[1]" and "quote" (Page 2).
+        Supports formats like "text[|cite:1|]" (new unique format) and "text[1]" (legacy).
 
         Parameters
         ----------
@@ -3913,8 +3913,14 @@ class DocumentProcessor:
             List of tuples (quote_text, citation_number)
         """
         citations = []
-        pattern = r"([^.!?]*?)\[(\d+)\]"
+        # Try new unique format first: [|cite:N|]
+        pattern = r"([^.!?]*?)\[\|cite:(\d+)\|\]"
         matches = re.findall(pattern, response_text)
+
+        # Fall back to legacy [N] format if no matches
+        if not matches:
+            pattern = r"([^.!?]*?)\[(\d+)\]"
+            matches = re.findall(pattern, response_text)
         for context_text, citation_num in matches:
             sentence = context_text.strip()
             if len(sentence) > 200:

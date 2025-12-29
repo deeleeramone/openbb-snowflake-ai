@@ -334,10 +334,7 @@ async def stream(request_obj: Request, request: QueryRequest):
     """Query endpoint with SSE streaming."""
     import time
 
-    print(request_obj.__dict__)
-
     request_start_time = time.time()
-
     logger.debug("[REQUEST START] New /query request at %s", request_start_time)
 
     if request.messages:
@@ -500,7 +497,15 @@ async def stream(request_obj: Request, request: QueryRequest):
                 widget_context_str,
                 widget_context_metadata,
             ) = await process_incoming_messages(
-                request, all_messages, conv_id, client, selected_widget_stage_path
+                request,
+                all_messages,
+                conv_id,
+                client,
+                selected_widget_stage_path,
+                existing_widget_context_str=widget_context_str,
+                existing_widget_context_metadata=widget_context_metadata,
+                existing_widget_for_citations=widget_for_citations,
+                existing_widget_input_args=widget_input_args_for_citations,
             )
 
             # Only process if we have a new user message OR need to respond to existing one
@@ -667,6 +672,9 @@ async def stream(request_obj: Request, request: QueryRequest):
                         widget_input_args=widget_input_args_for_citations,
                     )
 
+                    # Track if response looks like a JSON tool call (suppress streaming in that case)
+                    looks_like_tool_call = False
+
                     async for event in generator:
                         if not event:
                             continue
@@ -677,6 +685,25 @@ async def stream(request_obj: Request, request: QueryRequest):
                                 buffered_text_chunks.append(event_data)
                                 buffered_events.append(("text", event_data))
                                 stream_state["full_text"] += event_data
+
+                                # Check early if this looks like a JSON tool call
+                                # If so, don't stream - we'll handle it after loop
+                                current_text = stream_state["full_text"].strip()
+                                if not looks_like_tool_call:
+                                    # Check for JSON object start or tool pattern
+                                    if (
+                                        current_text.startswith("{")
+                                        or '"tool"' in current_text
+                                    ):
+                                        looks_like_tool_call = True
+                                        logger.debug(
+                                            "Detected potential tool call JSON, suppressing stream"
+                                        )
+
+                                # Only stream if NOT a tool call
+                                if not looks_like_tool_call:
+                                    # Stream immediately for real-time rendering
+                                    yield to_sse(message_chunk(event_data))
                         elif event_type == "sql":
                             if isinstance(event_data, str):
                                 sql_block = event_data.strip()
@@ -685,6 +712,8 @@ async def stream(request_obj: Request, request: QueryRequest):
                                     buffered_text_chunks.append(formatted_sql)
                                     buffered_events.append(("text", formatted_sql))
                                     stream_state["full_text"] += formatted_sql
+                                    if not looks_like_tool_call:
+                                        yield to_sse(message_chunk(formatted_sql))
                         elif event_type == "reasoning_complete":
                             if isinstance(event_data, str) and event_data.strip():
                                 yield to_sse(
@@ -704,6 +733,9 @@ async def stream(request_obj: Request, request: QueryRequest):
                             stream_state.setdefault("citation_summaries", []).append(
                                 summary_payload
                             )
+                            # Only stream citation if NOT a tool call
+                            if not looks_like_tool_call:
+                                yield to_sse(citations([event_data]))
                         elif event_type == "tool_call":
                             stream_state["tool_calls"].append(event_data)
                         elif event_type == "complete":
@@ -997,9 +1029,10 @@ async def stream(request_obj: Request, request: QueryRequest):
                                 else "(empty)"
                             ),
                         )
-                        if buffered_events:
+                        # Only yield buffered events if we suppressed streaming (thought it was a tool call but wasn't)
+                        if buffered_events and looks_like_tool_call:
                             logger.info(
-                                "Yielding %d buffered events as final text",
+                                "Yielding %d buffered events as final text (was suppressed as potential tool call)",
                                 len(buffered_events),
                             )
                             for event_type, event_data in buffered_events:
