@@ -19,11 +19,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 dotenvy = "0.15"
-snowflake-connector-rs = "0.4"
+snowflake-connector-rs = "0.7"
 tower-lsp = "0.20"
 dashmap = "6"
 regex = "1"
-reqwest = { version = "0.11", default-features = false, features = ["blocking", "json", "stream", "rustls-tls", "rustls-tls-native-roots"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "stream", "rustls-tls", "rustls-tls-native-roots"] }
 pyo3 = { version = "0.27.1", features = ["extension-module", "experimental-async", "serde", "generate-import-lib"] }
 futures = "0.3"
 eventsource-stream = "0.2"

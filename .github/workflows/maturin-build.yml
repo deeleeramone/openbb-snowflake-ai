@@ -53,10 +53,10 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $paths = @("wheelhouse","dist","release-archives")
-          foreach ($p in $paths) {
-            if (Test-Path $p) {
-              Remove-Item -Recurse -Force $p
+          \$paths = @("wheelhouse","dist","release-archives")
+          foreach (\$p in \$paths) {
+            if (Test-Path \$p) {
+              Remove-Item -Recurse -Force \$p
             }
           }
 
@@ -64,189 +64,15 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-          architecture: ${{ matrix.python-architecture || 'x64' }}
+          architecture: \${{ matrix.python-architecture || 'x64' }}
 
-      - name: Install OpenSSL development headers (Ubuntu)
-        if: matrix.os == 'linux'
-        run: |
-          if command -v apt-get > /dev/null; then
-            sudo apt-get update
-            sudo apt-get install -y libssl-dev
-          elif command -v yum > /dev/null; then
-            yum install -y openssl-devel openssl-static
-          fi
-
-      - name: Install dependencies (macOS)
-        if: matrix.os == 'macos'
-        run: |
-          brew install openssl@3 sqlcipher pkg-config
-          
-          OPENSSL_PREFIX=$(brew --prefix openssl@3)
-          SQLCIPHER_PREFIX=$(brew --prefix sqlcipher)
-          
-          echo "OPENSSL_DIR=$OPENSSL_PREFIX" >> $GITHUB_ENV
-          echo "OPENSSL_LIB_DIR=$OPENSSL_PREFIX/lib" >> $GITHUB_ENV
-          echo "OPENSSL_INCLUDE_DIR=$OPENSSL_PREFIX/include" >> $GITHUB_ENV
-          
-          # Critical: Set SQLCIPHER paths so libsqlite3-sys finds Homebrew's SQLCipher
-          echo "SQLCIPHER_LIB_DIR=$SQLCIPHER_PREFIX/lib" >> $GITHUB_ENV
-          echo "SQLCIPHER_INCLUDE_DIR=$SQLCIPHER_PREFIX/include" >> $GITHUB_ENV
-          
-          echo "PKG_CONFIG_PATH=$OPENSSL_PREFIX/lib/pkgconfig:$SQLCIPHER_PREFIX/lib/pkgconfig" >> $GITHUB_ENV
-          
-          # Force dynamic linking so delocate can bundle the dylibs
-          echo "OPENSSL_STATIC=0" >> $GITHUB_ENV
-          echo "SQLCIPHER_STATIC=0" >> $GITHUB_ENV
-          
-          # Use pkg-config to find SQLCipher (required when not using bundled feature)
-          echo "LIBSQLITE3_SYS_USE_PKG_CONFIG=1" >> $GITHUB_ENV
-          
-          # Tell Rust linker where to find the dylibs at build time
-          echo "RUSTFLAGS=-L $SQLCIPHER_PREFIX/lib -L $OPENSSL_PREFIX/lib" >> $GITHUB_ENV
-          
-          # Set library path so the binary can find dylibs before delocate processes them
-          echo "DYLD_LIBRARY_PATH=$OPENSSL_PREFIX/lib:$SQLCIPHER_PREFIX/lib" >> $GITHUB_ENV
-
-      - name: Install dependencies (Windows)
-        if: matrix.os == 'windows'
-        shell: pwsh
-        run: |
-          # Determine architecture
-          $arch = if ("${{ matrix.target }}" -eq "aarch64") { "arm64" } else { "x64" }
-          # Use standard triplet - we'll configure for dynamic libraries via features
-          $vcpkgTriplet = "${arch}-windows"
-          
-          # Check if vcpkg exists and clean it if needed
-          if (Test-Path "C:\vcpkg") {
-            Remove-Item -Path "C:\vcpkg" -Recurse -Force
-          }
-          
-          # Install vcpkg and build dependencies
-          git clone https://github.com/Microsoft/vcpkg.git C:\vcpkg
-          cd C:\vcpkg
-          .\bootstrap-vcpkg.bat
-          .\vcpkg integrate install
-          
-          # Create custom triplet for dynamic libraries
-          $tripletPath = "C:\vcpkg\triplets\community\${arch}-windows-dynamic.cmake"
-          @"
-          set(VCPKG_TARGET_ARCHITECTURE $arch)
-          set(VCPKG_CRT_LINKAGE dynamic)
-          set(VCPKG_LIBRARY_LINKAGE dynamic)
-          set(VCPKG_BUILD_TYPE release)
-          "@ | Out-File -FilePath $tripletPath -Encoding utf8
-          
-          # Install OpenSSL as DYNAMIC library using custom triplet
-          Write-Host "Installing OpenSSL with dynamic linkage for ${arch}-windows-dynamic"
-          .\vcpkg install "openssl:${arch}-windows-dynamic"
-          
-          # Set environment variables for the correct architecture
-          $installPath = "C:\vcpkg\installed\${arch}-windows-dynamic"
-          
-          # Now BUILD SQLCipher from source using the OpenSSL we just installed
-          Write-Host "Building SQLCipher from source..."
-          cd C:\
-          git clone https://github.com/sqlcipher/sqlcipher.git
-          cd sqlcipher
-          git checkout v4.6.1
-          
-          # Set up Visual Studio environment
-          $vsPath = "${env:ProgramFiles}\Microsoft Visual Studio\2022\Enterprise"
-          if (-not (Test-Path $vsPath)) {
-            $vsPath = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\Enterprise"
-          }
-          
-          # Run vcvarsall.bat to set up the build environment
-          $vcvarsScript = "$vsPath\VC\Auxiliary\Build\vcvarsall.bat"
-          if ($arch -eq "arm64") {
-            & cmd /c "`"$vcvarsScript`" amd64_arm64 && set" | ForEach-Object {
-              if ($_ -match '^([^=]+)=(.*)') {
-                [System.Environment]::SetEnvironmentVariable($matches[1], $matches[2])
-              }
-            }
-          } else {
-            & cmd /c "`"$vcvarsScript`" x64 && set" | ForEach-Object {
-              if ($_ -match '^([^=]+)=(.*)') {
-                [System.Environment]::SetEnvironmentVariable($matches[1], $matches[2])
-              }
-            }
-          }
-          
-          # Configure SQLCipher build with OpenSSL from vcpkg
-          $env:CFLAGS = "/DSQLITE_HAS_CODEC /DSQLCIPHER_CRYPTO_OPENSSL /I$installPath\include"
-          $env:LDFLAGS = "/LIBPATH:$installPath\lib"
-          $env:LIBS = "libcrypto.lib libssl.lib"
-          
-          # Build SQLCipher using nmake
-          Write-Host "Configuring SQLCipher..."
-          nmake /f Makefile.msc sqlite3.dll sqlite3.lib SQLITE_TEMP_STORE=2 `
-            OPT_FEATURE_FLAGS="-DSQLITE_HAS_CODEC -DSQLCIPHER_CRYPTO_OPENSSL" `
-            LTLINKOPTS="$installPath\lib\libcrypto.lib $installPath\lib\libssl.lib" `
-            LTLIBPATHS="/LIBPATH:$installPath\lib" `
-            OPTS="-DSQLITE_HAS_CODEC -I$installPath\include"
-          
-          # Copy the built SQLCipher libraries to vcpkg install directory
-          Write-Host "Installing SQLCipher to vcpkg directory..."
-          Copy-Item sqlite3.dll "$installPath\bin\sqlcipher.dll" -Force
-          Copy-Item sqlite3.lib "$installPath\lib\sqlcipher.lib" -Force
-          Copy-Item sqlite3.h "$installPath\include\sqlcipher.h" -Force
-          
-          # Also keep sqlite3 named versions for compatibility
-          Copy-Item sqlite3.dll "$installPath\bin\sqlite3.dll" -Force
-          Copy-Item sqlite3.lib "$installPath\lib\sqlite3.lib" -Force
-          
-          cd $env:GITHUB_WORKSPACE
-          
-          echo "OPENSSL_DIR=$installPath" >> $env:GITHUB_ENV
-          echo "OPENSSL_LIB_DIR=$installPath\lib" >> $env:GITHUB_ENV
-          echo "OPENSSL_INCLUDE_DIR=$installPath\include" >> $env:GITHUB_ENV
-          echo "SQLCIPHER_LIB_DIR=$installPath\lib" >> $env:GITHUB_ENV
-          echo "SQLCIPHER_INCLUDE_DIR=$installPath\include" >> $env:GITHUB_ENV
-          echo "SQLITE3_LIB_DIR=$installPath\lib" >> $env:GITHUB_ENV
-          # Force dynamic linking
-          echo "RUSTFLAGS=-L $installPath\lib" >> $env:GITHUB_ENV
-          # Explicitly tell OpenSSL to NOT use static linking
-          echo "OPENSSL_STATIC=0" >> $env:GITHUB_ENV
-          # Force OpenSSL to use vcpkg version, not native Windows TLS
-          echo "OPENSSL_NO_VENDOR=1" >> $env:GITHUB_ENV
-          
-          # For ARM64, we need to use the bundled SQLite since cross-compilation is complex
-          if ("${{ matrix.target }}" -eq "aarch64") {
-            echo "LIBSQLITE3_SYS_USE_BUNDLED=1" >> $env:GITHUB_ENV
-            Write-Host "Using bundled SQLite for ARM64"
-          } else {
-            echo "LIBSQLITE3_SYS_USE_PKG_CONFIG=0" >> $env:GITHUB_ENV
-          }
-          
-          # Verify the libraries AND DLLs exist
-          Write-Host "=== Checking bin directory for DLLs ==="
-          if (Test-Path "$installPath\bin") {
-            Write-Host "Bin directory found. DLL Contents:"
-            Get-ChildItem "$installPath\bin\*.dll" | Select-Object Name, @{Name="Size(MB)";Expression={[math]::Round($_.Length / 1MB, 2)}}
-          } else {
-            Write-Host "WARNING: Bin directory not found - no DLLs to bundle!"
-          }
-          
-          if (Test-Path "$installPath\lib") {
-            Write-Host "Library directory found. Contents:"
-            Get-ChildItem "$installPath\lib" | Select-Object Name
-          } else {
-            Write-Host "Library directory not found!"
-          }
-
-          # Export LIB and PATH so MSVC link.exe can find vcpkg libs and DLLs
-          echo "LIB=$installPath\lib;$env:LIB" >> $env:GITHUB_ENV
-          echo "PATH=$installPath\bin;$env:PATH" >> $env:GITHUB_ENV
-          
-          # Force the use of dynamic OpenSSL by setting feature flags
-          echo "CARGO_FEATURE_VENDORED=0" >> $env:GITHUB_ENV
-      - run: pip install -U ruff typing_extensions setuptools delocate delvewheel
+      - run: pip install -U ruff typing_extensions setuptools
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
-          targets: ${{ matrix.os == 'linux' && (matrix.target == 'aarch64' && 'aarch64-unknown-linux-gnu' || 'x86_64-unknown-linux-gnu') || matrix.os == 'macos' && (matrix.target == 'x86_64' && 'x86_64-apple-darwin' || 'aarch64-apple-darwin') || matrix.os == 'windows' && (matrix.target == 'aarch64' && 'aarch64-pc-windows-msvc' || 'x86_64-pc-windows-msvc') }}
+          targets: \${{ matrix.os == 'linux' && (matrix.target == 'aarch64' && 'aarch64-unknown-linux-gnu' || 'x86_64-unknown-linux-gnu') || matrix.os == 'macos' && (matrix.target == 'x86_64' && 'x86_64-apple-darwin' || 'aarch64-apple-darwin') || matrix.os == 'windows' && (matrix.target == 'aarch64' && 'aarch64-pc-windows-msvc' || 'x86_64-pc-windows-msvc') }}
 
       - name: Install maturin
         run: pip install maturin
@@ -257,49 +83,11 @@ jobs:
         run: |
           # Install build dependencies
           sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            pkg-config \
-            libssl-dev \
-            curl \
-            gcc \
-            g++ \
-            make \
-            cmake \
-            autoconf \
-            automake \
-            libtool
-          
-          # For x86_64/amd64, just use system libraries
-          if [ "${{ matrix.target }}" = "x86_64" ] || [ "${{ matrix.target }}" = "amd64" ]; then
-            # Install SQLCipher from source with system OpenSSL
-            cd /tmp
-            curl -fsSL https://github.com/sqlcipher/sqlcipher/archive/refs/tags/v4.6.1.tar.gz | tar xz
-            cd sqlcipher-4.6.1
-            
-            CFLAGS="-DSQLITE_HAS_CODEC -fPIC" \
-            CPPFLAGS="-fPIC" \
-            LDFLAGS="-fPIC" \
-            ./configure \
-              --prefix=/usr/local \
-              --enable-tempstore=yes \
-              --enable-static=yes \
-              --disable-shared \
-              --with-crypto-lib=openssl \
-              --with-pic
-            
-            make -j$(nproc)
-            sudo make install
-            
-            cd ${{ github.workspace }}
-            
-            # Build wheels for x86_64/amd64
-            sdist_flag="--sdist"
-            for py in ${{ matrix.interpreter }}; do
-              echo "Building for Python ${py}"
-              OPENSSL_STATIC=1 maturin build --release --interpreter ${py} ${sdist_flag}
-              sdist_flag=""
-            done
+          sudo apt-get install -y build-essential pkg-config curl gcc g++ make
+
+          # Determine target and build
+          if [ "\${{ matrix.target }}" = "x86_64" ] || [ "\${{ matrix.target }}" = "amd64" ]; then
+            RUST_TARGET="x86_64-unknown-linux-gnu"
           else
             # Cross-compilation for aarch64
             sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross
@@ -308,74 +96,20 @@ jobs:
             export AR=aarch64-linux-gnu-ar
             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
             RUST_TARGET="aarch64-unknown-linux-gnu"
-            OPENSSL_TARGET="linux-aarch64"
-            HOST_FLAG="--host=aarch64-linux-gnu"
-            
-            # Build OpenSSL for cross target
-            PREFIX=/tmp/deps-${{ matrix.target }}
-            mkdir -p "${PREFIX}"
-            
-            echo "Building OpenSSL 3.3.2 for ${{ matrix.target }}"
-            cd /tmp
-            curl -fsSL https://www.openssl.org/source/openssl-3.3.2.tar.gz | tar xz
-            cd openssl-3.3.2
-            
-            ./Configure ${OPENSSL_TARGET} \
-              --prefix="${PREFIX}" \
-              --openssldir="${PREFIX}/ssl" \
-              no-shared \
-              no-async \
-              -fPIC
-            
-            make -j$(nproc)
-            make install_sw
-            
-            # Build SQLCipher for cross target
-            echo "Building SQLCipher 4.6.1 for ${{ matrix.target }}"
-            cd /tmp
-            curl -fsSL https://github.com/sqlcipher/sqlcipher/archive/refs/tags/v4.6.1.tar.gz | tar xz
-            cd sqlcipher-4.6.1
-            
-            CPPFLAGS="-I${PREFIX}/include" \
-            LDFLAGS="-L${PREFIX}/lib" \
-            LIBS="-lcrypto -lpthread" \
-            ./configure \
-              --prefix="${PREFIX}" \
-              --enable-tempstore=yes \
-              --enable-static=yes \
-              --disable-shared \
-              --with-crypto-lib=openssl \
-              ${HOST_FLAG}
-            
-            make -j$(nproc)
-            make install
-            
-            cd ${{ github.workspace }}
-            
-            # Export all the environment variables for cross-compilation
-            export OPENSSL_DIR="${PREFIX}"
-            export OPENSSL_STATIC=1
-            export OPENSSL_LIB_DIR="${PREFIX}/lib"
-            export OPENSSL_INCLUDE_DIR="${PREFIX}/include"
-            export SQLCIPHER_LIB_DIR="${PREFIX}/lib"
-            export SQLCIPHER_INCLUDE_DIR="${PREFIX}/include"
-            export PKG_CONFIG_PATH="${PREFIX}/lib/pkgconfig"
-            export PKG_CONFIG_ALLOW_CROSS=1
-            
-            # Build wheels for aarch64
-            sdist_flag="--sdist"
-            for py in ${{ matrix.interpreter }}; do
-              echo "Building for Python ${py} on ${RUST_TARGET}"
-              
-              AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_DIR="${PREFIX}" \
-              AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_STATIC=1 \
-              AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_LIB_DIR="${PREFIX}/lib" \
-              AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_INCLUDE_DIR="${PREFIX}/include" \
-              maturin build --release --target ${RUST_TARGET} --interpreter ${py} ${sdist_flag}
-              sdist_flag=""
-            done
           fi
-          
+
+          # Build wheels for each Python version
+          sdist_flag="--sdist"
+          for py in \${{ matrix.interpreter }}; do
+            echo "Building for Python \${py} on \${RUST_TARGET}"
+            if [ -n "\$RUST_TARGET" ] && [ "\$RUST_TARGET" != "x86_64-unknown-linux-gnu" ]; then
+              maturin build --release --target \${RUST_TARGET} --interpreter \${py} \${sdist_flag}
+            else
+              maturin build --release --interpreter \${py} \${sdist_flag}
+            fi
+            sdist_flag=""
+          done
+
           # Move all wheels to dist directory
           mkdir -p dist
           find target -name "*.whl" -exec mv {} dist/ \;
@@ -385,9 +119,8 @@ jobs:
       - name: Build macOS wheels
         if: matrix.os == 'macos'
         run: |
-          # Dependencies already installed in earlier step
-          # Build wheels for each Python version
-          case "${{ matrix.target }}" in
+          # Determine target
+          case "\${{ matrix.target }}" in
             x86_64)
               RUST_TARGET="x86_64-apple-darwin"
               ;;
@@ -395,112 +128,15 @@ jobs:
               RUST_TARGET="aarch64-apple-darwin"
               ;;
           esac
-          
-          # Force dynamic linking by hiding static libraries
-          echo "Forcing dynamic linking by hiding static libraries..."
-          OPENSSL_PREFIX=$(brew --prefix openssl@3)
-          SQLCIPHER_PREFIX=$(brew --prefix sqlcipher)
-          
-          echo "OpenSSL prefix: $OPENSSL_PREFIX"
-          echo "SQLCipher prefix: $SQLCIPHER_PREFIX"
-          
-          # Temporarily move ALL static libraries to force dynamic linking
-          find "$OPENSSL_PREFIX/lib" -name "*.a" | while read -r static_lib; do
-            sudo mv "$static_lib" "${static_lib}.bak"
-            echo "Moved $static_lib to ${static_lib}.bak"
-          done
-          find "$SQLCIPHER_PREFIX/lib" -name "*.a" 2>/dev/null | while read -r static_lib; do
-            sudo mv "$static_lib" "${static_lib}.bak"
-            echo "Moved $static_lib to ${static_lib}.bak"
-          done
-          
-          # Also check for and move static libs in system paths that might be found first
-          if [ -d "/usr/local/lib" ]; then
-            find /usr/local/lib -name "libssl.a" -o -name "libcrypto.a" -o -name "libsqlcipher.a" 2>/dev/null | while read -r static_lib; do
-              sudo mv "$static_lib" "${static_lib}.bak" 2>/dev/null || true
-              echo "Moved system $static_lib to ${static_lib}.bak"
-            done
-          fi
-          
-          # Export dynamic linking flags for each build
-          export OPENSSL_STATIC=0
-          export SQLCIPHER_STATIC=0
-          export OPENSSL_DIR=$OPENSSL_PREFIX
-          export OPENSSL_LIB_DIR="$OPENSSL_PREFIX/lib"
-          export OPENSSL_INCLUDE_DIR="$OPENSSL_PREFIX/include"
-          export PKG_CONFIG_PATH="$OPENSSL_PREFIX/lib/pkgconfig:$SQLCIPHER_PREFIX/lib/pkgconfig"
-          # Force the linker to use dylibs with explicit paths
-          export RUSTFLAGS="-L $SQLCIPHER_PREFIX/lib -L $OPENSSL_PREFIX/lib -C link-arg=-Wl,-rpath,$OPENSSL_PREFIX/lib"
-          # Tell the linker to prefer dynamic libraries
-          export OPENSSL_NO_VENDOR=1
-          # Force dynamic for libsqlite3-sys as well
-          export LIBSQLITE3_SYS_USE_PKG_CONFIG=1
-          
-          # Debug: Check what we're linking against
-          echo "OPENSSL_DIR=$OPENSSL_DIR"
-          echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH"
-          echo "RUSTFLAGS=$RUSTFLAGS"
-          echo "OPENSSL_STATIC=$OPENSSL_STATIC"
-          echo "Available dylibs:"
-          ls -la $OPENSSL_PREFIX/lib/*.dylib || true
-          ls -la $SQLCIPHER_PREFIX/lib/*.dylib || true
-          
+
+          # Build wheels for each Python version
           sdist_flag="--sdist"
-          for py in ${{ matrix.interpreter }}; do
-            echo "Building for Python ${py} on ${RUST_TARGET}"
-            maturin build --release --target ${RUST_TARGET} --interpreter ${py} ${sdist_flag}
+          for py in \${{ matrix.interpreter }}; do
+            echo "Building for Python \${py} on \${RUST_TARGET}"
+            maturin build --release --target \${RUST_TARGET} --interpreter \${py} \${sdist_flag}
             sdist_flag=""
           done
-          
-          # DO NOT RESTORE STATIC LIBRARIES YET - we need them hidden for delocate to work
-          
-          # Verify dynamic linking before delocating
-          echo "Checking for dynamic dependencies in built wheels..."
-          for wheel in target/wheels/*.whl; do
-            echo "Checking $wheel"
-            tmpdir=$(mktemp -d)
-            unzip -q "$wheel" -d "$tmpdir"
-            echo "Contents of wheel:"
-            find "$tmpdir" -name "*.so" -o -name "*.dylib" | head -5
-            echo "Dynamic dependencies:"
-            find "$tmpdir" -name "*.so" -exec otool -L {} \; | grep -E "(libssl|libcrypto|sqlcipher)" || echo "WARNING: No external dylib deps found!"
-            rm -rf "$tmpdir"
-          done
-          
-          # Bundle dependent dylibs so end users do not need Homebrew-installed libraries.
-          echo "Looking for wheels to delocate..."
-          find target/wheels -name "*.whl" -ls || true
-          
-          BUNDLE_DIR="target/delocated-wheelhouse"
-          mkdir -p "${BUNDLE_DIR}"
-          find target/wheels -name "*.whl" -print0 | while IFS= read -r -d '' wheel; do
-            echo "Delocating: $wheel"
-            delocate-wheel -v -w "${BUNDLE_DIR}" "$wheel"
-            rm "$wheel"
-          done
-          
-          # Move delocated wheels back to target/wheels for consistency
-          find "${BUNDLE_DIR}" -name "*.whl" -exec mv {} target/wheels/ \;
-          
-          # NOW restore static libraries after delocate is done
-          find "$OPENSSL_PREFIX/lib" -name "*.a.bak" | while read -r backup; do
-            original="${backup%.bak}"
-            sudo mv "$backup" "$original"
-            echo "Restored $original"
-          done
-          find "$SQLCIPHER_PREFIX/lib" -name "*.a.bak" 2>/dev/null | while read -r backup; do
-            original="${backup%.bak}"
-            sudo mv "$backup" "$original"
-            echo "Restored $original"
-          done
-          if [ -d "/usr/local/lib" ]; then
-            find /usr/local/lib -name "*.a.bak" 2>/dev/null | while read -r backup; do
-              original="${backup%.bak}"
-              sudo mv "$backup" "$original" 2>/dev/null || true
-              echo "Restored system $original"
-            done
-          fi
-          
+
           # Move all wheels to dist directory
           mkdir -p dist
           find target -name "*.whl" -exec mv {} dist/ \;
@@ -511,268 +147,38 @@ jobs:
         if: matrix.os == 'windows'
         shell: pwsh
         run: |
-          # Determine architecture paths
-          $arch = if ("${{ matrix.target }}" -eq "aarch64") { "arm64" } else { "x64" }
-          # Use custom dynamic triplet
-          $vcpkgTriplet = "${arch}-windows-dynamic"
-          $installPath = "C:\vcpkg\installed\$vcpkgTriplet"
-          
-          # Set environment variables for the build
-          $env:OPENSSL_DIR = $installPath
-          $env:OPENSSL_LIB_DIR = "$installPath\lib"
-          $env:OPENSSL_INCLUDE_DIR = "$installPath\include"
-          $env:SQLCIPHER_LIB_DIR = "$installPath\lib"
-          $env:SQLCIPHER_INCLUDE_DIR = "$installPath\include"
-          $env:SQLITE3_LIB_DIR = "$installPath\lib"
-          
-          # CRITICAL: Force linking against ALL the DLLs we need
-          # List the actual DLL names without extensions
-          $sslDllName = if ($arch -eq "arm64") { "libssl-3-arm64" } else { "libssl-3-x64" }
-          $cryptoDllName = if ($arch -eq "arm64") { "libcrypto-3-arm64" } else { "libcrypto-3-x64" }
-          
-          # Windows MSVC linker needs the .lib import libraries, but we force it to use the DLLs at runtime
-          # Add all the paths and force linking
-          $env:RUSTFLAGS = "-L `"$installPath\lib`" -L `"$installPath\bin`""
-          $env:RUSTFLAGS += " -C link-arg=/LIBPATH:`"$installPath\lib`""
-          $env:RUSTFLAGS += " -C link-arg=/LIBPATH:`"$installPath\bin`""
-          $env:RUSTFLAGS += " -C link-arg=libssl.lib"
-          $env:RUSTFLAGS += " -C link-arg=libcrypto.lib"
-          $env:RUSTFLAGS += " -C link-arg=sqlcipher.lib"
-          # Force DLL dependencies
-          $env:RUSTFLAGS += " -C link-arg=/DEPENDENTLOADFLAG:0x800"
-          
-          $env:LIB = "$installPath\lib;$installPath\bin;$env:LIB"
-          $env:PATH = "$installPath\bin;$env:PATH"
-          
-          # Explicitly disable static linking
-          $env:OPENSSL_STATIC = "0"
-          # Force OpenSSL sys crate to link dynamically
-          $env:OPENSSL_LIBS = "ssl:libssl;crypto:libcrypto"
-          
-          # Confirm sqlcipher.lib exists (helpful debug)
-          if (Test-Path "$installPath\lib\sqlcipher.lib") {
-            Write-Host "sqlcipher.lib found at $installPath\lib"
-          } else {
-            Write-Host "WARNING: sqlcipher.lib not found at $installPath\lib — link may fail"
-          }
-          
-          # Build wheels for each Python version
-          switch ("${{ matrix.target }}") {
+          # Determine Rust target
+          switch ("\${{ matrix.target }}") {
             "x86_64" {
-              $rustTarget = "x86_64-pc-windows-msvc"
+              \$rustTarget = "x86_64-pc-windows-msvc"
             }
             "aarch64" {
-              $rustTarget = "aarch64-pc-windows-msvc"
+              \$rustTarget = "aarch64-pc-windows-msvc"
             }
           }
-          
-          # Before building, verify OpenSSL is found
-          Write-Host "=== Verifying OpenSSL configuration ==="
-          Write-Host "OPENSSL_DIR: $env:OPENSSL_DIR"
-          Write-Host "OPENSSL_LIB_DIR: $env:OPENSSL_LIB_DIR"
-          Write-Host "OPENSSL_STATIC: $env:OPENSSL_STATIC"
-          Write-Host "Checking for OpenSSL libs:"
-          if (Test-Path "$env:OPENSSL_LIB_DIR\libssl.lib") {
-            Write-Host "  Found libssl.lib"
-          }
-          if (Test-Path "$env:OPENSSL_LIB_DIR\libcrypto.lib") {
-            Write-Host "  Found libcrypto.lib"
-          }
-          
-          $pythonVersions = "${{ matrix.interpreter }}".Split()
-          $emitSdist = $true
-          foreach ($py in $pythonVersions) {
-            Write-Host "Building for Python $py on $rustTarget"
-            $args = @("--release", "--target", $rustTarget, "--interpreter", $py)
-            if ($emitSdist) {
-              $args += "--sdist"
-              $emitSdist = $false
+
+          # Build wheels for each Python version
+          \$pythonVersions = "\${{ matrix.interpreter }}".Split()
+          \$emitSdist = \$true
+          foreach (\$py in \$pythonVersions) {
+            Write-Host "Building for Python \$py on \$rustTarget"
+            \$args = @("--release", "--target", \$rustTarget, "--interpreter", \$py)
+            if (\$emitSdist) {
+              \$args += "--sdist"
+              \$emitSdist = \$false
             }
             maturin build @args
           }
-          
-          # Bundle dependent DLLs so end users do not need vcpkg-installed libraries
-          Write-Host "=== Starting delvewheel repair to bundle DLLs ==="
-          $bundleDir = Join-Path $PWD "target\delvewheel-wheelhouse"
-          New-Item -ItemType Directory -Force -Path $bundleDir | Out-Null
-          
-          # Debug: Show what DLLs are available to bundle
-          Write-Host "`nDLLs available in ${installPath}\bin:"
-          $totalDllSize = 0
-          Get-ChildItem "$installPath\bin\*.dll" -ErrorAction SilentlyContinue | ForEach-Object { 
-            $size = [math]::Round($_.Length / 1MB, 2)
-            $totalDllSize += $_.Length
-            Write-Host "  - $($_.Name) (${size} MB)"
-          }
-          $totalDllSizeMB = [math]::Round($totalDllSize / 1MB, 2)
-          Write-Host "Total DLL size available: ${totalDllSizeMB} MB"
-          
-          # Check what our binary actually links against
-          Write-Host "`nChecking wheel dependencies BEFORE repair:"
-          Get-ChildItem -Path target\wheels -Filter *.whl | ForEach-Object {
-            Write-Host "`nAnalyzing: $($_.Name)"
-            $tempPre = Join-Path $env:TEMP "pre_repair_$(Get-Random)"
-            New-Item -ItemType Directory -Force -Path $tempPre | Out-Null
-            
-            # Use forward slashes for Python or escape backslashes properly
-            $wheelPath = $_.FullName.Replace('\', '/')
-            $extractPath = $tempPre.Replace('\', '/')
-            python -c "import zipfile; zipfile.ZipFile('$wheelPath').extractall('$extractPath')"
-            
-            # Find the .pyd file
-            $pydFile = Get-ChildItem -Path $tempPre -Filter "*.pyd" -Recurse | Select-Object -First 1
-            if ($pydFile) {
-              Write-Host "  Found .pyd: $($pydFile.Name)"
-              # Use dumpbin to check dependencies if available
-              $dumpbin = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.42.34433\bin\Hostx64\$arch\dumpbin.exe"
-              if (-not (Test-Path $dumpbin)) {
-                # Try to find dumpbin in any VS installation
-                $dumpbin = Get-ChildItem -Path "C:\Program Files\Microsoft Visual Studio" -Filter "dumpbin.exe" -Recurse -ErrorAction SilentlyContinue | 
-                           Where-Object { $_.FullName -like "*Host*\$arch\*" -or $_.FullName -like "*Hostx64\x64\*" } | 
-                           Select-Object -First 1
-              }
-              
-              if ($dumpbin -and (Test-Path $dumpbin)) {
-                Write-Host "  Running dumpbin /DEPENDENTS:"
-                & $dumpbin /DEPENDENTS $pydFile.FullName | Select-String -Pattern "\.dll" | ForEach-Object {
-                  Write-Host "    $_"
-                }
-              } else {
-                Write-Host "  WARNING: dumpbin not found, using Python ctypes to check"
-                $pydPath = $pydFile.FullName.Replace('\', '/')
-                $pydDir = $pydFile.DirectoryName.Replace('\', '/')
-                $pythonScript = "import ctypes.util; import os; os.chdir('$pydDir'); "
-                $pythonScript += "try: import ctypes; dll = ctypes.CDLL('$pydPath'); print('  Successfully loaded (statically linked?)'); "
-                $pythonScript += "except Exception as e: print(f'  Load error (missing DLLs?): {e}')"
-                python -c $pythonScript
-              }
-            }
-            Remove-Item -Recurse -Force $tempPre
-          }
-          
-          Write-Host "`n=== Running delvewheel repair ==="
-          Get-ChildItem -Path target -Recurse -Filter *.whl | ForEach-Object {
-            $originalSize = [math]::Round($_.Length / 1MB, 2)
-            Write-Host "`nRepairing wheel: $($_.Name)"
-            Write-Host "  Original size: ${originalSize} MB"
 
-            # Extract the wheel first
-            $wheelName = $_.Name
-            $wheelPath = $_.FullName
-            $tempDir = Join-Path $env:TEMP "manual_repair_$(Get-Random)"
-            New-Item -ItemType Directory -Force -Path $tempDir | Out-Null
-            
-            Write-Host "  Extracting wheel to $tempDir"
-            $tempDirPy = $tempDir.Replace('\', '/')
-            $wheelPathPy = $wheelPath.Replace('\', '/')
-            python -c "import zipfile; zipfile.ZipFile('$wheelPathPy').extractall('$tempDirPy')"
-            
-            # Find the package name (should be snowflake_ai)
-            $packageDir = Get-ChildItem -Path $tempDir -Directory | Where-Object { $_.Name -match "snowflake" } | Select-Object -First 1
-            if (-not $packageDir) {
-              Write-Host "  ERROR: Could not find package directory!"
-              Remove-Item -Recurse -Force $tempDir
-              continue
-            }
-            
-            # Create .libs directory inside the package
-            $libsDir = Join-Path $packageDir.FullName ".libs"
-            New-Item -ItemType Directory -Force -Path $libsDir | Out-Null
-            Write-Host "  Created $libsDir"
-            
-            Write-Host "  Copying ALL DLLs from $installPath\bin to $libsDir"
-            # List of DLLs we MUST include
-            $requiredDlls = @(
-              "libssl-3-${arch}.dll",
-              "libcrypto-3-${arch}.dll",
-              "sqlcipher.dll",
-              "sqlite3.dll",
-              "legacy.dll"
-            )
-            
-            $copiedDlls = @()
-            foreach ($dllName in $requiredDlls) {
-              $sourceDll = Join-Path "$installPath\bin" $dllName
-              if (Test-Path $sourceDll) {
-                # Generate a unique name to avoid conflicts (like delvewheel does)
-                $hash = [System.Guid]::NewGuid().ToString("N").Substring(0, 32)
-                $baseName = [System.IO.Path]::GetFileNameWithoutExtension($dllName)
-                $mangledName = "${baseName}-${hash}.dll"
-                $destDll = Join-Path $libsDir $mangledName
-                
-                Copy-Item $sourceDll $destDll -Force
-                $size = [math]::Round((Get-Item $destDll).Length / 1MB, 2)
-                Write-Host "    Copied $dllName -> $mangledName (${size} MB)"
-                $copiedDlls += $mangledName
-              } else {
-                Write-Host "    WARNING: $dllName not found at $sourceDll"
-              }
-            }
-            
-            # Now we need to patch the __init__.py to load these DLLs
-            $initPy = Join-Path $packageDir.FullName "__init__.py"
-            if (Test-Path $initPy) {
-              $initContent = Get-Content $initPy -Raw
-            } else {
-              $initContent = ""
-            }
-            
-            # Prepend DLL loading code (similar to what delvewheel does)
-            $dllLoader = "# DLL loader injected by manual repair`nimport os`nimport sys`n`nif sys.platform == 'win32':`n    _libs_dir = os.path.join(os.path.dirname(__file__), '.libs')`n    if os.path.isdir(_libs_dir):`n        os.add_dll_directory(_libs_dir)`n        # Also try to load specific DLLs we need`n        import ctypes`n        for dll_name in os.listdir(_libs_dir):`n            if dll_name.endswith('.dll'):`n                try:`n                    dll_path = os.path.join(_libs_dir, dll_name)`n                    ctypes.CDLL(dll_path)`n                except Exception:`n                    pass  # Some DLLs might not load directly, that's ok`n"
-            
-            # Only add if not already present
-            if ($initContent -notmatch "os.add_dll_directory") {
-              $newContent = $dllLoader + "`n" + $initContent
-              Set-Content -Path $initPy -Value $newContent -Encoding UTF8
-              Write-Host "  Patched __init__.py to load DLLs"
-            }
-            
-            # Repackage the wheel
-            Write-Host "  Repackaging wheel..."
-            $repairedWheelPath = Join-Path $bundleDir $wheelName
-            
-            # Create the wheel using Python's zipfile - use a single-line script
-            $pythonScript = "import zipfile; import os; import stat; wheel_path = r'$repairedWheelPath'.replace('\\', '/'); temp_dir = r'$tempDir'.replace('\\', '/'); zf = zipfile.ZipFile(wheel_path, 'w', zipfile.ZIP_DEFLATED); [(zf.write(os.path.join(root, file), os.path.relpath(os.path.join(root, file), temp_dir).replace('\\', '/'))) for root, dirs, files in os.walk(temp_dir) for file in files]; zf.close(); print(f'Created wheel: {wheel_path}')"
-            
-            python -c $pythonScript
-            
-            # Verify the repaired wheel
-            if (Test-Path $repairedWheelPath) {
-              $repairedSize = [math]::Round((Get-Item $repairedWheelPath).Length / 1MB, 2)
-              $sizeDiff = [math]::Round($repairedSize - $originalSize, 2)
-              Write-Host "  Repaired size: ${repairedSize} MB (added ${sizeDiff} MB)"
-              
-              # List what we bundled
-              Write-Host "  Manually bundled DLLs:"
-              foreach ($dll in $copiedDlls) {
-                Write-Host "    - $dll"
-              }
-              
-              $totalBundled = (Get-ChildItem $libsDir -Filter "*.dll" | Measure-Object -Property Length -Sum).Sum
-              $totalBundledMB = [math]::Round($totalBundled / 1MB, 2)
-              Write-Host "  Total bundled DLL size: ${totalBundledMB} MB"
-              
-              if ($totalBundledMB -lt 5) {
-                Write-Host "  WARNING: Expected ~10MB of DLLs but only bundled ${totalBundledMB} MB!"
-              }
-            }
-            
-            # Clean up temp directory
-            Remove-Item -Recurse -Force $tempDir
-            
-            # Remove original wheel
-            Remove-Item $wheelPath
-          }
-          
           # Move all wheels to dist directory
           New-Item -ItemType Directory -Force -Path dist
           Get-ChildItem -Path target -Recurse -Include *.whl,*.tar.gz | Move-Item -Destination dist
 
-      - run: ${{ (matrix.os == 'windows' && 'dir') || 'ls -lh' }} dist/
+      - run: \${{ (matrix.os == 'windows' && 'dir') || 'ls -lh' }} dist/
 
       - uses: actions/upload-artifact@v4
         with:
-          name: pypi_files_${{ matrix.os }}_${{ matrix.target }}_${{ matrix.interpreter || 'all' }}
+          name: pypi_files_\${{ matrix.os }}_\${{ matrix.target }}_\${{ matrix.interpreter || 'all' }}
           path: dist
 
   # =================== COLLECT AND PACKAGE ===================
@@ -798,10 +204,10 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $paths = @("wheelhouse","dist","release-archives")
-          foreach ($p in $paths) {
-            if (Test-Path $p) {
-              Remove-Item -Recurse -Force $p
+          \$paths = @("wheelhouse","dist","release-archives")
+          foreach (\$p in \$paths) {
+            if (Test-Path \$p) {
+              Remove-Item -Recurse -Force \$p
             }
           }
 
@@ -839,16 +245,16 @@ jobs:
           
           # Create per-file .sha256 and master CHECKSUMS.sha256
           for file in *.whl *.tar.gz; do
-            if [ -f "$file" ]; then
-              sha256sum "$file" > "$file.sha256"
-              echo "Generated hash for $file"
+            if [ -f "\$file" ]; then
+              sha256sum "\$file" > "\$file.sha256"
+              echo "Generated hash for \$file"
             fi
           done
           
           # Create master checksums file
           {
             echo "# SHA256 Checksums"
-            echo "Generated on: $(date -u)"
+            echo "Generated on: \$(date -u)"
             echo ""
             sha256sum *.whl *.tar.gz 2>/dev/null || true
           } > CHECKSUMS.sha256
